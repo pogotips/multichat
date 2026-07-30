@@ -1,0 +1,64 @@
+// Copy this file to `wrangler.jsonc` and fill in your own values.
+// The real `wrangler.jsonc` is gitignored so your channel/domain never lands
+// in a public fork's history. See README / docs/ARCHITECTURE.md for setup.
+{
+	"name": "multichat",
+	"main": "src/worker.js",
+	"workers_dev": false,
+	"preview_urls": false,
+	"routes": [
+		{
+			"pattern": "YOUR_DOMAIN",
+			"custom_domain": true
+		}
+	],
+	"compatibility_date": "2026-07-20",
+	"vars": {
+		"TWITCH_CHANNEL": "YOUR_CHANNEL",
+		// Numeric broadcaster user id for YOUR_CHANNEL — resolved once via a
+		// public login->id lookup (no Twitch auth needed, id is not sensitive).
+		// Never changes for a given channel; Get Channel Followers requires it.
+		"TWITCH_BROADCASTER_ID": "YOUR_BROADCASTER_ID",
+		// Chat display-name for self-mention highlighting. Independent of
+		// TWITCH_CHANNEL (that's the login, this is the display name used in
+		// chat). Leave blank to disable highlighting.
+		"MULTICHAT_MY_NAME": ""
+	},
+	"durable_objects": {
+		"bindings": [
+			{
+				"name": "HUB",
+				"class_name": "ChatHub"
+			}
+		]
+	},
+	"r2_buckets": [
+		{
+			"binding": "CAPTURE",
+			"bucket_name": "multichat-capture"
+		}
+	],
+	"migrations": [
+		{
+			"tag": "v1",
+			"new_sqlite_classes": [
+				"ChatHub"
+			]
+		}
+	],
+	"observability": {
+		"enabled": true,
+		"head_sampling_rate": 1,
+		"logs": {
+			"enabled": true,
+			"head_sampling_rate": 1,
+			"persist": true,
+			"invocation_logs": true
+		},
+		"traces": {
+			"enabled": false,
+			"persist": true,
+			"head_sampling_rate": 1
+		}
+	}
+}

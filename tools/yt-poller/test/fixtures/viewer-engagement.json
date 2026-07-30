@@ -1,0 +1,43 @@
+{
+  "liveChatViewerEngagementMessageRenderer": {
+    "id": "CjEKL0NPTU1VTklUWV9HVUlERUxJTkVTX1ZFTTIwMjYvMDcvMTgtMTA6NTQ6NTYuNDc4",
+    "timestampUsec": "1784397296478571",
+    "icon": { "iconType": "YOUTUBE_ROUND" },
+    "message": {
+      "runs": [
+        {
+          "text": "Welcome to live chat! Remember to guard your privacy and abide by our community guidelines."
+        }
+      ]
+    },
+    "actionButton": {
+      "buttonRenderer": {
+        "style": "STYLE_BLUE_TEXT",
+        "size": "SIZE_DEFAULT",
+        "isDisabled": false,
+        "text": { "simpleText": "Learn more" },
+        "navigationEndpoint": {
+          "clickTrackingParams": "CCEQ8FsiEwjQuvj35dyVAxXWxz8EHabNDgXKAQSYI_iu",
+          "commandMetadata": {
+            "webCommandMetadata": {
+              "url": "//support.google.com/youtube/answer/2853856?hl=en#safe",
+              "webPageType": "WEB_PAGE_TYPE_UNKNOWN",
+              "rootVe": 83769
+            }
+          },
+          "urlEndpoint": {
+            "url": "//support.google.com/youtube/answer/2853856?hl=en#safe",
+            "target": "TARGET_NEW_WINDOW"
+          }
+        },
+        "trackingParams": "CCEQ8FsiEwjQuvj35dyVAxXWxz8EHabNDgU=",
+        "accessibilityData": {
+          "accessibilityData": {
+            "label": "Welcome to live chat! Remember to guard your privacy and abide by our community guidelines. Learn more"
+          }
+        }
+      }
+    },
+    "trackingParams": "CAEQl98BIhMI0Lr49-XclQMV1sc_BB2mzQ4F"
+  }
+}

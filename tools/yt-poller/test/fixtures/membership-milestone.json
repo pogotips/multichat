@@ -1,0 +1,53 @@
+{
+  "liveChatMembershipItemRenderer": {
+    "id": "ChwKGkNPdkQwYUxUcC1BREZjOEs1UW9kQWc0QW5C",
+    "timestampUsec": "1752570060000000",
+    "authorExternalChannelId": "UCmilestone00000000000000",
+    "headerPrimaryText": {
+      "runs": [
+        { "text": "Member for " },
+        { "text": "6" },
+        { "text": " months" }
+      ]
+    },
+    "headerSubtext": { "simpleText": "Member" },
+    "message": {
+      "runs": [
+        { "text": "love the streams " },
+        {
+          "emoji": {
+            "emojiId": "UCxxx/heart",
+            "shortcuts": [":heart:"],
+            "isCustomEmoji": true,
+            "image": {
+              "thumbnails": [
+                { "url": "https://yt3.ggpht.com/emoji=s24", "width": 24, "height": 24 }
+              ]
+            }
+          }
+        }
+      ]
+    },
+    "authorName": { "simpleText": "LoyalViewer" },
+    "authorPhoto": {
+      "thumbnails": [
+        { "url": "https://yt4.ggpht.com/loyal=s32", "width": 32, "height": 32 },
+        { "url": "https://yt4.ggpht.com/loyal=s64", "width": 64, "height": 64 }
+      ]
+    },
+    "authorBadges": [
+      {
+        "liveChatAuthorBadgeRenderer": {
+          "customThumbnail": {
+            "thumbnails": [
+              { "url": "https://yt3.ggpht.com/badge6mo=s16" },
+              { "url": "https://yt3.ggpht.com/badge6mo=s32" }
+            ]
+          },
+          "tooltip": "Member (6 months)",
+          "accessibility": { "accessibilityData": { "label": "Member (6 months)" } }
+        }
+      }
+    ]
+  }
+}

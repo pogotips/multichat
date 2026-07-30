@@ -1,0 +1,20 @@
+{
+  "liveChatSponsorshipsGiftRedemptionAnnouncementRenderer": {
+    "id": "ChwKGkNKX2YwYUxUcC1BREZjOEs1UW9kQWc0QW5F",
+    "timestampUsec": "1752570240000000",
+    "authorExternalChannelId": "UCrecipient00000000000000",
+    "authorName": { "simpleText": "LuckyViewer" },
+    "authorPhoto": {
+      "thumbnails": [
+        { "url": "https://yt4.ggpht.com/lucky=s32", "width": 32, "height": 32 },
+        { "url": "https://yt4.ggpht.com/lucky=s64", "width": 64, "height": 64 }
+      ]
+    },
+    "message": {
+      "runs": [
+        { "text": "was gifted a membership by ", "italics": true },
+        { "text": "GenerousGifter", "bold": true, "italics": true }
+      ]
+    }
+  }
+}

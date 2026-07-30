@@ -1,0 +1,45 @@
+# Copy this file to `.dev.vars` for local `wrangler dev`, and set the same
+# values in production with `wrangler secret put <NAME>`.
+# The real `.dev.vars` is gitignored — never commit real secret values.
+# Generate opaque random strings for the *_SECRET values (e.g. `openssl rand -hex 32`).
+
+# --- Required ---
+
+# Gates the viewer SSE link. Seeded client-side via the URL fragment `#t=<value>`.
+# Low trust: shown on stream, appears in Cloudflare's /events access logs
+# (EventSource can't send a header). Keep distinct from the ingest secrets.
+MULTICHAT_VIEW_SECRET="replace-with-random-string"
+
+# Gates the YouTube poller's `POST /ingest/yt` (X-Multichat-Secret header).
+# Must match the poller host's MULTICHAT_INGEST_SECRET exactly.
+MULTICHAT_INGEST_SECRET="replace-with-random-string"
+
+# --- Optional ---
+
+# Second accepted ingest secret, for an optional external membership-renewal
+# cron. Omit entirely if you are not wiring that up. Never reuse the same
+# value as MULTICHAT_INGEST_SECRET — the split is what prevents caller
+# privilege confusion.
+MULTICHAT_RAIDQ_INGEST_SECRET="replace-with-random-string"
+
+# Twitch EventSub webhook HMAC signing secret (redemptions / hype train / ad
+# breaks). Unset => handleEventSubCallback 403s and the feature is disabled.
+EVENTSUB_SECRET="replace-with-random-string"
+
+# Twitch app (client-credentials flow, no user consent) for live viewer-count
+# polling. Register at https://dev.twitch.tv/console/apps. Both required for
+# viewer counts; unset => viewer count simply never populates (chat unaffected).
+TWITCH_CLIENT_ID="replace-with-twitch-app-client-id"
+TWITCH_CLIENT_SECRET="replace-with-twitch-app-client-secret"
+
+# Twitch user refresh token with moderator:read:followers (obtained via an
+# out-of-band OAuth consent flow) to seed the follower-count refresh chain.
+# The live token then rotates inside the Durable Object's storage. Unset =>
+# follower count never populates. See docs/ARCHITECTURE.md §1 "Live counts".
+TWITCH_USER_REFRESH_TOKEN="replace-with-twitch-user-refresh-token"
+
+# Chat display-name for self-mention highlighting in the viewer UI. Normally
+# set via wrangler.jsonc `vars` — set here only to override for local
+# `wrangler dev`. Independent of TWITCH_CHANNEL (that's the login, this is
+# the display name used in chat). Unset/blank disables highlighting.
+MULTICHAT_MY_NAME=""

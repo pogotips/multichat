@@ -1,0 +1,15 @@
+{
+  "name": "multichat-yt-poller",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "main": "poller.mjs",
+  "scripts": {
+    "start": "node poller.mjs",
+    "postinstall": "patch-package"
+  },
+  "dependencies": {
+    "patch-package": "^8.0.1",
+    "youtube-chat": "^2.2.0"
+  }
+}

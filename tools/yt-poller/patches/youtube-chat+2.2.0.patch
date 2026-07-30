@@ -1,0 +1,216 @@
+diff --git a/node_modules/youtube-chat/dist/parser.js b/node_modules/youtube-chat/dist/parser.js
+index 2245f50..2df346c 100644
+--- a/node_modules/youtube-chat/dist/parser.js
++++ b/node_modules/youtube-chat/dist/parser.js
+@@ -104,6 +104,23 @@ function parseMessages(runs) {
+         }
+     });
+ }
++/** join a runs array into plain text (emoji runs contribute nothing) */
++function joinRunsText(runs) {
++    return (runs || []).map((run) => ("text" in run ? run.text : "")).join("");
++}
++// Keys YouTube attaches to virtually every action alongside the real action
++// key — never the payload itself, so never a valid unknownAction key.
++const ACTION_NOISE_KEYS = ["clickTrackingParams"];
++/** headerPrimaryText / headerSubtext / primaryText can be {runs} or {simpleText} */
++function textFromHeader(header) {
++    if (!header) {
++        return "";
++    }
++    if (header.simpleText) {
++        return header.simpleText;
++    }
++    return joinRunsText(header.runs);
++}
+ /** actionの種類を判別してRendererを返す */
+ function rendererFromAction(action) {
+     if (!action.addChatItemAction) {
+@@ -120,14 +137,143 @@ function rendererFromAction(action) {
+         return item.liveChatPaidStickerRenderer;
+     }
+     else if (item.liveChatMembershipItemRenderer) {
+-        return item.liveChatMembershipItemRenderer;
++        // Marked so consumers can tell a membership announcement from a plain
++        // text message by a member (identical ChatItem shape otherwise).
++        return Object.assign({}, item.liveChatMembershipItemRenderer, { rendererType: "membershipItem" });
++    }
++    else if (item.liveChatSponsorshipsGiftPurchaseAnnouncementRenderer) {
++        // Display fields live on the nested header renderer; id/timestamp/channel
++        // live on the outer renderer — flatten into one object.
++        const outer = item.liveChatSponsorshipsGiftPurchaseAnnouncementRenderer;
++        const header = outer.header && outer.header.liveChatSponsorshipsHeaderRenderer;
++        if (!header) {
++            return null;
++        }
++        return Object.assign({}, header, {
++            id: outer.id,
++            timestampUsec: outer.timestampUsec,
++            authorExternalChannelId: outer.authorExternalChannelId,
++            rendererType: "giftPurchase",
++        });
++    }
++    else if (item.liveChatSponsorshipsGiftRedemptionAnnouncementRenderer) {
++        return Object.assign({}, item.liveChatSponsorshipsGiftRedemptionAnnouncementRenderer, { rendererType: "giftRedemption" });
++    }
++    else if (item.giftMessageViewModel) {
++        // Newer paid Jewels/animated-gift feature. Unlike every renderer above,
++        // this is a ViewModel — a structurally different, flatter payload with
++        // none of the classic {simpleText}/{runs}/timestampUsec fields. Tagged
++        // separately so parseActionToChatItem can short-circuit around the
++        // shared classic-renderer extraction below instead of assuming fields
++        // that don't exist on this shape.
++        return Object.assign({}, item.giftMessageViewModel, { rendererType: "giftMessage" });
++    }
++    // A valid addChatItemAction whose item key we've never seen (e.g. a new
++    // paid-feature renderer YT ships later) — surface it instead of silently
++    // dropping it, so callers can capture it for fixture harvesting. item
++    // always has exactly one key: the renderer type name itself.
++    const unknownType = Object.keys(item)[0];
++    if (unknownType) {
++        return { rendererType: "unknown", unknownType: unknownType, raw: item[unknownType] };
+     }
+     return null;
+ }
+ /** an action to a ChatItem */
+ function parseActionToChatItem(data) {
+     var _a, _b, _c;
++    // Mod-action control messages — surfaced as control items instead of
++    // silently dropped (the stock/patched rendererFromAction above only
++    // handles addChatItemAction; every other action key falls through to
++    // null). Field shapes (targetItemId / externalChannelId) match YouTube's
++    // publicly reverse-engineered innertube live-chat action schema used
++    // across other YT chat scrapers; if a future YouTube revision changes
++    // them, the missing-field guard below routes the raw action to the same
++    // unknownAction capture path instead of emitting a broken control item.
++    if (data.markChatItemAsDeletedAction || data.removeChatItemAction) {
++        const key = data.markChatItemAsDeletedAction ? "markChatItemAsDeletedAction" : "removeChatItemAction";
++        const src = data[key];
++        if (src && typeof src.targetItemId === "string") {
++            return { rendererType: "deletion", targetId: src.targetItemId };
++        }
++        return { rendererType: "unknownAction", unknownType: key, raw: src };
++    }
++    if (data.markChatItemsByAuthorAsDeletedAction || data.removeChatItemByAuthorAction) {
++        const key = data.markChatItemsByAuthorAsDeletedAction ? "markChatItemsByAuthorAsDeletedAction" : "removeChatItemByAuthorAction";
++        const src = data[key];
++        if (src && typeof src.externalChannelId === "string") {
++            return { rendererType: "authorDeletion", authorChannelId: src.externalChannelId };
++        }
++        return { rendererType: "unknownAction", unknownType: key, raw: src };
++    }
++    // Known-benign noise: fires alongside addChatItemAction for
++    // superchats/memberships (a ticker summary of the paid event, already
++    // typed as `object` in the library's own yt-response.d.ts) — dropped, not
++    // captured, so it doesn't flood unknown-renderers.jsonl with a duplicate
++    // of data addChatItemAction already delivers.
++    if (data.addLiveChatTickerItemAction) {
++        return null;
++    }
++    // Any other action key we've never seen (not addChatItemAction, not one
++    // of the mod actions above, not the known ticker noise) — surface it for
++    // fixture harvesting instead of silently dropping it, closing the gap for
++    // whatever other action types YouTube ships.
++    if (!data.addChatItemAction) {
++        // clickTrackingParams rides alongside the real action key and sometimes
++        // sorts first in Object.keys() — picking it as unknownType recorded the
++        // tracking token instead of the actual action, discarding the action
++        // this branch exists to capture. Skip known noise keys; if every key is
++        // noise (or data is empty), key it "unknown" rather than dropping the
++        // line. raw is always the full action object, not just the value at the
++        // chosen key, so a wrong or noise-only key guess never loses data.
++        const unknownType = Object.keys(data).find((key) => !ACTION_NOISE_KEYS.includes(key)) || "unknown";
++        return { rendererType: "unknownAction", unknownType: unknownType, raw: data };
++    }
+     const messageRenderer = rendererFromAction(data);
++    if (messageRenderer && messageRenderer.rendererType === "unknown") {
++        // Short-circuit before any known-shape field extraction below (id,
++        // authorPhoto.thumbnails, etc.) — an unrecognized renderer can't be
++        // assumed to have any of those fields.
++        return messageRenderer;
++    }
++    if (messageRenderer && messageRenderer.rendererType === "giftMessage") {
++        // ViewModel shape has no authorName.simpleText, message.runs,
++        // timestampUsec, or authorPhoto — build the ChatItem directly instead
++        // of falling into the classic-renderer extraction below.
++        const authorName = ((messageRenderer.authorName && messageRenderer.authorName.content) || "")
++            .trim()
++            .replace(/^@/, "");
++        const text = (messageRenderer.text && messageRenderer.text.content) || "";
++        // Gift name, tier-agnostic: strip the leading "sent " verb from the
++        // ViewModel's own text ("sent Gold coin" -> "Gold coin", "sent 5
++        // Roses" -> "5 Roses"); fall back to the a11y label's "sent a gift, X"
++        // tail if text is ever empty. Never keyed off a literal tier string.
++        const giftName = text.replace(/^sent\s+/i, "") ||
++            (() => {
++                const m = (messageRenderer.giftImageA11yLabel || "").match(/sent a gift,\s*(.+)$/i);
++                return m ? m[1] : "";
++            })();
++        return {
++            id: messageRenderer.id,
++            author: { name: authorName, channelId: "" },
++            message: text ? [{ text: text }] : [],
++            isMembership: false,
++            isOwner: false,
++            isVerified: false,
++            isModerator: false,
++            // The ViewModel carries no timestampUsec, so this is wall-clock
++            // "now" rather than YouTube's send time. Side effect, accepted on
++            // purpose: a gift arriving inside a reconnect's preload batch will
++            // classify as live (not recovered) in classifyYtItem — no dim
++            // styling, buzzes like a live event. Id-dedupe (both here and in
++            // the worker's bounded id set) still kills true duplicates; the
++            // only case this affects is a genuinely-missed gift on reconnect,
++            // and that one SHOULD be loud, not silently dimmed. Do not "fix"
++            // this by trying to derive a real timestamp from the ViewModel —
++            // it doesn't carry one.
++            timestamp: new Date(),
++            giftMessage: { giftName: giftName },
++        };
++    }
+     if (messageRenderer === null) {
+         return null;
+     }
+@@ -136,7 +282,8 @@ function parseActionToChatItem(data) {
+         message = messageRenderer.message.runs;
+     }
+     else if ("headerSubtext" in messageRenderer) {
+-        message = messageRenderer.headerSubtext.runs;
++        // headerSubtext is sometimes {simpleText} instead of {runs}
++        message = messageRenderer.headerSubtext.runs || [];
+     }
+     const authorNameText = (_b = (_a = messageRenderer.authorName) === null || _a === void 0 ? void 0 : _a.simpleText) !== null && _b !== void 0 ? _b : "";
+     const ret = {
+@@ -191,6 +338,31 @@ function parseActionToChatItem(data) {
+             color: convertColorToHex6(messageRenderer.bodyBackgroundColor),
+         };
+     }
++    if (messageRenderer.rendererType === "membershipItem") {
++        // milestone ("Member for N months" headerPrimaryText) vs new member
++        const milestone = "headerPrimaryText" in messageRenderer;
++        if (milestone && !("message" in messageRenderer)) {
++            // headerSubtext on a milestone is the tier name, not a chat message
++            ret.message = [];
++        }
++        ret.membership = {
++            milestone: milestone,
++            headerText: milestone
++                ? textFromHeader(messageRenderer.headerPrimaryText)
++                : textFromHeader(messageRenderer.headerSubtext),
++        };
++    }
++    else if (messageRenderer.rendererType === "giftPurchase") {
++        const headerText = textFromHeader(messageRenderer.primaryText);
++        const countMatch = headerText.match(/(\d[\d,]*)/);
++        ret.membershipGift = {
++            count: countMatch ? Number(countMatch[1].replace(/,/g, "")) : 1,
++            headerText: headerText,
++        };
++    }
++    else if (messageRenderer.rendererType === "giftRedemption") {
++        ret.membershipGiftReceived = true;
++    }
+     return ret;
+ }
+ //# sourceMappingURL=parser.js.map
+\ No newline at end of file

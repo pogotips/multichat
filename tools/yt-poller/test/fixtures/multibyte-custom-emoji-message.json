@@ -1,0 +1,35 @@
+{
+  "liveChatTextMessageRenderer": {
+    "id": "Chz-multibyte-custom-emoji-message-id",
+    "timestampUsec": "1752570260000000",
+    "authorExternalChannelId": "UCmultibytefan00000000000",
+    "authorName": { "simpleText": "MultibyteFan" },
+    "authorPhoto": {
+      "thumbnails": [
+        { "url": "https://yt4.ggpht.com/multibytefan=s32", "width": 32, "height": 32 }
+      ]
+    },
+    "message": {
+      "runs": [
+        { "text": "🎉" },
+        { "text": "你好" },
+        { "text": "👨‍👩‍👧‍👦" },
+        {
+          "emoji": {
+            "emojiId": "UCtestchannel/custom_smile",
+            "shortcuts": [":_smile:"],
+            "searchTerms": ["smile"],
+            "isCustomEmoji": true,
+            "image": {
+              "thumbnails": [
+                { "url": "https://yt3.ggpht.com/custom_smile.png", "width": 24, "height": 24 }
+              ],
+              "accessibility": { "accessibilityData": { "label": "smile" } }
+            }
+          }
+        },
+        { "text": " nice!" }
+      ]
+    }
+  }
+}

@@ -1,0 +1,35 @@
+{
+  "liveChatMembershipItemRenderer": {
+    "id": "ChwKGkNKdUEwYUxUcC1BREZjOEs1UW9kQWc0QW5B",
+    "timestampUsec": "1752570000000000",
+    "authorExternalChannelId": "UCnewmember00000000000000",
+    "headerSubtext": {
+      "runs": [
+        { "text": "Welcome to " },
+        { "text": "Fan Club" },
+        { "text": "!" }
+      ]
+    },
+    "authorName": { "simpleText": "NewFan" },
+    "authorPhoto": {
+      "thumbnails": [
+        { "url": "https://yt4.ggpht.com/newfan=s32", "width": 32, "height": 32 },
+        { "url": "https://yt4.ggpht.com/newfan=s64", "width": 64, "height": 64 }
+      ]
+    },
+    "authorBadges": [
+      {
+        "liveChatAuthorBadgeRenderer": {
+          "customThumbnail": {
+            "thumbnails": [
+              { "url": "https://yt3.ggpht.com/badge=s16" },
+              { "url": "https://yt3.ggpht.com/badge=s32" }
+            ]
+          },
+          "tooltip": "New member",
+          "accessibility": { "accessibilityData": { "label": "New member" } }
+        }
+      }
+    ]
+  }
+}

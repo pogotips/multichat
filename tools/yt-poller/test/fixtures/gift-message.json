@@ -1,0 +1,56 @@
+{
+  "giftMessageViewModel": {
+    "text": {
+      "content": "sent Gold coin",
+      "styleRuns": [{ "startIndex": 0, "length": 14 }]
+    },
+    "authorName": {
+      "content": "@Jaydengames017 ",
+      "styleRuns": [{ "startIndex": 0, "length": 16 }]
+    },
+    "id": "ChwKGkNMMjF4ZkRtM0pVREZVZXd3Z0VkOEZRYUhn",
+    "authorAvatar": {
+      "avatarViewModel": {
+        "image": {
+          "sources": [
+            {
+              "url": "https://yt4.ggpht.com/QnlwN8SOrV22iLXrQqHBHukFT9Dx3nCWDXz2tcjVrULZdfxeJvu6NLc1iE6IpgGr0cbgvxNzTA=s32-c-k-c0x00ffffff-no-rj",
+              "width": 32,
+              "height": 32
+            },
+            {
+              "url": "https://yt4.ggpht.com/QnlwN8SOrV22iLXrQqHBHukFT9Dx3nCWDXz2tcjVrULZdfxeJvu6NLc1iE6IpgGr0cbgvxNzTA=s64-c-k-c0x00ffffff-no-rj",
+              "width": 64,
+              "height": 64
+            }
+          ],
+          "processor": { "borderImageProcessor": { "circular": true } }
+        },
+        "avatarImageSize": "AVATAR_SIZE_XS"
+      }
+    },
+    "giftImage": {
+      "sources": [
+        {
+          "url": "//www.gstatic.com/youtube/img/pdg/gift/assets/gold_coin_v2_320x320.png=w480-h480",
+          "width": 480,
+          "height": 480
+        },
+        {
+          "url": "//www.gstatic.com/youtube/img/pdg/gift/assets/gold_coin_v2_320x320.png=w640-h640",
+          "width": 640,
+          "height": 640
+        }
+      ]
+    },
+    "giftImageA11yLabel": "@Jaydengames017 sent a gift, Gold coin",
+    "rendererContext": {
+      "loggingContext": {
+        "loggingDirectives": {
+          "trackingParams": "CAIQ9p4PIhMI0rqY8ebclQMVw9Y_BB2QIzAW",
+          "visibility": { "types": "12" }
+        }
+      }
+    }
+  }
+}

@@ -1,0 +1,33 @@
+{
+  "liveChatTextMessageRenderer": {
+    "id": "Chz-standard-emoji-message-id",
+    "timestampUsec": "1752570250000000",
+    "authorExternalChannelId": "UCstandardfan000000000000",
+    "authorName": { "simpleText": "StandardFan" },
+    "authorPhoto": {
+      "thumbnails": [
+        { "url": "https://yt4.ggpht.com/standardfan=s32", "width": 32, "height": 32 }
+      ]
+    },
+    "message": {
+      "runs": [
+        { "text": "nice " },
+        {
+          "emoji": {
+            "emojiId": "😀",
+            "shortcuts": [":grinning:"],
+            "searchTerms": ["grinning"],
+            "isCustomEmoji": false,
+            "image": {
+              "thumbnails": [
+                { "url": "https://www.gstatic.com/android/keyboard/emojikitchen/grinning.png", "width": 24, "height": 24 }
+              ],
+              "accessibility": { "accessibilityData": { "label": "grinning face" } }
+            }
+          }
+        },
+        { "text": " stream" }
+      ]
+    }
+  }
+}

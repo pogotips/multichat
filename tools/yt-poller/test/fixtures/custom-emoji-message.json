@@ -1,0 +1,33 @@
+{
+  "liveChatTextMessageRenderer": {
+    "id": "Chz-custom-emoji-message-id",
+    "timestampUsec": "1752570240000000",
+    "authorExternalChannelId": "UCemojifan0000000000000000",
+    "authorName": { "simpleText": "EmojiFan" },
+    "authorPhoto": {
+      "thumbnails": [
+        { "url": "https://yt4.ggpht.com/emojifan=s32", "width": 32, "height": 32 }
+      ]
+    },
+    "message": {
+      "runs": [
+        { "text": "gg " },
+        {
+          "emoji": {
+            "emojiId": "UCtestchannel/custom_smile",
+            "shortcuts": [":_smile:"],
+            "searchTerms": ["smile"],
+            "isCustomEmoji": true,
+            "image": {
+              "thumbnails": [
+                { "url": "https://yt3.ggpht.com/custom_smile.png", "width": 24, "height": 24 }
+              ],
+              "accessibility": { "accessibilityData": { "label": "smile" } }
+            }
+          }
+        },
+        { "text": " nice!" }
+      ]
+    }
+  }
+}

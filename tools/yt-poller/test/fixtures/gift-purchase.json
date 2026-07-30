@@ -1,0 +1,46 @@
+{
+  "liveChatSponsorshipsGiftPurchaseAnnouncementRenderer": {
+    "id": "ChwKGkNQZm4wYUxUcC1BREZjOEs1UW9kQWc0QW5E",
+    "timestampUsec": "1752570180000000",
+    "authorExternalChannelId": "UCgifter00000000000000000",
+    "header": {
+      "liveChatSponsorshipsHeaderRenderer": {
+        "authorName": { "simpleText": "GenerousGifter" },
+        "authorPhoto": {
+          "thumbnails": [
+            { "url": "https://yt4.ggpht.com/gifter=s32", "width": 32, "height": 32 },
+            { "url": "https://yt4.ggpht.com/gifter=s64", "width": 64, "height": 64 }
+          ]
+        },
+        "primaryText": {
+          "runs": [
+            { "text": "Gifted ", "bold": true },
+            { "text": "5", "bold": true },
+            { "text": " ", "bold": true },
+            { "text": "Fan Club", "bold": true },
+            { "text": " memberships", "bold": true }
+          ]
+        },
+        "authorBadges": [
+          {
+            "liveChatAuthorBadgeRenderer": {
+              "customThumbnail": {
+                "thumbnails": [
+                  { "url": "https://yt3.ggpht.com/gifterbadge=s16" },
+                  { "url": "https://yt3.ggpht.com/gifterbadge=s32" }
+                ]
+              },
+              "tooltip": "Member (2 months)",
+              "accessibility": { "accessibilityData": { "label": "Member (2 months)" } }
+            }
+          }
+        ],
+        "image": {
+          "thumbnails": [
+            { "url": "https://www.gstatic.com/youtube/img/sponsorships/sponsorships_gift_purchase_announcement_artwork.png" }
+          ]
+        }
+      }
+    }
+  }
+}

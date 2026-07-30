@@ -1,0 +1,12 @@
+# Copy this file to `docker-compose.yml` and fill in your own values.
+# The real `docker-compose.yml` is gitignored — never commit real secrets.
+# See README.md for what each variable means.
+services:
+  multichat-yt-poller:
+    build: .
+    restart: unless-stopped
+    environment:
+      YT_CHANNEL_ID: "UCxxxxxxxxxxxxxxxxxxxxxx"      # your channel id (starts UC...)
+      MULTICHAT_URL: "https://multichat.YOUR_DOMAIN" # base URL of the multichat Worker
+      MULTICHAT_INGEST_SECRET: "replace-with-your-ingest-secret" # must match the Worker's secret
+      YOUTUBE_API_KEY: "replace-with-youtube-api-key" # optional — omit to leave live-counts off

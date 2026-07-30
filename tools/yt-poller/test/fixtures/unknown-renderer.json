@@ -1,0 +1,10 @@
+{
+  "liveChatPaidJewelRenderer": {
+    "id": "ChwKGkpld2Vsc1JlbmRlcmVyLUFERmM4SzVRb2RB",
+    "timestampUsec": "1752570180000000",
+    "authorExternalChannelId": "UCjeweler000000000000000",
+    "authorName": { "simpleText": "GemGifter" },
+    "purchaseAmountText": { "simpleText": "500 Jewels" },
+    "jewelCount": 500
+  }
+}
