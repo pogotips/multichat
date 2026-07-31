@@ -34,7 +34,6 @@ async function probeGateBehavior(helixDelayMs, reqId) {
   const id = env.HUB.idFromName(`gate-test-${reqId}`);
   const stub = env.HUB.get(id);
 
-  const logs = [];
   vi.stubGlobal('fetch', vi.fn(async (input) => {
     const url = typeof input === 'string' ? input : input.url;
     if (url.includes('id.twitch.tv/oauth2/token')) {
@@ -65,7 +64,7 @@ async function probeGateBehavior(helixDelayMs, reqId) {
   });
   const elapsedMs = performance.now() - t0;
 
-  return { res, elapsedMs, logs };
+  return { res, elapsedMs };
 }
 
 describe('Phase 4a/4b: DO input-gate dispatch probe (real workerd)', () => {

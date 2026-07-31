@@ -382,6 +382,14 @@ grant (`channel:moderate` plus per-action scopes) and fresh broadcaster
 consent beyond the four scopes already granted for this phase. Deliberately
 excluded; revisit only as an explicit, separately-scoped follow-up.
 
+**No rate limit on `/eventsub/callback` (accepted).** It's the only public
+unauthenticated route, but a forged/spam request is 403'd cheaply — body-size
+cap, then HMAC verification — entirely at the edge, before the DO stub is ever
+touched; cost per forgery is one edge invocation plus one HMAC. Twitch's own
+source IPs vary, so an IP-keyed throttle risks rate-limiting legitimate Twitch
+retries rather than an attacker. Accepted as-is rather than adding a
+`ratelimits` binding.
+
 ## 4. Gap Recovery & Telemetry/Capture Sinks
 
 ### Twitch (server-side, in the DO)
@@ -707,40 +715,26 @@ All client behavior lives in the inline `<script>` inside `PAGE_HTML`
   `touchstart` on `#feed` bubbles to the document-level `unlockTts` listener
   unchanged (nothing here calls `stopPropagation`), so a pull also serves as
   the first-gesture iOS audio unlock like any other tap.
-- **Refresh button + haptics** (2026.07.30.2): a `↻` button in the top-right
-  of `#topbar` is the only manual (non-gesture) refresh affordance — `⚿`
-  moved to the far left of the row, and the old `#status` connection dot was
-  removed (the tw/yt chip liveness dots and `#banner` already cover
-  connection state, making the dot redundant). Haptics are progressive
-  enhancement, platform-split at mount time via an `isIOS` UA/platform check:
-  on Android/desktop `#refreshBtn` stays a plain button, `navigator.vibrate()`
-  firing on its `click`. On iOS, `#refreshBtn` is replaced (`replaceWith`,
-  one control ever occupies that topbar slot) with a real `<input
-  type="checkbox" switch>`, created and mounted only there. JS-triggered
-  haptics have been dead on iOS Safari since 26.5, and an *invisible*
-  (`opacity:0`) switch overlay was tried first and confirmed dead on-device —
-  but a direct tap on an actually-*visible* native switch still produces the
-  system haptic, so the iOS switch is shrunk to icon scale via `font-size`
-  only (no `transform`/`appearance:none` — altering native rendering is what
-  risks losing the haptic). Its `change` handler fires `refreshReconnect()`
-  only on the on-toggle (`refreshSwitch.checked`); no click-based buzz call,
-  since the OS-level switch flip *is* the haptic. The switch springs back to
-  unchecked inside `clearRefreshPending()` — not immediately, but once the
-  refresh actually resolves (a message lands or the 5s window times out) —
-  so the slide-back itself reads as "refresh done" instead of an instant
-  bounce; that one reset point covers both paths since both already routed
-  through `clearRefreshPending()` before the switch existed.
+- **Refresh button** (2026.07.30.2, haptics removed 2026-07-31): a `↻` button
+  in the top-right of `#topbar` is the only manual (non-gesture) refresh
+  affordance, on every platform — `⚿` moved to the far left of the row, and
+  the old `#status` connection dot was removed (the tw/yt chip liveness dots
+  and `#banner` already cover connection state, making the dot redundant).
   `refreshReconnect()` is the shared reconnect core — the same `/api/version`
   + `versionMismatch` + `connect()` logic `triggerPullRefresh` always used,
-  factored out so the button/switch and pull gesture share one path and one
+  factored out so the button and pull gesture share one path and one
   in-flight guard (`refreshBusy`, distinct from pull's own `pullBusy`). A
-  `pendingRefreshConfirm` flag fires a one-shot `[10, 30, 10]` "refresh
-  landed" buzz on the next SSE message (Android only; the iOS switch's own
-  reset is its feedback) — ordinary live messages never buzz for refresh,
-  only financial/raid rows keep their existing `fireEmission` buzz. The
-  `visibilitychange` staleness watchdog gets a debounced (30s) ack-only buzz,
-  no success flag — otherwise rapid background/foreground churn mid-stream
-  would buzz-storm Android.
+  `pendingRefreshConfirm`/`refreshConfirmTimer` pair clears `refreshBusy`
+  once the refresh actually resolves — consumed by the next SSE message
+  within ~5s, or cleared by the timeout / a version-mismatch reload — with no
+  haptic feedback attached to it (an earlier iOS `<input type="checkbox"
+  switch>` haptic workaround was removed entirely: JS-triggered haptics have
+  been dead on iOS Safari since 26.5, an *invisible* overlay never worked,
+  and a *visible* native switch worked but was a confusing, inconsistent
+  control across platforms — simpler to have no haptic anywhere for refresh
+  than a plain button on Android/desktop and a switch on iOS). Ordinary live
+  messages never touch this path — only financial/raid rows keep their
+  existing `fireEmission` buzz, which is a separate feature.
 
 ## 6. Deploy Runbook
 

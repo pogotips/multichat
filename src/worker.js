@@ -3,9 +3,11 @@
 // and workerd rejects a non-function/class top-level named export from an
 // entry module (see lib.js's own header comment for the full why). Every
 // `export function`/`export class` below this line is fine as-is.
-import { PENDING_MOD_TTL_MS, PENDING_MOD_MAX, VALID_KINDS, TTS_LABELS, EMIT_TTL_MS } from './lib.js';
+import { PENDING_MOD_TTL_MS, PENDING_MOD_MAX, VALID_KINDS, TTS_LABELS, EMIT_TTL_MS, FINANCIAL_KINDS } from './lib.js';
 
-const RELEASE_VERSION = '2026.07.30.2'; // CalVer, human-facing
+const RELEASE_VERSION = '2026.07.31.2'; // CalVer, human-facing
+
+const ENC = new TextEncoder(); // module-level memo — avoid a throwaway TextEncoder per call on hot paths
 
 // PWA icons, cut once from assets/icon-master-1024.png via sips and embedded as
 // base64 — no runtime image processing, no committed generated PNGs.
@@ -29,6 +31,7 @@ const TW_FOLLOWERS_STALE_MS = 2 * TW_FOLLOWERS_POLL_MS;
 const TW_USER_REFRESH_TOKEN_KEY = 'twUserRefreshToken'; // ctx.storage key — see getTwitchUserToken
 const RECOVER_TIMEOUT_MS = 3000;         // recent-messages fetch: hard cap, must never delay reconnect
 const RECOVER_MAX_AGE_MS = 10 * 60_000;  // gap-recovery window cap
+const TWITCH_API_TIMEOUT_MS = 5000;      // app-token + Helix streams-discovery fetches: hard cap, never block chat
 const CAPTURE_FLUSH_LINES = 50;   // mid-session burst trigger — fire-and-forget
 const CAPTURE_MAX_BUFFER = 500;   // hard cap: a stuck/failing R2 can never OOM the DO
 const INGEST_MAX_BYTES = 16 * 1024; // generous for one chat event; rejects runaway/compromised poller bodies
@@ -41,16 +44,6 @@ const MAX_SSE_AGE_MS = 6 * 60 * 60_000; // force-close SSE streams older than th
 // delete/author_delete can reach this DO before the chat message it targets.
 // pendingYtDeletes/pendingAuthorDeletes buffer that race instead of letting
 // markDeletedYt no-op it away; pushMessage checks both on every yt insert.
-// (PENDING_MOD_TTL_MS/PENDING_MOD_MAX themselves are imported from lib.js above.)
-
-// Financial/paid kinds, for the enumerable per-event server log line. Excludes
-// member_gift_received (redemption noise — a gift bomb is one member_gift plus
-// up to 20 redemptions). Mirrors VALID_KINDS' paid subset; kept here so the log
-// gate never depends on client render state.
-const FINANCIAL_KINDS = new Set([
-  'cheer', 'sub', 'giftsub', 'superchat', 'supersticker',
-  'member_new', 'member_milestone', 'member_gift', 'member_renewed', 'yt_gift',
-]);
 
 // Twitch EventSub webhook — channel-point redemptions, hype train, ad break.
 // Raids are deliberately NOT subscribed here: IRC USERNOTICE already renders
@@ -108,9 +101,9 @@ const ROUTES = [
   ['POST', /^\/eventsub\/callback$/, handleEventSubCallback],
   ['GET', /^\/api\/version$/, handleVersion],
   ['GET', /^\/manifest\.webmanifest$/, handleManifest],
-  ['GET', /^\/icon-180\.png$/, () => handleIcon(ICON_180_B64)],
-  ['GET', /^\/icon-192\.png$/, () => handleIcon(ICON_192_B64)],
-  ['GET', /^\/icon-512\.png$/, () => handleIcon(ICON_512_B64)],
+  ['GET', /^\/icon-180\.png$/, () => handleIcon(ICON_180_BYTES ??= iconBytes(ICON_180_B64))],
+  ['GET', /^\/icon-192\.png$/, () => handleIcon(ICON_192_BYTES ??= iconBytes(ICON_192_B64))],
+  ['GET', /^\/icon-512\.png$/, () => handleIcon(ICON_512_BYTES ??= iconBytes(ICON_512_B64))],
 ];
 
 export default {
@@ -159,6 +152,11 @@ function handleManifest() {
   });
 }
 
+// Icons are served immutable/max-age=1y, but the base64 decode itself ran
+// per-request — each cold hit re-decoded 18-61KB char-by-char. The
+// ROUTES-level ??= memoizes the decoded bytes lazily on first hit per isolate.
+let ICON_180_BYTES, ICON_192_BYTES, ICON_512_BYTES;
+
 function iconBytes(b64) {
   const bin = atob(b64);
   const bytes = new Uint8Array(bin.length);
@@ -166,8 +164,8 @@ function iconBytes(b64) {
   return bytes;
 }
 
-function handleIcon(b64) {
-  return new Response(iconBytes(b64), {
+function handleIcon(bytes) {
+  return new Response(bytes, {
     headers: { 'content-type': 'image/png', 'cache-control': 'public, max-age=31536000, immutable' },
   });
 }
@@ -211,7 +209,7 @@ async function handleIngestYt(req, env, ctx, url) {
     return new Response('payload too large', { status: 413 });
   }
   const bodyText = await req.text();
-  if (new TextEncoder().encode(bodyText).length > INGEST_MAX_BYTES) {
+  if (ENC.encode(bodyText).length > INGEST_MAX_BYTES) {
     return new Response('payload too large', { status: 413 });
   }
   const stub = env.HUB.getByName('main');
@@ -248,7 +246,7 @@ export async function handleEventSubCallback(req, env, ctx) {
     return new Response('payload too large', { status: 413 });
   }
   const rawBody = await req.text();
-  if (new TextEncoder().encode(rawBody).length > EVENTSUB_MAX_BYTES) {
+  if (ENC.encode(rawBody).length > EVENTSUB_MAX_BYTES) {
     return new Response('payload too large', { status: 413 });
   }
   const id = req.headers.get('twitch-eventsub-message-id');
@@ -320,8 +318,8 @@ export async function handleEventSubCallback(req, env, ctx) {
 
 export function safeEqual(a, b) {
   if (typeof a !== 'string' || typeof b !== 'string') return false;
-  const bufA = new TextEncoder().encode(a);
-  const bufB = new TextEncoder().encode(b);
+  const bufA = ENC.encode(a);
+  const bufB = ENC.encode(b);
   if (bufA.length !== bufB.length) return false;
   let diff = 0;
   for (let i = 0; i < bufA.length; i++) diff |= bufA[i] ^ bufB[i];
@@ -648,25 +646,25 @@ export class ChatHub {
     this.clients.delete(controller);
   }
 
-  sendToController(controller, msg) {
-    const payload = `id: ${msg.id}\ndata: ${JSON.stringify(msg)}\n\n`;
+  // Per-client enqueue — one dead controller must never break the loop for
+  // the others, so the catch (and resulting dropClient) stays scoped here.
+  enqueueBytes(controller, bytes) {
     try {
-      controller.enqueue(new TextEncoder().encode(payload));
+      controller.enqueue(bytes);
     } catch {
       this.dropClient(controller, 'enqueue-error');
     }
+  }
+
+  sendToController(controller, msg) {
+    this.enqueueBytes(controller, ENC.encode(`id: ${msg.id}\ndata: ${JSON.stringify(msg)}\n\n`));
   }
 
   // Named SSE event (ping / status) — distinct from the default "message"
   // event so the client can tell a liveness signal from a chat message
   // without parsing payloads.
   sendEventTo(controller, event, dataObj) {
-    const payload = `event: ${event}\ndata: ${JSON.stringify(dataObj)}\n\n`;
-    try {
-      controller.enqueue(new TextEncoder().encode(payload));
-    } catch {
-      this.dropClient(controller, 'enqueue-error');
-    }
+    this.enqueueBytes(controller, ENC.encode(`event: ${event}\ndata: ${JSON.stringify(dataObj)}\n\n`));
   }
 
   // Reaps dead/zombie SSE readers on each heartbeat tick — the actual fix for
@@ -702,12 +700,18 @@ export class ChatHub {
     this.dropClient(controller, reason);
   }
 
+  // Encode once, enqueue the same bytes to every client — the SSE stream is a
+  // default (non-byte) ReadableStream, so enqueue() does not detach the
+  // shared buffer. Per-client dead-controller handling still lives in
+  // enqueueBytes, so one bad client never breaks the loop for the rest.
   broadcast(msg) {
-    for (const controller of this.clients) this.sendToController(controller, msg);
+    const bytes = ENC.encode(`id: ${msg.id}\ndata: ${JSON.stringify(msg)}\n\n`);
+    for (const controller of this.clients) this.enqueueBytes(controller, bytes);
   }
 
   broadcastEvent(event, dataObj) {
-    for (const controller of this.clients) this.sendEventTo(controller, event, dataObj);
+    const bytes = ENC.encode(`event: ${event}\ndata: ${JSON.stringify(dataObj)}\n\n`);
+    for (const controller of this.clients) this.enqueueBytes(controller, bytes);
   }
 
   buildStatusPayload() {
@@ -923,8 +927,6 @@ export class ChatHub {
     try {
       const cutoffTs = this.lastTwTmiSentTs;
       const floorTs = Date.now() - RECOVER_MAX_AGE_MS;
-      const controller = new AbortController();
-      const timer = setTimeout(() => controller.abort(), RECOVER_TIMEOUT_MS);
       let body;
       const spanId = beginFetchSpan('backfill');
       // outcome flips to 'ok' only once the fetch resolves — a throw/abort
@@ -934,13 +936,12 @@ export class ChatHub {
       try {
         const res = await fetch(
           `https://recent-messages.robotty.de/api/v2/recent-messages/${encodeURIComponent(this.env.TWITCH_CHANNEL)}`,
-          { signal: controller.signal }
+          { signal: AbortSignal.timeout(RECOVER_TIMEOUT_MS) }
         );
         fetchOutcome = 'ok';
         if (!res.ok) return;
         body = await res.json();
       } finally {
-        clearTimeout(timer);
         endFetchSpan(spanId, fetchOutcome);
       }
       if (!body || !Array.isArray(body.messages)) return;
@@ -1025,6 +1026,7 @@ export class ChatHub {
             client_secret: this.env.TWITCH_CLIENT_SECRET,
             grant_type: 'client_credentials',
           }),
+          signal: AbortSignal.timeout(TWITCH_API_TIMEOUT_MS),
         });
         fetchOutcome = 'ok';
       } finally {
@@ -1065,7 +1067,10 @@ export class ChatHub {
       try {
         res = await fetch(
           `https://api.twitch.tv/helix/streams?user_login=${encodeURIComponent(this.env.TWITCH_CHANNEL)}`,
-          { headers: { 'Client-Id': this.env.TWITCH_CLIENT_ID, 'Authorization': `Bearer ${token}` } }
+          {
+            headers: { 'Client-Id': this.env.TWITCH_CLIENT_ID, 'Authorization': `Bearer ${token}` },
+            signal: AbortSignal.timeout(TWITCH_API_TIMEOUT_MS),
+          }
         );
         fetchOutcome = 'ok';
       } finally {
@@ -1597,7 +1602,7 @@ export class ChatHub {
         }
         // Belt-and-suspenders: normally the SSE stream's cancel() already
         // stopped this when the last client left, but a client removed via
-        // the enqueue-catch path in sendToController/sendEventTo bypasses
+        // the enqueue-catch path in enqueueBytes() bypasses
         // cancel() — without this, the interval pins the DO awake forever.
         // The heartbeat-tick reap (reapDeadClients) is the primary fix for a
         // zombie client keeping clients.size > 0 so this branch is reached at
@@ -1761,14 +1766,21 @@ export class ChatHub {
         } catch {}
         continue;
       }
-      const privmsg = parsePrivmsg(line);
+      // Tags are parsed at most once per line here and threaded into every
+      // parser/ircMeta call below — previously parsePrivmsg, a failed-then-
+      // retried parseUsernotice, and ircMeta each independently re-ran
+      // parseIrcTags on the same "@tag1=...;tag2=..." prefix (up to 3 full
+      // passes for a single USERNOTICE line, the hottest path in the DO).
+      const tagsSpaceIdx = line.startsWith('@') ? line.indexOf(' ') : -1;
+      const lineTags = tagsSpaceIdx > 0 ? parseIrcTags(line.slice(0, tagsSpaceIdx)) : {};
+      const privmsg = parsePrivmsg(line, lineTags);
       if (privmsg) {
-        this.pushMessage('tw', privmsg, ircMeta(line));
+        this.pushMessage('tw', privmsg, ircMeta(line, lineTags));
         continue;
       }
-      const usernotice = parseUsernotice(line);
+      const usernotice = parseUsernotice(line, lineTags);
       if (usernotice) {
-        this.pushMessage('tw', usernotice, ircMeta(line));
+        this.pushMessage('tw', usernotice, ircMeta(line, lineTags));
         continue;
       }
       const clearmsg = parseClearmsg(line);
@@ -1845,13 +1857,16 @@ function badgeFlags(tags) {
   };
 }
 
-export function parsePrivmsg(line) {
+// preParsedTags lets a caller that already parsed this line's tags (e.g.
+// handleIrcData) skip a second full parseIrcTags pass; omit it to parse the
+// line directly (existing direct-call behavior, used by tests).
+export function parsePrivmsg(line, preParsedTags) {
   let rest = line;
   let tags = {};
   if (rest.startsWith('@')) {
     const spaceIdx = rest.indexOf(' ');
     if (spaceIdx === -1) return null;
-    tags = parseIrcTags(rest.slice(0, spaceIdx));
+    tags = preParsedTags || parseIrcTags(rest.slice(0, spaceIdx));
     rest = rest.slice(spaceIdx + 1);
   }
   if (!rest.startsWith(':')) return null;
@@ -1923,13 +1938,14 @@ const USERNOTICE_SYS = {
   announcement: 'announce',
 };
 
-export function parseUsernotice(line) {
+// preParsedTags: see parsePrivmsg's comment above — same opt-in reuse.
+export function parseUsernotice(line, preParsedTags) {
   let rest = line;
   let tags = {};
   if (rest.startsWith('@')) {
     const spaceIdx = rest.indexOf(' ');
     if (spaceIdx === -1) return null;
-    tags = parseIrcTags(rest.slice(0, spaceIdx));
+    tags = preParsedTags || parseIrcTags(rest.slice(0, spaceIdx));
     rest = rest.slice(spaceIdx + 1);
   }
   if (!rest.startsWith(':')) return null;
@@ -2088,12 +2104,13 @@ export function isProtocolNoise(line) {
 }
 
 // Twitch's own message id + send-ts, for gap-recovery dedup/ordering — kept
-// separate from parsePrivmsg/parseUsernotice since the SSE feed never needs them.
-function ircMeta(line) {
+// separate from parsePrivmsg/parseUsernotice since the SSE feed never needs
+// them. preParsedTags: see parsePrivmsg's comment — same opt-in reuse.
+function ircMeta(line, preParsedTags) {
   if (!line.startsWith('@')) return {};
   const spaceIdx = line.indexOf(' ');
   if (spaceIdx === -1) return {};
-  const tags = parseIrcTags(line.slice(0, spaceIdx));
+  const tags = preParsedTags || parseIrcTags(line.slice(0, spaceIdx));
   const ts = Number(tags['tmi-sent-ts']);
   return { id: tags.id, ts: Number.isFinite(ts) ? ts : undefined };
 }
@@ -2161,8 +2178,6 @@ export function filterRecoveredMessages(lines, { cutoffTs, floorTs, seenIds }) {
   return recovered;
 }
 
-// (VALID_KINDS itself is imported from lib.js above.)
-
 // Authoritative (worker-side) allowlist for YouTube custom-emoji image hosts —
 // the only two domains YT actually serves chat emoji images from. ytimg.com is
 // deliberately excluded: it's thumbnails, never chat emojis, in this field.
@@ -2226,11 +2241,11 @@ export function normalizeYt(body) {
   if (typeof user !== 'string' || !user.trim()) throw new Error('missing user');
   if (typeof text !== 'string' || !text.trim()) throw new Error('missing text');
   const trimmedUser = user.trim();
-  const out = { user: trimmedUser.length > 100 ? trimmedUser.slice(0, 100) : trimmedUser, text: text.length > 500 ? text.slice(0, 500) : text };
+  const out = { user: ellipsize(trimmedUser, 100), text: ellipsize(text, 500) };
   if (typeof color === 'string' && /^#[0-9a-fA-F]{6}$/.test(color)) out.color = color;
   if (typeof kind === 'string' && VALID_KINDS.has(kind)) out.kind = kind;
   if (typeof amount === 'string' && amount.trim()) {
-    out.amount = amount.length > 32 ? amount.slice(0, 32) : amount;
+    out.amount = ellipsize(amount, 32);
   }
   if (typeof isMod === 'boolean') out.isMod = isMod;
   if (typeof isMember === 'boolean') out.isMember = isMember;
@@ -2241,8 +2256,6 @@ export function normalizeYt(body) {
   if (cleanedEmotes) out.emotes = cleanedEmotes;
   return out;
 }
-
-// (TTS_LABELS and EMIT_TTL_MS themselves are imported from lib.js above.)
 
 // ── Twitch EventSub ──────────────────────────────────────────────────────
 
@@ -2435,6 +2448,15 @@ export function versionMismatch(clientVersion, serverVersion) {
 
 // ── Static page ──────────────────────────────────────────────────────────
 
+// JSON-into-<script> interpolation must escape `<` — otherwise a value
+// containing "</script>" (or "<!--") breaks out of the inline script block.
+// Values here are operator/deploy-controlled, not attacker data, so this is
+// conformance rather than a live vuln — but a pathological
+// MULTICHAT_MY_NAME shouldn't be able to break/attack its own page.
+function jsonForScript(value) {
+  return JSON.stringify(value).replace(/</g, '\\u003c');
+}
+
 function pageHtml(myName) {
   return `<!doctype html>
 <html lang="en">
@@ -2532,7 +2554,7 @@ function pageHtml(myName) {
   const countTw = document.getElementById('count-tw');
   const countYt = document.getElementById('count-yt');
   const fontToggle = document.getElementById('fontToggle');
-  const MY_NAME = ${JSON.stringify(myName)}; // empty disables self-mention highlighting
+  const MY_NAME = ${jsonForScript(myName)}; // empty disables self-mention highlighting
   const MAX_ROWS = 300;
   const STALE_AFTER_MS = 60_000; // reconnect if nothing (not even a ping) heard in this long while backgrounded
   const CHIP_WARN_MS = 60_000;
@@ -2554,9 +2576,9 @@ function pageHtml(myName) {
 
   // ── TTS read-aloud ───────────────────────────────────────────────────
   const speakToggle = document.getElementById('speakToggle');
-  const TTS_LABELS = ${JSON.stringify(TTS_LABELS)};
+  const TTS_LABELS = ${jsonForScript(TTS_LABELS)};
   const EMIT_TTL_MS = ${EMIT_TTL_MS};
-  const BUILD_VERSION = ${JSON.stringify(RELEASE_VERSION)};
+  const BUILD_VERSION = ${jsonForScript(RELEASE_VERSION)};
   // NOTE: these interpolate the literal function source via Function.prototype.toString().
   // If this Worker's build is ever configured to minify, a renamed export here would silently
   // desync from the plain-text call sites below (isEmittable(...), etc.) — a client-side
@@ -2902,49 +2924,38 @@ function pageHtml(myName) {
     if (window.speechSynthesis && speakEnabled) startKeepalive();
   }
 
-  // ── Haptics (progressive enhancement) ───────────────────────────────────
-  // Android: navigator.vibrate() works from any JS call site, wired to
-  // #refreshBtn's click. iOS: JS-triggered haptics have been dead since
-  // Safari 26.5 — an *invisible* (opacity:0) <input type="checkbox" switch>
-  // overlay was tried first and confirmed dead on-device (no haptic). A
-  // *visible* native switch does still produce the system haptic on direct
-  // tap, so on iOS #refreshBtn is swapped for a real (shrunk via font-size,
-  // not transform/appearance:none — altering native rendering is what risks
-  // losing the haptic) <input switch>, mounted only there. Never gate refresh
-  // *logic* on vibrate support — only the buzz itself is conditional.
-  function haptic(pattern = 15) { if (navigator.vibrate) navigator.vibrate(pattern); }
-  const isIOS = /iP(hone|od|ad)/.test(navigator.platform)
-    || (navigator.platform === 'MacIntel' && navigator.maxTouchPoints > 1);
-  let refreshSwitch = null;
-
   // Shared reconnect core for the refresh button + pull-to-refresh. refreshBusy
   // is a global in-flight guard (separate from pull's own pullBusy, which only
   // gates the pull gesture's indicator) so a double-tap on the button or a
   // pull-during-button-refresh no-ops instead of racing two connect() calls.
-  // pendingRefreshConfirm/refreshConfirmTimer drive the one-shot success buzz:
-  // consumed by the next onmessage within ~5s, or cleared by the timeout /
-  // a version-mismatch reload (reload navigates away — only the tap-ack buzz
-  // fired, no success buzz, and that's expected, not a bug).
+  // pendingRefreshConfirm/refreshConfirmTimer clear refreshBusy once the
+  // refresh actually resolves: consumed by the next onmessage within ~5s, or
+  // cleared by the timeout / a version-mismatch reload (reload navigates away
+  // — refreshBusy simply never matters again, and that's fine).
+  // onGaveUp fires whenever this call will NOT wait for a live confirmation
+  // (no token, or the version fetch itself failed) — pull-to-refresh uses it
+  // to hide its indicator immediately instead of riding the 3s fallback, per
+  // the documented "same as toggling airplane mode briefly" behavior (5a).
   let refreshBusy = false;
   let pendingRefreshConfirm = false;
   let refreshConfirmTimer = null;
-  let lastWatchdogHapticTs = 0;
 
   function clearRefreshPending() {
     pendingRefreshConfirm = false;
     refreshBusy = false;
     clearTimeout(refreshConfirmTimer);
-    // Called from both the success path (onmessage) and the 5s timeout
-    // fallback below — one reset point covers the switch springing back
-    // whether refresh lands fast or times out quiet.
-    if (isIOS && refreshSwitch) refreshSwitch.checked = false;
   }
 
-  function refreshReconnect(onConnected) {
+  // pendingRefreshConfirm is deliberately NOT set before the await fetch —
+  // it's set only right before each connect() call below, in the same
+  // synchronous tick that reassigns es to the new socket. Setting it earlier
+  // left a window where a message on the still-open OLD socket would pass
+  // its socket-not-equal-es guard (es not reassigned yet), find
+  // pendingRefreshConfirm already true, and consume the one-shot confirm
+  // before the refresh actually happened.
+  function refreshReconnect(onConnected, onGaveUp) {
     if (refreshBusy) return;
     refreshBusy = true;
-    pendingRefreshConfirm = true;
-    refreshConfirmTimer = setTimeout(clearRefreshPending, 5000);
     fetch('/api/version', { cache: 'no-store' }).then((r) => r.json()).then((data) => {
       if (versionMismatch(BUILD_VERSION, data.releaseVersion)) {
         location.reload();
@@ -2952,43 +2963,29 @@ function pageHtml(myName) {
       }
       if (!token) {
         clearRefreshPending();
+        if (onGaveUp) onGaveUp();
         return;
       }
+      pendingRefreshConfirm = true;
+      refreshConfirmTimer = setTimeout(clearRefreshPending, 5000);
       connect();
       if (onConnected) onConnected(es);
     }).catch(() => {
       if (token) {
+        pendingRefreshConfirm = true;
+        refreshConfirmTimer = setTimeout(clearRefreshPending, 5000);
         connect();
         if (onConnected) onConnected(es);
       } else {
         clearRefreshPending();
       }
+      if (onGaveUp) onGaveUp();
     });
   }
 
-  if (isIOS) {
-    refreshSwitch = document.createElement('input');
-    refreshSwitch.type = 'checkbox';
-    refreshSwitch.id = 'refreshSwitch';
-    refreshSwitch.setAttribute('switch', '');
-    refreshSwitch.setAttribute('aria-label', 'Refresh feed'); // replaces a button — must keep an accessible name
-    refreshSwitch.style.fontSize = '9px'; // shrinks the native control to icon scale
-    refreshSwitch.style.pointerEvents = 'auto'; // #topbar sets pointer-events:none
-    refreshSwitch.style.accentColor = '#5096ff'; // matches the app's existing accent (tokenPrompt button); :root already sets color-scheme:dark so the native track itself needs no further override
-    refreshBtn.replaceWith(refreshSwitch);
-    refreshSwitch.addEventListener('change', () => {
-      // Only the on-toggle triggers a refresh — no immediate reset here.
-      // The switch springs back to unchecked in clearRefreshPending() once
-      // the refresh actually lands (or times out), so the slide-back itself
-      // is the "done" feedback instead of an instant bounce.
-      if (refreshSwitch.checked) refreshReconnect();
-    });
-  } else {
-    refreshBtn.addEventListener('click', () => {
-      haptic(15); // ack — Android vibrates; desktop has no vibrate API, silently no-ops
-      refreshReconnect();
-    });
-  }
+  refreshBtn.addEventListener('click', () => {
+    refreshReconnect();
+  });
 
   function scheduleReconnect() {
     showBanner();
@@ -3023,10 +3020,7 @@ function pageHtml(myName) {
       try {
         const msg = JSON.parse(e.data);
         lastMsgId = msg.id;
-        if (pendingRefreshConfirm) {
-          clearRefreshPending();
-          haptic([10, 30, 10]); // refresh landed — not a per-message buzz
-        }
+        if (pendingRefreshConfirm) clearRefreshPending();
         addRow(msg);
       } catch {}
     };
@@ -3120,13 +3114,6 @@ function pageHtml(myName) {
       // nothing (not even a ping) came through recently, the EventSource is
       // likely dead without ever firing onerror — force a fresh connection.
       if (token && Date.now() - lastActivityTs > STALE_AFTER_MS) {
-        // Debounced ack buzz only — no success-buzz flag here. Rapid bg/fg
-        // churn (e.g. switching apps repeatedly mid-stream) must not turn
-        // into a buzz storm the way an un-debounced haptic() per call would.
-        if (Date.now() - lastWatchdogHapticTs > 30_000) {
-          haptic();
-          lastWatchdogHapticTs = Date.now();
-        }
         connect();
       }
     }
@@ -3161,25 +3148,30 @@ function pageHtml(myName) {
   // (captured right after connect() returns, since es is reassigned
   // synchronously), or a 3s timeout settles it quietly either way.
   function triggerPullRefresh() {
-    if (pullBusy || refreshBusy) return;
+    if (pullBusy || refreshBusy) {
+      // A concurrent refresh (button already in flight) means this gesture
+      // no-ops — but touchmove already painted "release to refresh" before
+      // touchend got here, so it must be cleared here too or the pill sticks
+      // until the next unrelated touch.
+      pullIndicatorEl.classList.remove('show');
+      return;
+    }
     pullBusy = true;
-    haptic(15);
     pullIndicatorEl.textContent = 'refreshing…';
     pullIndicatorEl.classList.add('show');
     const timeoutId = setTimeout(() => settlePull(timeoutId), 3000);
     // Routed through the same refreshReconnect() core the refresh button uses
-    // (version-check → reload/connect, in-flight guard, success-buzz flag) so
-    // pull-to-refresh isn't a second bespoke reconnect path. onConnected fires
-    // synchronously right after connect() reassigns es — still in time to
-    // attach these one-shot listeners for the *new* socket.
+    // (version-check → reload/connect, in-flight guard) so pull-to-refresh
+    // isn't a second bespoke reconnect path. onConnected fires synchronously
+    // right after connect() reassigns es — still in time to attach these
+    // one-shot listeners for the *new* socket. onGaveUp covers the no-token /
+    // fetch-failed cases, which will never produce a message to settle on —
+    // settle instantly there instead of riding the 3s timeout.
     refreshReconnect((socket) => {
       const onSettle = () => settlePull(timeoutId);
       socket.addEventListener('message', onSettle, { once: true });
       socket.addEventListener('status', onSettle, { once: true });
-    });
-    // refreshReconnect() no-ops (busy) or resolves to a no-token skip without
-    // ever calling onConnected — either way the 3s timeout still settles the
-    // pull indicator so it never gets stuck visible.
+    }, () => settlePull(timeoutId));
   }
 
   if (window.matchMedia('(display-mode: standalone)').matches) {

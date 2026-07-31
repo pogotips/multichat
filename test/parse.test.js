@@ -416,17 +416,18 @@ describe('normalizeYt', () => {
     expect(() => normalizeYt('nope')).toThrow();
   });
 
-  it('clamps user to 100 chars', () => {
+  it('clamps user to 100 code points', () => {
     const long = 'x'.repeat(150);
     const result = normalizeYt({ user: long, text: 'hi' });
-    expect(result.user).toHaveLength(100);
-    expect(result.user).toBe('x'.repeat(100));
+    expect([...result.user].length).toBe(100);
+    expect(result.user).toBe('x'.repeat(99) + '…');
   });
 
-  it('clamps overlong text to 500 chars', () => {
+  it('clamps overlong text to 500 code points', () => {
     const long = 'x'.repeat(600);
     const result = normalizeYt({ user: 'Alice', text: long });
-    expect(result.text.length).toBe(500);
+    expect([...result.text].length).toBe(500);
+    expect(result.text.endsWith('…')).toBe(true);
   });
 
   it('accepts a valid kind + amount', () => {

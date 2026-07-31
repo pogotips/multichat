@@ -33,6 +33,12 @@ export const VALID_KINDS = new Set([
   'yt_gift',
 ]);
 
+// Financial/paid subset of VALID_KINDS, for the enumerable per-event server
+// log line. Excludes member_gift_received (redemption noise — a gift bomb is
+// one member_gift plus up to 20 redemptions). Derived rather than
+// hand-restated so a new VALID_KINDS entry can't silently miss this set.
+export const FINANCIAL_KINDS = new Set([...VALID_KINDS].filter((k) => k !== 'member_gift_received'));
+
 // Speech label per financial `kind` — kept separate from the on-screen
 // badge/text so YouTube's "gift" and Twitch's community-gift burst, which
 // render similarly, are disambiguated out loud. Falls back to the raw kind
