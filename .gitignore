@@ -1,5 +1,6 @@
 node_modules/
 .wrangler/
+.DS_Store
 
 # Real config — copy the .example files and fill in your own values.
 # The .example variants are committed; these real ones stay local.
