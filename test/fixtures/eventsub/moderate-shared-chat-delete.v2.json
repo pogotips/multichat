@@ -1,0 +1,50 @@
+{
+  "subscription": {
+    "id": "7297f7eb-3bf5-461f-8ae6-7cd7781ebced",
+    "type": "channel.moderate",
+    "version": "2",
+    "status": "enabled",
+    "condition": { "broadcaster_user_id": "423374343", "moderator_user_id": "423374343" },
+    "transport": { "method": "webhook", "callback": "https://example.com/eventsub/callback" },
+    "created_at": "2024-02-23T21:12:33.771005262Z"
+  },
+  "event": {
+    "broadcaster_user_id": "423374343",
+    "broadcaster_user_login": "glowillig",
+    "broadcaster_user_name": "glowillig",
+    "source_broadcaster_user_id": "41292030",
+    "source_broadcaster_user_login": "adflynn404",
+    "source_broadcaster_user_name": "adflynn404",
+    "moderator_user_id": "424596340",
+    "moderator_user_login": "quotrok",
+    "moderator_user_name": "quotrok",
+    "action": "shared_chat_delete",
+    "followers": null,
+    "slow": null,
+    "vip": null,
+    "unvip": null,
+    "mod": null,
+    "unmod": null,
+    "ban": null,
+    "unban": null,
+    "timeout": null,
+    "untimeout": null,
+    "raid": null,
+    "unraid": null,
+    "delete": null,
+    "warn": null,
+    "automod_terms": null,
+    "unban_request": null,
+    "shared_chat_ban": null,
+    "shared_chat_unban": null,
+    "shared_chat_timeout": null,
+    "shared_chat_untimeout": null,
+    "shared_chat_delete": {
+      "user_id": "141981764",
+      "user_login": "twitchdev",
+      "user_name": "TwitchDev",
+      "message_id": "3c72b1e8-8888-4444-9999-abcdefabcdef",
+      "message_body": "kappa kappa kappa"
+    }
+  }
+}

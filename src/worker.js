@@ -3,9 +3,12 @@
 // and workerd rejects a non-function/class top-level named export from an
 // entry module (see lib.js's own header comment for the full why). Every
 // `export function`/`export class` below this line is fine as-is.
-import { PENDING_MOD_TTL_MS, PENDING_MOD_MAX, VALID_KINDS, TTS_LABELS, EMIT_TTL_MS, FINANCIAL_KINDS } from './lib.js';
+import {
+  PENDING_MOD_TTL_MS, PENDING_MOD_MAX, VALID_KINDS, TTS_LABELS, EMIT_TTL_MS, FINANCIAL_KINDS,
+  beginFetchSpan, endFetchSpan, snapshotOpenSpans, spannedFetch, cleanSpokenName,
+} from './lib.js';
 
-const RELEASE_VERSION = '2026.07.31.2'; // CalVer, human-facing
+const RELEASE_VERSION = '2026.08.08.1'; // CalVer, human-facing
 
 const ENC = new TextEncoder(); // module-level memo — avoid a throwaway TextEncoder per call on hot paths
 
@@ -31,10 +34,12 @@ const TW_FOLLOWERS_STALE_MS = 2 * TW_FOLLOWERS_POLL_MS;
 const TW_USER_REFRESH_TOKEN_KEY = 'twUserRefreshToken'; // ctx.storage key — see getTwitchUserToken
 const RECOVER_TIMEOUT_MS = 3000;         // recent-messages fetch: hard cap, must never delay reconnect
 const RECOVER_MAX_AGE_MS = 10 * 60_000;  // gap-recovery window cap
-const TWITCH_API_TIMEOUT_MS = 5000;      // app-token + Helix streams-discovery fetches: hard cap, never block chat
+const TWITCH_API_TIMEOUT_MS = 10_000;    // app-token + Helix streams-discovery fetches: hard cap, never block chat — matches the poller's sendOnce convention (poller.mjs)
 const CAPTURE_FLUSH_LINES = 50;   // mid-session burst trigger — fire-and-forget
 const CAPTURE_MAX_BUFFER = 500;   // hard cap: a stuck/failing R2 can never OOM the DO
 const INGEST_MAX_BYTES = 16 * 1024; // generous for one chat event; rejects runaway/compromised poller bodies
+const CLIENT_ERROR_MAX_BYTES = 2 * 1024; // forensics rec 5: a short message/stack, not a chat payload
+const CLIENT_ERROR_FIELD_MAX = 500; // per-field clamp — one oversized field can't blow past the body cap via padding elsewhere
 const REAP_STRIKE_LIMIT = 3;      // consecutive negative-desiredSize heartbeats before evicting a dead SSE reader
 const MAX_SSE_AGE_MS = 6 * 60 * 60_000; // force-close SSE streams older than this; client auto-reconnects (no gap)
 
@@ -57,40 +62,7 @@ const EVENTSUB_ENSURE_INTERVAL_MS = 24 * 60 * 60_000; // re-check cadence once e
 const EVENTSUB_ENSURE_RETRY_MS = 60 * 60_000;          // faster re-check cadence while anything is unhealthy (e.g. secret not yet set)
 const REWARD_TITLE_MAX = 64;   // ellipsize cap — viewer-controlled text never enters the ring uncapped
 const USER_INPUT_MAX = 200;    // same, for the redemption's free-text user_input
-
-// ── Ingest-tail instrumentation ────────────────────────────────────────────
-// Module-level, not instance state: survives across requests within one
-// isolate's lifetime, same scope as the consts above. Tracks every awaited
-// outbound fetch's span_id -> {op, start} so an ingest request's handler
-// window (see ChatHub.handleIngestYt) can be correlated against whatever
-// fetch spans were in flight at any point during it — the actual test of
-// the DO input-gate hypothesis. Added on span start, removed in the same
-// finally that logs the span (never left dangling on error).
-const inFlightSpans = new Map();
-
-function beginFetchSpan(op) {
-  const spanId = crypto.randomUUID().slice(0, 8);
-  inFlightSpans.set(spanId, { op, start: Date.now() });
-  return spanId;
-}
-
-function endFetchSpan(spanId, outcome) {
-  const span = inFlightSpans.get(spanId);
-  inFlightSpans.delete(spanId);
-  const start = span ? span.start : Date.now();
-  const op = span ? span.op : 'unknown';
-  console.log(JSON.stringify({ ev: 'do_fetch_timing', op, durationMs: Date.now() - start, outcome, span_id: spanId }));
-}
-
-// Copies whatever spans are currently open into `into` (keyed by span_id,
-// keeping the earliest-seen {op, start} — same Map entry object each time,
-// so a second call mid-request just re-adds what's still there). Called
-// once before and once after the ingest handler's only await point — a span
-// that opens AND fully closes strictly between those two checks, without
-// ever showing up in either snapshot, cannot be caught this way.
-function snapshotOpenSpans(into) {
-  for (const [spanId, span] of inFlightSpans) into.set(spanId, span);
-}
+const MODE_CHANGE_TEXT_MAX = 200; // same, for the YT liveChatModeChangeMessageRenderer text
 
 // ── Worker entry ─────────────────────────────────────────────────────────
 
@@ -98,6 +70,7 @@ const ROUTES = [
   ['GET', /^\/$/, handleIndex],
   ['GET', /^\/events$/, handleEvents],
   ['POST', /^\/ingest\/yt$/, handleIngestYt],
+  ['POST', /^\/client-error$/, handleClientError],
   ['POST', /^\/eventsub\/callback$/, handleEventSubCallback],
   ['GET', /^\/api\/version$/, handleVersion],
   ['GET', /^\/manifest\.webmanifest$/, handleManifest],
@@ -224,6 +197,52 @@ async function handleIngestYt(req, env, ctx, url) {
     headers,
     body: bodyText,
   });
+}
+
+// forensics rec 5: minimal client-side error beacon. This investigation hit a
+// hard wall trying to explain a reported red YT chip — nothing server-side
+// could have produced it, and there was no way to see what the client
+// actually did (no error reporting existed). Gated on the same view token
+// `/events` already uses — not an open endpoint — which caps spam exposure to
+// "already has a valid viewer link" (same trust tier as the page itself) and
+// needs no new secret or endpoint-specific rate limiter. No DO involved: this
+// is stateless logging, validated and console.log'd directly at the edge.
+async function handleClientError(req, env, ctx, url) {
+  const secret = url.searchParams.get('t');
+  if (!safeEqual(secret, env.MULTICHAT_VIEW_SECRET)) {
+    return new Response('unauthorized', { status: 401 });
+  }
+  const contentLength = Number(req.headers.get('Content-Length'));
+  if (Number.isFinite(contentLength) && contentLength > CLIENT_ERROR_MAX_BYTES) {
+    return new Response('payload too large', { status: 413 });
+  }
+  const bodyText = await req.text();
+  if (ENC.encode(bodyText).length > CLIENT_ERROR_MAX_BYTES) {
+    return new Response('payload too large', { status: 413 });
+  }
+  let body;
+  try {
+    body = JSON.parse(bodyText);
+  } catch {
+    return new Response('bad json', { status: 400 });
+  }
+  if (!body || typeof body.message !== 'string' || !body.message.trim()) {
+    return new Response('missing message', { status: 400 });
+  }
+  const clampStr = (v) => (typeof v === 'string' ? v.slice(0, CLIENT_ERROR_FIELD_MAX) : undefined);
+  // Per-field clamp on top of the body-size cap, so one oversized field can't
+  // blow past it via padding elsewhere, and pulled from the JSON body only —
+  // never req.url/the query string — so the token itself never reaches the log.
+  console.log(JSON.stringify({
+    ev: 'client_error',
+    message: clampStr(body.message),
+    source: clampStr(body.source),
+    line: Number.isFinite(body.line) ? body.line : undefined,
+    col: Number.isFinite(body.col) ? body.col : undefined,
+    stack: clampStr(body.stack),
+    ts: Number.isFinite(body.ts) ? body.ts : undefined,
+  }));
+  return new Response('ok', { status: 200 });
 }
 
 // First public unauthenticated route in this Worker — the only "auth" is
@@ -377,8 +396,14 @@ export class ChatHub {
     this.esOrigin = null;               // public https origin, threaded from the edge — see handleEvents
     this.esEnsured = false;             // true once ensureEventSubSubscriptions has run at least once
     this.esScopeChecked = false;        // true once logEventSubScopeCheck has run (once per DO lifetime)
+    this.esScopeCheckResult = null;     // { hasBitsRead, hasAllEventSubScopes, checkedAt } from the last successful scope check, or null if none has succeeded — feeds createEventSubSubscription's 403-cause diagnosis (see logEventSubScopeCheck)
     this.esLastEnsured = 0;             // ms epoch of the last ensure run
     this.esAllHealthy = false;          // true iff every desired sub was already enabled+correct-version at the last ensure — gates hourly vs daily recheck
+    this.esModerateHealthy = false;     // true iff channel.moderate is enabled+correct-version — decides row ownership (see applyClearchat/applyClearmsg); persisted (ctx.storage key 'esModerateHealthy') so a DO cold start doesn't forget a healthy sub and double-render. Hydrated below, blocking fetch() until it resolves.
+    this.ctx.blockConcurrencyWhile(async () => {
+      const stored = await this.ctx.storage.get('esModerateHealthy');
+      this.esModerateHealthy = stored ?? false; // default false only when no reconcile has ever persisted a value (first boot / pre-feature DOs)
+    });
     // Ingest-tail delay accumulators — running
     // totals since this DO instance started, read by the alarm()-cadence
     // rollup (Phase 4). Never reset mid-lifetime: the point is one line that
@@ -424,9 +449,18 @@ export class ChatHub {
         if (lastEventId) {
           const lastId = Number(lastEventId);
           if (Number.isFinite(lastId)) {
+            let matched = 0, sentFrom = null, sentTo = null;
             for (const msg of self.ring) {
-              if (msg.id > lastId) self.sendToController(controller, msg);
+              if (msg.id > lastId) {
+                self.sendToController(controller, msg);
+                matched++;
+                if (sentFrom === null) sentFrom = msg.id;
+                sentTo = msg.id;
+              }
             }
+            // Root-causes the "no backfill" class of report: what a replay
+            // was asked for vs. what the ring actually had to give it.
+            console.log(JSON.stringify({ ev: 'sse_replay_result', sseId, lastId, matched, sentFrom, sentTo }));
           }
         }
       },
@@ -467,6 +501,16 @@ export class ChatHub {
       snapshotOpenSpans(seenSpans);
       if (body && body.type === 'heartbeat') {
         this.lastSeen.yt = Date.now();
+        // forensics rec 4: unconditional, every heartbeat — this is health
+        // telemetry (poller-side fetch activity), not a gated "did it change"
+        // update like the viewer/like counts_update lines below. Distinct ev
+        // name so CF Observability can watch poller fetch health without
+        // conflating it with the counts feature.
+        console.log(JSON.stringify({
+          ev: 'yt_poller_health',
+          fetched: Number.isFinite(body.fetched) ? body.fetched : null,
+          lastMessageAgeSec: Number.isFinite(body.lastMessageAgeSec) ? body.lastMessageAgeSec : null,
+        }));
         // Both fields optional and independent — the poller only sends them
         // while a live session holds a current video id (see its videoId
         // lifecycle notes); absent fields here just mean "no update", never an
@@ -519,6 +563,12 @@ export class ChatHub {
           const authorId = typeof body.authorId === 'string' && body.authorId.trim() ? body.authorId.slice(0, 128) : null;
           if (!authorId) return new Response('missing authorId', { status: 400 });
           this.applyYtAuthorDelete(authorId);
+          return new Response('ok', { status: 200 });
+        }
+        if (body.action === 'mode_change') {
+          const text = typeof body.text === 'string' ? body.text.trim() : '';
+          if (!text) return new Response('missing text', { status: 400 });
+          this.applyYtModeChange(ellipsize(text, MODE_CHANGE_TEXT_MAX));
           return new Response('ok', { status: 200 });
         }
         return new Response('bad mod action', { status: 400 });
@@ -696,6 +746,20 @@ export class ChatHub {
   closeClient(controller, reason) {
     const meta = this.clientMeta.get(controller);
     console.log(JSON.stringify({ ev: 'reap', sseId: meta ? meta.sseId : null, reason }));
+    if (reason === 'backpressure') {
+      // Best available backlog signal: there's no per-client queued-message
+      // array (fan-out enqueues straight to the controller), so desiredSize
+      // (negative = bytes past the stream's high-water mark) plus how many
+      // consecutive reap ticks it stayed negative is what's real to log.
+      let desiredSize = null;
+      try { desiredSize = controller.desiredSize; } catch { desiredSize = null; }
+      console.log(JSON.stringify({
+        ev: 'sse_reap_backlog',
+        sseId: meta ? meta.sseId : null,
+        strikes: meta ? meta.strikes : null,
+        desiredSize,
+      }));
+    }
     try { controller.close(); } catch {}
     this.dropClient(controller, reason);
   }
@@ -746,6 +810,7 @@ export class ChatHub {
       ...(data.isMember ? { isMember: true } : {}),
       ...(data.firstMsg ? { firstMsg: true } : {}),
       ...(data.emotes && data.emotes.length ? { emotes: data.emotes } : {}),
+      ...(data.emote && data.emote.id ? { emote: data.emote } : {}),
       ...(data.recovered ? { recovered: true } : {}),
       text: data.text,
       ts: Date.now(),
@@ -770,6 +835,16 @@ export class ChatHub {
     // donations recoverable in Workers Observability from now on.
     if (msg.kind && FINANCIAL_KINDS.has(msg.kind)) {
       console.log(JSON.stringify({ ev: 'financial', platform, kind: msg.kind, user: msg.user, amount: msg.amount || null, ts: msg.ts }));
+      // Separate, narrowly-gated log — NOT folded into the line above, which
+      // fires on every financial row regardless of TTS. This one exists only
+      // to accumulate real separator-name cases (post-Step1 cleanup) for
+      // evaluating the deferred Step2 rule; low volume by design (financial
+      // kind AND a separator survives cleanup), scoped to the same kind
+      // predicate emitCategory uses to decide what gets spoken client-side.
+      const spokenName = cleanSpokenName(msg.user);
+      if (/[_-]/.test(spokenName)) {
+        console.log(JSON.stringify({ ev: 'tts_name_sep_candidate', name: spokenName }));
+      }
     }
     this.broadcast(msg);
     if (lateMark) this.broadcastEvent('mark', lateMark);
@@ -819,7 +894,16 @@ export class ChatHub {
 
   applyClearmsg({ targetId, login }) {
     this.markDeleted({ action: 'delete', twId: targetId });
-    this.pushMessage('tw', { user: login, login, sys: 'deleted', text: `${login}'s message deleted` });
+    // Strike-mark always happens (above) — IRC is fast and works even if
+    // EventSub lags or drops. The gray attribution row is owned by
+    // channel.moderate once it's healthy (renders "<mod> deleted <user>'s
+    // message" instead); IRC's own target-only row only fires as the
+    // fallback, so one delete never produces two rows. See
+    // docs/ARCHITECTURE.md §3a for the ownership rule and its accepted
+    // mirror-window bound.
+    if (!this.esModerateHealthy) {
+      this.pushMessage('tw', { user: login, login, sys: 'deleted', text: `${login}'s message deleted` });
+    }
   }
 
   // YouTube analogs of markDeleted/applyClearmsg/applyClearchat above — same
@@ -866,19 +950,39 @@ export class ChatHub {
     this.pushMessage('yt', { sys: 'deleted', text: found ? `${found.user}'s messages were removed` : "A viewer's messages were removed" });
   }
 
+  // ROOMSTATE parity for YouTube (slow/sub-only/emote-only toggles) — gray
+  // info row, same shape as Twitch's applyRoomstate below. text already
+  // fully formed by the poller (liveChatModeChangeMessageRenderer's own
+  // text.runs), ellipsized by the caller before this is invoked.
+  applyYtModeChange(text) {
+    this.pushMessage('yt', { sys: 'modechange', text });
+  }
+
   applyClearchat(result) {
     if (result.clear) {
-      // Bare CLEARCHAT (full clear): record it, never wipe the feed, never mark rows.
+      // Bare CLEARCHAT (full clear): record it, never wipe the feed, never
+      // mark rows. Always pushed regardless of esModerateHealthy —
+      // channel.moderate never renders a 'clear' action, so IRC keeps sole
+      // ownership here; no dedupe risk.
       this.pushMessage('tw', { sys: 'clear', text: 'chat cleared' });
       return;
     }
     const { login, seconds } = result;
+    // Strike-mark always happens (below) regardless of ownership — IRC is
+    // fast and works even if EventSub lags or drops. The attributed gray row
+    // is owned by channel.moderate once it's healthy; IRC's own target-only
+    // row is the fallback, so one timeout/ban never produces two rows. See
+    // docs/ARCHITECTURE.md §3a.
     if (seconds != null) {
       this.markDeleted({ action: 'timeout', login });
-      this.pushMessage('tw', { user: login, login, sys: 'timeout', text: `timeout: ${login}, ${seconds}s` });
+      if (!this.esModerateHealthy) {
+        this.pushMessage('tw', { user: login, login, sys: 'timeout', text: `timeout: ${login}, ${seconds}s` });
+      }
     } else {
       this.markDeleted({ action: 'ban', login });
-      this.pushMessage('tw', { user: login, login, sys: 'ban', text: `ban: ${login}` });
+      if (!this.esModerateHealthy) {
+        this.pushMessage('tw', { user: login, login, sys: 'ban', text: `ban: ${login}` });
+      }
     }
   }
 
@@ -928,6 +1032,7 @@ export class ChatHub {
       const cutoffTs = this.lastTwTmiSentTs;
       const floorTs = Date.now() - RECOVER_MAX_AGE_MS;
       let body;
+      // span contains early-return control flow; intentionally not spannedFetch()
       const spanId = beginFetchSpan('backfill');
       // outcome flips to 'ok' only once the fetch resolves — a throw/abort
       // (the slow-then-failed case this span exists to catch) must still log,
@@ -1014,26 +1119,16 @@ export class ChatHub {
     const now = Date.now();
     if (this.twToken && now < this.twTokenExp) return this.twToken;
     try {
-      const spanId = beginFetchSpan('app_token');
-      let fetchOutcome = 'error';
-      let res;
-      try {
-        res = await fetch('https://id.twitch.tv/oauth2/token', {
-          method: 'POST',
-          headers: { 'content-type': 'application/x-www-form-urlencoded' },
-          body: new URLSearchParams({
-            client_id: this.env.TWITCH_CLIENT_ID,
-            client_secret: this.env.TWITCH_CLIENT_SECRET,
-            grant_type: 'client_credentials',
-          }),
-          signal: AbortSignal.timeout(TWITCH_API_TIMEOUT_MS),
-        });
-        fetchOutcome = 'ok';
-      } finally {
-        // finally, not post-await: a throw must still emit the span (it
-        // propagates on to the outer catch's console.error unchanged).
-        endFetchSpan(spanId, fetchOutcome);
-      }
+      const res = await spannedFetch('app_token', () => fetch('https://id.twitch.tv/oauth2/token', {
+        method: 'POST',
+        headers: { 'content-type': 'application/x-www-form-urlencoded' },
+        body: new URLSearchParams({
+          client_id: this.env.TWITCH_CLIENT_ID,
+          client_secret: this.env.TWITCH_CLIENT_SECRET,
+          grant_type: 'client_credentials',
+        }),
+        signal: AbortSignal.timeout(TWITCH_API_TIMEOUT_MS),
+      }));
       if (!res.ok) {
         // Misconfigured/revoked client_id+secret (e.g. 400) — never touch
         // chat flow, but log so a stuck Twitch app credential is diagnosable
@@ -1058,13 +1153,23 @@ export class ChatHub {
   // staleness check is what tells the client the number can no longer be
   // trusted, rather than this method guessing at when to blank it.
   async pollTwitchViewers() {
+    // Feature-disabled fast path stays outside the span entirely (matches
+    // getTwitchAppToken's own no-op guard) — otherwise an unconfigured app
+    // would log a do_fetch_timing 'error' for helix_viewer_poll every cycle
+    // forever, pure noise for a deliberately-off feature.
+    if (!this.env.TWITCH_CLIENT_ID || !this.env.TWITCH_CLIENT_SECRET) return;
     try {
-      const token = await this.getTwitchAppToken();
-      if (!token) return;
+      // Span now wraps the app-token fetch and res.json() too, not just the
+      // Helix fetch call — previously both landed in ingest-tail's
+      // unattributed_ms despite being part of this same poll operation.
+      // span contains early-return control flow; intentionally not spannedFetch()
       const spanId = beginFetchSpan('helix_viewer_poll');
       let fetchOutcome = 'error';
       let res;
+      let body;
       try {
+        const token = await this.getTwitchAppToken();
+        if (!token) return;
         res = await fetch(
           `https://api.twitch.tv/helix/streams?user_login=${encodeURIComponent(this.env.TWITCH_CHANNEL)}`,
           {
@@ -1072,21 +1177,23 @@ export class ChatHub {
             signal: AbortSignal.timeout(TWITCH_API_TIMEOUT_MS),
           }
         );
+        // 'ok' means "fetch didn't throw", independent of HTTP status —
+        // same convention as every other spanned fetch in this file.
         fetchOutcome = 'ok';
+        if (res.status === 401) {
+          // Token invalid/revoked mid-lifetime — drop the cache so the next
+          // poll fetches a fresh one instead of retrying the same bad token.
+          this.twToken = null;
+          this.twTokenExp = 0;
+          return;
+        }
+        if (!res.ok) return;
+        body = await res.json();
       } finally {
         // finally, not post-await: a throw must still emit the span (it
         // propagates on to the outer catch's console.error unchanged).
         endFetchSpan(spanId, fetchOutcome);
       }
-      if (res.status === 401) {
-        // Token invalid/revoked mid-lifetime — drop the cache so the next
-        // poll fetches a fresh one instead of retrying the same bad token.
-        this.twToken = null;
-        this.twTokenExp = 0;
-        return;
-      }
-      if (!res.ok) return;
-      const body = await res.json();
       const stream = Array.isArray(body.data) ? body.data[0] : null;
       const viewers = stream && Number.isFinite(stream.viewer_count) ? stream.viewer_count : null;
       const changed = viewers !== this.twViewers;
@@ -1157,26 +1264,16 @@ export class ChatHub {
 
   async refreshTwitchUserToken(refreshToken) {
     try {
-      const spanId = beginFetchSpan('token_refresh');
-      let fetchOutcome = 'error';
-      let res;
-      try {
-        res = await fetch('https://id.twitch.tv/oauth2/token', {
-          method: 'POST',
-          headers: { 'content-type': 'application/x-www-form-urlencoded' },
-          body: new URLSearchParams({
-            grant_type: 'refresh_token',
-            refresh_token: refreshToken,
-            client_id: this.env.TWITCH_CLIENT_ID,
-            client_secret: this.env.TWITCH_CLIENT_SECRET,
-          }),
-        });
-        fetchOutcome = 'ok';
-      } finally {
-        // finally, not post-await: a throw must still emit the span (it
-        // propagates on to the outer catch's console.error unchanged).
-        endFetchSpan(spanId, fetchOutcome);
-      }
+      const res = await spannedFetch('token_refresh', () => fetch('https://id.twitch.tv/oauth2/token', {
+        method: 'POST',
+        headers: { 'content-type': 'application/x-www-form-urlencoded' },
+        body: new URLSearchParams({
+          grant_type: 'refresh_token',
+          refresh_token: refreshToken,
+          client_id: this.env.TWITCH_CLIENT_ID,
+          client_secret: this.env.TWITCH_CLIENT_SECRET,
+        }),
+      }));
       if (!res.ok) return null;
       const body = await res.json();
       if (!body || typeof body.access_token !== 'string' || typeof body.refresh_token !== 'string') return null;
@@ -1200,18 +1297,10 @@ export class ChatHub {
     try {
       const token = await this.getTwitchUserToken();
       if (!token) return;
-      const spanId = beginFetchSpan('follower_poll');
-      let fetchOutcome = 'error';
-      let res;
-      try {
-        res = await fetch(
-          `https://api.twitch.tv/helix/channels/followers?broadcaster_id=${encodeURIComponent(this.env.TWITCH_BROADCASTER_ID)}`,
-          { headers: { 'Client-Id': this.env.TWITCH_CLIENT_ID, 'Authorization': `Bearer ${token}` } }
-        );
-        fetchOutcome = 'ok';
-      } finally {
-        endFetchSpan(spanId, fetchOutcome);
-      }
+      const res = await spannedFetch('follower_poll', () => fetch(
+        `https://api.twitch.tv/helix/channels/followers?broadcaster_id=${encodeURIComponent(this.env.TWITCH_BROADCASTER_ID)}`,
+        { headers: { 'Client-Id': this.env.TWITCH_CLIENT_ID, 'Authorization': `Bearer ${token}` } }
+      ));
       if (res.status === 401) {
         // Access token invalid mid-lifetime — drop only the cached access
         // token, never the storage refresh chain; next poll re-derives it.
@@ -1316,28 +1405,45 @@ export class ChatHub {
         console.error(JSON.stringify({ ev: 'eventsub_scope_check', ok: false, reason: 'no_user_token' }));
         return;
       }
-      const spanId = beginFetchSpan('eventsub_scope_check');
-      let fetchOutcome = 'error';
-      let res;
-      try {
-        res = await fetch('https://id.twitch.tv/oauth2/validate', {
-          headers: { 'Authorization': `OAuth ${token}` },
-        });
-        fetchOutcome = 'ok';
-      } finally {
-        endFetchSpan(spanId, fetchOutcome);
-      }
+      const res = await spannedFetch('eventsub_scope_check', () => fetch('https://id.twitch.tv/oauth2/validate', {
+        headers: { 'Authorization': `OAuth ${token}` },
+      }));
       if (!res.ok) {
         console.error(JSON.stringify({ ev: 'eventsub_scope_check', ok: false, status: res.status }));
         return;
       }
       const body = await res.json();
+      const scopes = Array.isArray(body.scopes) ? body.scopes : [];
+      const REQUIRED_EVENTSUB_SCOPES = ['channel:read:redemptions', 'channel:read:hype_train', 'channel:read:ads', 'bits:read'];
+      const hasBitsRead = scopes.includes('bits:read');
+      const hasAllEventSubScopes = REQUIRED_EVENTSUB_SCOPES.every((s) => scopes.includes(s));
+      // channel.moderate v2's authorization is 8 OR-groups (each satisfied by
+      // either its read or manage scope) — distinct shape from the flat
+      // REQUIRED_EVENTSUB_SCOPES list above, so it gets its own structure
+      // rather than being flattened into one array.
+      const MODERATE_SCOPE_GROUPS = [
+        ['moderator:read:blocked_terms', 'moderator:manage:blocked_terms'],
+        ['moderator:read:chat_settings', 'moderator:manage:chat_settings'],
+        ['moderator:read:unban_requests', 'moderator:manage:unban_requests'],
+        ['moderator:read:banned_users', 'moderator:manage:banned_users'],
+        ['moderator:read:chat_messages', 'moderator:manage:chat_messages'],
+        ['moderator:read:warnings', 'moderator:manage:warnings'],
+        ['moderator:read:moderators'],
+        ['moderator:read:vips'],
+      ];
+      const hasAllModerateScopes = MODERATE_SCOPE_GROUPS.every((group) => group.some((s) => scopes.includes(s)));
       console.log(JSON.stringify({
         ev: 'eventsub_scope_check',
         userId: body.user_id,
         broadcasterMatch: body.user_id === this.env.TWITCH_BROADCASTER_ID,
-        scopes: Array.isArray(body.scopes) ? body.scopes : [],
+        scopes,
+        hasBitsRead,
+        hasAllEventSubScopes,
+        hasAllModerateScopes,
       }));
+      // Stored so createEventSubSubscription can diagnose a later
+      // channel.bits.use 403 without re-fetching — see that method.
+      this.esScopeCheckResult = { hasBitsRead, hasAllEventSubScopes, hasAllModerateScopes, checkedAt: Date.now() };
     } catch (err) {
       console.error(JSON.stringify({ ev: 'eventsub_scope_check', ok: false, err: String(err) }));
     }
@@ -1360,6 +1466,10 @@ export class ChatHub {
     }
     const now = Date.now();
     let allHealthy = true;
+    // Tracked separately from allHealthy — decides IRC-vs-EventSub row
+    // ownership for moderation actions (see applyClearchat/applyClearmsg),
+    // persisted below so a DO cold start doesn't forget a healthy sub.
+    let moderateHealthy = false;
     for (const want of desired) {
       const sameSlot = (s) =>
         s.type === want.type &&
@@ -1384,7 +1494,10 @@ export class ChatHub {
         await this.createEventSubSubscription(token, want, callback);
         continue;
       }
-      if (match.status === 'enabled') continue;
+      if (match.status === 'enabled') {
+        if (want.type === 'channel.moderate') moderateHealthy = true;
+        continue;
+      }
       allHealthy = false;
       if (match.status === 'webhook_callback_verification_pending') {
         const createdAt = Date.parse(match.created_at || '');
@@ -1405,27 +1518,44 @@ export class ChatHub {
       await this.createEventSubSubscription(token, want, callback);
     }
     this.esAllHealthy = allHealthy;
+    this.esModerateHealthy = moderateHealthy;
+    // Persisted (not just in-memory) — see the constructor's
+    // blockConcurrencyWhile hydration and its comment for the accepted
+    // mirror-window this closes (cold start) vs. the one it doesn't (a
+    // revocation landing between the last persist and the next DO eviction).
+    await this.ctx.storage.put('esModerateHealthy', moderateHealthy);
   }
 
+  // Status-blind listing must be COMPLETE or not used at all — a page that
+  // fails partway through pagination used to `break` silently (no log, no
+  // throw), returning whatever partial list had accumulated so far as if it
+  // were the whole thing. ensureEventSubSubscriptions would then treat any
+  // desired sub that happened to live on a later, unfetched page as entirely
+  // missing and try to (re)create it every cycle — a real, healthy,
+  // currently-delivering subscription indistinguishable from a genuinely
+  // missing one. Fail closed instead: log loudly and throw, so the caller's
+  // existing try/catch (which already `return`s before touching any
+  // per-sub create/delete logic) skips the ENTIRE reconcile pass on
+  // incomplete data rather than reconciling against a partial view.
   async listEventSubSubscriptions(token) {
     const out = [];
     let cursor = '';
     do {
       const url = `https://api.twitch.tv/helix/eventsub/subscriptions${cursor ? `?after=${encodeURIComponent(cursor)}` : ''}`;
-      const spanId = beginFetchSpan('eventsub_list');
-      let fetchOutcome = 'error';
-      let res;
-      try {
-        res = await fetch(url, {
-          headers: { 'Client-Id': this.env.TWITCH_CLIENT_ID, 'Authorization': `Bearer ${token}` },
-        });
-        fetchOutcome = 'ok';
-      } finally {
-        endFetchSpan(spanId, fetchOutcome);
+      const res = await spannedFetch('eventsub_list', () => fetch(url, {
+        headers: { 'Client-Id': this.env.TWITCH_CLIENT_ID, 'Authorization': `Bearer ${token}` },
+      }));
+      if (!res.ok) {
+        const bodyText = await res.text().catch(() => '');
+        console.error(JSON.stringify({ ev: 'eventsub_list_incomplete', reason: 'page_not_ok', status: res.status, cursor, body: bodyText.slice(0, 500) }));
+        throw new Error(`eventsub list page failed: ${res.status}`);
       }
-      if (!res.ok) break;
       const body = await res.json();
-      if (Array.isArray(body.data)) out.push(...body.data);
+      if (!Array.isArray(body.data)) {
+        console.error(JSON.stringify({ ev: 'eventsub_list_incomplete', reason: 'malformed_page', cursor }));
+        throw new Error('eventsub list page malformed: data is not an array');
+      }
+      out.push(...body.data);
       cursor = body.pagination?.cursor || '';
     } while (cursor);
     return out;
@@ -1433,28 +1563,20 @@ export class ChatHub {
 
   async createEventSubSubscription(token, want, callback) {
     try {
-      const spanId = beginFetchSpan('eventsub_create');
-      let fetchOutcome = 'error';
-      let res;
-      try {
-        res = await fetch('https://api.twitch.tv/helix/eventsub/subscriptions', {
-          method: 'POST',
-          headers: {
-            'Client-Id': this.env.TWITCH_CLIENT_ID,
-            'Authorization': `Bearer ${token}`,
-            'content-type': 'application/json',
-          },
-          body: JSON.stringify({
-            type: want.type,
-            version: want.version,
-            condition: want.condition,
-            transport: { method: 'webhook', callback, secret: this.env.EVENTSUB_SECRET },
-          }),
-        });
-        fetchOutcome = 'ok';
-      } finally {
-        endFetchSpan(spanId, fetchOutcome);
-      }
+      const res = await spannedFetch('eventsub_create', () => fetch('https://api.twitch.tv/helix/eventsub/subscriptions', {
+        method: 'POST',
+        headers: {
+          'Client-Id': this.env.TWITCH_CLIENT_ID,
+          'Authorization': `Bearer ${token}`,
+          'content-type': 'application/json',
+        },
+        body: JSON.stringify({
+          type: want.type,
+          version: want.version,
+          condition: want.condition,
+          transport: { method: 'webhook', callback, secret: this.env.EVENTSUB_SECRET },
+        }),
+      }));
       if (res.status === 409) {
         console.log(JSON.stringify({ ev: 'eventsub_create_conflict', type: want.type })); // benign — already exists
         return;
@@ -1465,8 +1587,25 @@ export class ChatHub {
         // mismatch — a prior incident where status alone left
         // every one of 20 failures unexplained for a full night.
         const bodyText = await res.text().catch(() => '');
+        // channel.bits.use specifically also requires a broadcaster
+        // bits:read consent grant (separate from the app-token create
+        // call) — correlate against the last logEventSubScopeCheck result
+        // so a 403 here doesn't require manually cross-referencing a
+        // separate log line or parsing Twitch's raw error text.
+        // esScopeCheckResult is checked once per DO lifetime (see
+        // logEventSubScopeCheck) and never refreshed — a 'not_a_scope_issue'
+        // diagnosis reflects the grant as of that one check, not a live
+        // guarantee the scope is still present if revoked mid-lifetime.
+        const diagnosis = want.type === 'channel.bits.use' && res.status === 403
+          ? (this.esScopeCheckResult == null
+              ? 'scope_check_unavailable'
+              : this.esScopeCheckResult.hasBitsRead
+                ? 'not_a_scope_issue'
+                : 'scope_not_granted')
+          : undefined;
         console.error(JSON.stringify({
           ev: 'eventsub_create_failed', type: want.type, status: res.status, body: bodyText.slice(0, 500),
+          ...(diagnosis ? { diagnosis } : {}),
         }));
         return;
       }
@@ -1484,18 +1623,10 @@ export class ChatHub {
   // to prevent.
   async deleteEventSubSubscription(token, id) {
     try {
-      const spanId = beginFetchSpan('eventsub_delete');
-      let fetchOutcome = 'error';
-      let res;
-      try {
-        res = await fetch(`https://api.twitch.tv/helix/eventsub/subscriptions?id=${encodeURIComponent(id)}`, {
-          method: 'DELETE',
-          headers: { 'Client-Id': this.env.TWITCH_CLIENT_ID, 'Authorization': `Bearer ${token}` },
-        });
-        fetchOutcome = 'ok';
-      } finally {
-        endFetchSpan(spanId, fetchOutcome);
-      }
+      const res = await spannedFetch('eventsub_delete', () => fetch(`https://api.twitch.tv/helix/eventsub/subscriptions?id=${encodeURIComponent(id)}`, {
+        method: 'DELETE',
+        headers: { 'Client-Id': this.env.TWITCH_CLIENT_ID, 'Authorization': `Bearer ${token}` },
+      }));
       if (!res.ok && res.status !== 404) {
         console.error(JSON.stringify({ ev: 'eventsub_delete_failed', id, status: res.status }));
         return false;
@@ -1774,6 +1905,22 @@ export class ChatHub {
       const tagsSpaceIdx = line.startsWith('@') ? line.indexOf(' ') : -1;
       const lineTags = tagsSpaceIdx > 0 ? parseIrcTags(line.slice(0, tagsSpaceIdx)) : {};
       const privmsg = parsePrivmsg(line, lineTags);
+      // Rider: undocumented Twitch power-up marker (Gigantify an Emote /
+      // Message Effect) apparently sets an `animation-id` tag on PRIVMSG per
+      // third-party research — capture raw ground truth alongside normal
+      // classification so a real occurrence finally has a captured fixture.
+      // Additive only; never blocks or replaces normal delivery below.
+      if (lineTags['animation-id']) this.pushCapture(line);
+      // Rider: sharedchatnotice (Twitch Shared Chat) wraps another USERNOTICE
+      // msg-id — parseUsernotice below never claims it (not in
+      // USERNOTICE_KIND/USERNOTICE_SYS), so it already falls through to the
+      // generic capture sink at the bottom of this loop untouched. This just
+      // logs the inner msg-id (source-msg-id) so a real occurrence is
+      // greppable without downloading the capture object. Log-only — no
+      // extra pushCapture call here, no rendering, no classification change.
+      if (lineTags['msg-id'] === 'sharedchatnotice') {
+        console.log(JSON.stringify({ ev: 'shared_chat_notice_capture', innerMsgId: lineTags['source-msg-id'] || null }));
+      }
       if (privmsg) {
         this.pushMessage('tw', privmsg, ircMeta(line, lineTags));
         continue;
@@ -1850,17 +1997,30 @@ function hasBadge(tags, badgeId) {
 
 function badgeFlags(tags) {
   const isMod = tags.mod === '1' || hasBadge(tags, 'broadcaster');
-  const isMember = tags.subscriber === '1' || hasBadge(tags, 'founder');
+  // founder/VIP badges are deliberately excluded — role color is mod (blue,
+  // includes broadcaster) or paid-member (green, subscriber tag only). VIPs
+  // and founders (unless independently subscribed) get default text color.
+  const isMember = tags.subscriber === '1';
   return {
     ...(isMod ? { isMod: true } : {}),
     ...(isMember ? { isMember: true } : {}),
   };
 }
 
-// preParsedTags lets a caller that already parsed this line's tags (e.g.
-// handleIrcData) skip a second full parseIrcTags pass; omit it to parse the
-// line directly (existing direct-call behavior, used by tests).
-export function parsePrivmsg(line, preParsedTags) {
+// Common IRC line preamble shared by every line-type parser below: an
+// optional "@tags " prefix, then either a ":<source> COMMAND params" line
+// or (Twitch's own PING) a bare "COMMAND params" line with no source
+// prefix. Was duplicated ×7 (parsePrivmsg/parseUsernotice/parseClearmsg/
+// parseClearchat/parseRoomstate/isReconnectCommand/isProtocolNoise) — see
+// CODE_REVIEW_2026-07-31.md B1-full. Returns null only when the line
+// doesn't parse far enough to identify a command; each call site applies
+// its own further requirements (hasPrefix, a specific command, tags
+// presence) on top. preParsedTags lets a caller that already parsed this
+// line's tags (handleIrcData) skip a second full parseIrcTags pass — same
+// opt-in reuse parsePrivmsg/parseUsernotice already had individually
+// (only consulted when the line actually carries an '@tags' prefix, same
+// as before).
+export function splitIrcLine(line, preParsedTags) {
   let rest = line;
   let tags = {};
   if (rest.startsWith('@')) {
@@ -1869,25 +2029,38 @@ export function parsePrivmsg(line, preParsedTags) {
     tags = preParsedTags || parseIrcTags(rest.slice(0, spaceIdx));
     rest = rest.slice(spaceIdx + 1);
   }
-  if (!rest.startsWith(':')) return null;
-  const privmsgIdx = rest.indexOf(' PRIVMSG ');
-  if (privmsgIdx === -1) return null;
-  const prefix = rest.slice(1, privmsgIdx);
-  const afterCmd = rest.slice(privmsgIdx + ' PRIVMSG '.length);
-  const colonIdx = afterCmd.indexOf(' :');
+  const hasPrefix = rest.startsWith(':');
+  let source = '';
+  let afterPrefix = rest;
+  if (hasPrefix) {
+    const spaceIdx = rest.indexOf(' ');
+    if (spaceIdx === -1) return null;
+    source = rest.slice(1, spaceIdx);
+    afterPrefix = rest.slice(spaceIdx + 1);
+  }
+  const cmdSpaceIdx = afterPrefix.indexOf(' ');
+  const command = cmdSpaceIdx === -1 ? afterPrefix : afterPrefix.slice(0, cmdSpaceIdx);
+  const params = cmdSpaceIdx === -1 ? '' : afterPrefix.slice(cmdSpaceIdx + 1);
+  return { tags, hasPrefix, source, command, params };
+}
+
+// preParsedTags: see splitIrcLine's comment above — same opt-in reuse.
+export function parsePrivmsg(line, preParsedTags) {
+  const split = splitIrcLine(line, preParsedTags);
+  if (!split || !split.hasPrefix || split.command !== 'PRIVMSG') return null;
+  const { tags, source, params } = split;
+  const colonIdx = params.indexOf(' :');
   if (colonIdx === -1) return null;
-  const text = afterCmd.slice(colonIdx + 2);
+  const text = params.slice(colonIdx + 2);
   if (!text) return null;
-  const nick = prefix.split('!')[0];
+  const nick = source.split('!')[0];
   const login = nick; // IRC prefix nick IS the lowercase login for Twitch chat
   const user = tags['display-name'] || nick;
-  const color = tags.color || undefined;
   const extra = tags.bits ? { kind: 'cheer', amount: `${tags.bits} bits` } : {};
   const emotes = parseEmotes(tags.emotes);
   return {
     user,
     login,
-    color,
     text,
     ...extra,
     ...badgeFlags(tags),
@@ -1932,32 +2105,24 @@ const USERNOTICE_KIND = {
   anongiftpaidupgrade: 'giftsub',
 };
 
-// raid/announcement render as gray info rows (sys), never gold/.paid like subs.
+// raid/announcement/viewermilestone render as gray info rows (sys), never
+// gold/.paid like subs.
 const USERNOTICE_SYS = {
   raid: 'raid',
   announcement: 'announce',
+  viewermilestone: 'viewermilestone',
 };
 
-// preParsedTags: see parsePrivmsg's comment above — same opt-in reuse.
+// preParsedTags: see splitIrcLine's comment above — same opt-in reuse.
 export function parseUsernotice(line, preParsedTags) {
-  let rest = line;
-  let tags = {};
-  if (rest.startsWith('@')) {
-    const spaceIdx = rest.indexOf(' ');
-    if (spaceIdx === -1) return null;
-    tags = preParsedTags || parseIrcTags(rest.slice(0, spaceIdx));
-    rest = rest.slice(spaceIdx + 1);
-  }
-  if (!rest.startsWith(':')) return null;
-  const usernoticeIdx = rest.indexOf(' USERNOTICE ');
-  if (usernoticeIdx === -1) return null;
+  const split = splitIrcLine(line, preParsedTags);
+  if (!split || !split.hasPrefix || split.command !== 'USERNOTICE') return null;
+  const { tags, params } = split;
   const msgId = tags['msg-id'];
-  const afterCmd = rest.slice(usernoticeIdx + ' USERNOTICE '.length);
-  const colonIdx = afterCmd.indexOf(' :');
-  const trailingText = colonIdx !== -1 ? afterCmd.slice(colonIdx + 2) : '';
+  const colonIdx = params.indexOf(' :');
+  const trailingText = colonIdx !== -1 ? params.slice(colonIdx + 2) : '';
   const login = tags.login || undefined;
   const user = tags['display-name'] || tags.login || 'unknown';
-  const color = tags.color || undefined;
 
   const sys = USERNOTICE_SYS[msgId];
   if (sys === 'raid') {
@@ -1972,42 +2137,73 @@ export function parseUsernotice(line, preParsedTags) {
   if (sys === 'announce') {
     return { user, login, sys: 'announce', text: trailingText || tags['system-msg'] || '', ...badgeFlags(tags) };
   }
+  if (sys === 'viewermilestone') {
+    // msg-param-category is always 'watch-streak' in observed data (see
+    // PR #38's 2026-08-08 streak coverage audit) — rendered unconditionally
+    // rather than filtered on category, since system-msg already carries a
+    // complete, correct sentence for any category Twitch might send.
+    return { user, login, sys: 'viewermilestone', text: tags['system-msg'] || '', ...badgeFlags(tags) };
+  }
 
   const kind = USERNOTICE_KIND[msgId];
   if (!kind) return null;
   let text = tags['system-msg'] || '';
   if (msgId === 'resub' && trailingText) text += ` — ${trailingText}`;
-  return { user, login, color, kind, text, ...badgeFlags(tags) };
+  if (msgId === 'resub') {
+    const streakInfo = formatResubStreakInfo(tags);
+    if (streakInfo) text += ` ${streakInfo}`;
+  }
+  const giftAmount = msgId === 'submysterygift' ? giftCountAmount(tags, text) : undefined;
+  const extra = giftAmount ? { amount: giftAmount } : {};
+  return { user, login, kind, text, ...extra, ...badgeFlags(tags) };
+}
+
+// Twitch sends msg-param-cumulative-months (always) and msg-param-streak-months
+// (only when msg-param-should-share-streak=1) as separate numeric USERNOTICE
+// tags on every resub. Read directly here rather than relying on Twitch's
+// system-msg wording, which silently drops the streak sentence if Twitch ever
+// changes the copy (see PR #38's 2026-08-08 streak coverage audit). Absent/zero/
+// non-numeric tags omit that segment — fail-open, never throws, never blocks
+// the gold row.
+function formatResubStreakInfo(tags) {
+  const cumulative = Number(tags['msg-param-cumulative-months']);
+  const streak = Number(tags['msg-param-streak-months']);
+  const parts = [];
+  if (Number.isFinite(cumulative) && cumulative > 0) parts.push(`${cumulative} months`);
+  if (Number.isFinite(streak) && streak > 0) parts.push(`${streak}-month streak`);
+  return parts.length ? `(${parts.join(', ')})` : '';
+}
+
+// submysterygift's gift count: prefer Twitch's own msg-param-mass-gift-count
+// tag over parsing system-msg text — the tag is exact, always sent by real
+// Twitch clients. The regex fallback (comma-aware — a plain /\d+/ would
+// truncate "1,000" to "1") only covers a client that omits the tag.
+function giftCountAmount(tags, systemMsg) {
+  const tagCount = Number(tags['msg-param-mass-gift-count']);
+  if (Number.isFinite(tagCount) && tagCount > 0) {
+    return tagCount === 1 ? '1 gift' : `${tagCount} gifts`;
+  }
+  // Anchored to "gifting <N>" rather than a bare digit-scan — a display name
+  // containing a digit (e.g. "TWW2") would otherwise match before the real
+  // count.
+  const match = systemMsg.match(/gifting\s+(\d[\d,]*)/i);
+  const n = match ? Number(match[1].replace(/,/g, '')) : NaN;
+  if (!Number.isFinite(n) || n <= 0) return undefined;
+  return n === 1 ? '1 gift' : `${n} gifts`;
 }
 
 // Twitch is retiring one WS edge and sends ":tmi.twitch.tv RECONNECT" to
 // warn clients to reconnect elsewhere before it drops them.
 export function isReconnectCommand(line) {
-  let rest = line;
-  if (rest.startsWith('@')) {
-    const spaceIdx = rest.indexOf(' ');
-    if (spaceIdx === -1) return false;
-    rest = rest.slice(spaceIdx + 1);
-  }
-  if (!rest.startsWith(':')) return false;
-  const spaceIdx = rest.indexOf(' ');
-  if (spaceIdx === -1) return false;
-  const command = rest.slice(spaceIdx + 1).split(' ')[0];
-  return command === 'RECONNECT';
+  const split = splitIrcLine(line);
+  return Boolean(split) && split.hasPrefix && split.command === 'RECONNECT';
 }
 
 // @login=<author>;target-msg-id=<id> :tmi.twitch.tv CLEARMSG #chan :<deleted text>
 export function parseClearmsg(line) {
-  let rest = line;
-  let tags = {};
-  if (rest.startsWith('@')) {
-    const spaceIdx = rest.indexOf(' ');
-    if (spaceIdx === -1) return null;
-    tags = parseIrcTags(rest.slice(0, spaceIdx));
-    rest = rest.slice(spaceIdx + 1);
-  }
-  if (!rest.startsWith(':')) return null;
-  if (rest.indexOf(' CLEARMSG ') === -1) return null;
+  const split = splitIrcLine(line);
+  if (!split || !split.hasPrefix || split.command !== 'CLEARMSG') return null;
+  const { tags } = split;
   const login = tags.login;
   const targetId = tags['target-msg-id'];
   if (!login || !targetId) return null;
@@ -2019,21 +2215,12 @@ export function parseClearmsg(line) {
 // the "clear chat" button): ":tmi.twitch.tv CLEARCHAT #chan" — never marks
 // rows, the feed is never wiped.
 export function parseClearchat(line) {
-  let rest = line;
-  let tags = {};
-  if (rest.startsWith('@')) {
-    const spaceIdx = rest.indexOf(' ');
-    if (spaceIdx === -1) return null;
-    tags = parseIrcTags(rest.slice(0, spaceIdx));
-    rest = rest.slice(spaceIdx + 1);
-  }
-  if (!rest.startsWith(':')) return null;
-  const idx = rest.indexOf(' CLEARCHAT ');
-  if (idx === -1) return null;
-  const afterCmd = rest.slice(idx + ' CLEARCHAT '.length);
-  const colonIdx = afterCmd.indexOf(' :');
+  const split = splitIrcLine(line);
+  if (!split || !split.hasPrefix || split.command !== 'CLEARCHAT') return null;
+  const { tags, params } = split;
+  const colonIdx = params.indexOf(' :');
   if (colonIdx === -1) return { clear: true };
-  const login = afterCmd.slice(colonIdx + 2);
+  const login = params.slice(colonIdx + 2);
   if (!login) return { clear: true };
   const durTag = tags['ban-duration'];
   const seconds = durTag != null ? Number(durTag) : null;
@@ -2046,13 +2233,10 @@ export function parseClearchat(line) {
 // slow: seconds, 0 = off. subs-only/emote-only/r9k(unique-chat): 0/1.
 // followers-only: -1 = off, 0 = on/any-follower, N>0 = on/N-minutes.
 export function parseRoomstate(line) {
-  if (!line.startsWith('@')) return null; // ROOMSTATE always carries tags
-  const spaceIdx = line.indexOf(' ');
-  if (spaceIdx === -1) return null;
-  const tags = parseIrcTags(line.slice(0, spaceIdx));
-  const rest = line.slice(spaceIdx + 1);
-  if (!rest.startsWith(':')) return null;
-  if (rest.indexOf(' ROOMSTATE ') === -1) return null;
+  if (!line.startsWith('@')) return null; // ROOMSTATE always carries tags — stricter than splitIrcLine's own optional-tags tolerance
+  const split = splitIrcLine(line);
+  if (!split || !split.hasPrefix || split.command !== 'ROOMSTATE') return null;
+  const { tags } = split;
 
   const out = {};
   if (tags.slow !== undefined) {
@@ -2086,21 +2270,9 @@ const PROTOCOL_NOISE_COMMANDS = new Set([
 ]);
 
 export function isProtocolNoise(line) {
-  let rest = line;
-  if (rest.startsWith('@')) {
-    const spaceIdx = rest.indexOf(' ');
-    if (spaceIdx === -1) return false;
-    rest = rest.slice(spaceIdx + 1);
-  }
-  let command;
-  if (rest.startsWith(':')) {
-    const spaceIdx = rest.indexOf(' ');
-    if (spaceIdx === -1) return false;
-    command = rest.slice(spaceIdx + 1).split(' ')[0];
-  } else {
-    command = rest.split(' ')[0];
-  }
-  return PROTOCOL_NOISE_COMMANDS.has(command);
+  const split = splitIrcLine(line);
+  if (!split) return false;
+  return PROTOCOL_NOISE_COMMANDS.has(split.command);
 }
 
 // Twitch's own message id + send-ts, for gap-recovery dedup/ordering — kept
@@ -2317,6 +2489,14 @@ export function buildDesiredSubs(broadcasterId) {
     { type: 'channel.hype_train.progress', version: '2', condition },
     { type: 'channel.hype_train.end', version: '2', condition },
     { type: 'channel.ad_break.begin', version: '1', condition },
+    { type: 'channel.bits.use', version: '1', condition },
+    // channel.moderate v2 — own condition object (needs moderator_user_id,
+    // the other five don't). moderator_user_id here is an authorization
+    // identity (must match the granting user), not an actor filter: Twitch's
+    // own docs example ("Adding a Moderator") shows a delivered event whose
+    // moderator_user_id differs from the condition — see docs/ARCHITECTURE.md
+    // §3a for the citation and the live-verification follow-up.
+    { type: 'channel.moderate', version: '2', condition: { broadcaster_user_id: broadcasterId, moderator_user_id: broadcasterId } },
   ];
 }
 
@@ -2328,6 +2508,17 @@ function ellipsize(str, max) {
   if (typeof str !== 'string') return '';
   const codePoints = [...str];
   return codePoints.length > max ? codePoints.slice(0, max - 1).join('') + '…' : str;
+}
+
+// Rounds to the nearest unit (598s -> "10m", never floored/truncated to
+// "9m") — used for channel.moderate timeout durations, derived from
+// expires_at - now. Negative/non-finite input (a clock-skewed or already-
+// expired expires_at) clamps to 0s rather than printing a negative duration.
+function formatDuration(seconds) {
+  const s = Number.isFinite(seconds) && seconds > 0 ? seconds : 0;
+  if (s < 60) return `${s}s`;
+  if (s < 3600) return `${Math.round(s / 60)}m`;
+  return `${Math.round(s / 3600)}h`;
 }
 
 // Pure event -> row mapper, no DO instance state (the Hype Train level-gate
@@ -2358,6 +2549,102 @@ export function mapEventToRow(subType, event) {
       const auto = event.is_automatic === true || event.is_automatic === 'true';
       return { sys: 'ad', text: `Ad break — ${event.duration_seconds}s${auto ? ' (auto)' : ''}` };
     }
+    case 'channel.bits.use': {
+      if (event.type === 'cheer') return null; // IRC's own bits tag owns cheer rows — no double gold row
+      const user = typeof event.user_name === 'string' && event.user_name ? event.user_name : 'unknown';
+      const bits = Number.isFinite(event.bits) ? event.bits : 0;
+      if (event.type === 'power_up') {
+        const powerUpType = event.power_up && event.power_up.type;
+        const POWER_UP_LABELS = {
+          gigantify_an_emote: 'Gigantify an Emote',
+          message_effect: 'Message Effect',
+          celebration: 'On-Screen Celebration',
+        };
+        const powerUpLabel = POWER_UP_LABELS[powerUpType];
+        if (!powerUpLabel) {
+          console.log(JSON.stringify({ ev: 'bits_use_unmapped', branch: 'power_up', type: event.type, powerUpType }));
+          return null; // unknown future power-up type — fail closed, don't guess a label
+        }
+        let emote;
+        if (powerUpType === 'gigantify_an_emote') {
+          const rawEmote = event.power_up.emote;
+          if (rawEmote && typeof rawEmote.id === 'string' && rawEmote.id) {
+            emote = { id: rawEmote.id, name: typeof rawEmote.name === 'string' ? rawEmote.name : '' };
+          } else {
+            console.log(JSON.stringify({ ev: 'bits_use_gigantify_no_emote', branch: 'power_up', powerUpType }));
+          }
+        }
+        return { user, kind: 'power_up', amount: `${bits} bits`, powerUpType, powerUpLabel, text: powerUpLabel, ...(emote ? { emote } : {}) };
+      }
+      if (event.type === 'custom_power_up') {
+        const rawTitle = event.custom_power_up && event.custom_power_up.title;
+        if (typeof rawTitle !== 'string' || !rawTitle) {
+          console.log(JSON.stringify({ ev: 'bits_use_unmapped', branch: 'custom_power_up', type: event.type }));
+          return null; // fail closed — mirror the power_up branch, don't guess a label
+        }
+        const powerUpLabel = ellipsize(rawTitle, REWARD_TITLE_MAX);
+        return { user, kind: 'power_up', amount: `${bits} bits`, powerUpType: 'custom_power_up', powerUpLabel, text: powerUpLabel };
+      }
+      console.log(JSON.stringify({ ev: 'bits_use_unmapped', branch: 'unrecognized_type', type: event.type }));
+      return null; // unrecognized future `type` value — fail closed
+    }
+    // Rendered set is 11 of the ~30 possible `action` values: the core 6
+    // (timeout/ban/unban/untimeout/delete/warn) plus the 5 shared_chat_*
+    // variants — un-deferred because IRC has no shared-chat-aware row to
+    // fall back to once applyClearchat/applyClearmsg suppress their own row
+    // for an owned action (see those methods). Every other action
+    // (emoteonly, mod, vip, raid, add_blocked_term, ...) is frequent/expected
+    // and returns null silently — logging each would be noise, not signal.
+    // An OWNED action with a missing/malformed sub-object is different: that
+    // should never happen per the documented payload shapes, so it logs
+    // 'modact_unmapped' before returning null (mirrors bits_use_unmapped).
+    case 'channel.moderate': {
+      const action = event.action;
+      const RENDERED_MODERATE_ACTIONS = new Set([
+        'timeout', 'ban', 'unban', 'untimeout', 'delete', 'warn',
+        'shared_chat_ban', 'shared_chat_unban', 'shared_chat_timeout', 'shared_chat_untimeout', 'shared_chat_delete',
+      ]);
+      if (!RENDERED_MODERATE_ACTIONS.has(action)) return null; // unowned action — silent, expected/frequent
+      const detail = event[action];
+      const userName = detail && typeof detail === 'object' && typeof detail.user_name === 'string' && detail.user_name
+        ? detail.user_name
+        : null;
+      const isTimeout = action === 'timeout' || action === 'shared_chat_timeout';
+      const expiresAtMs = isTimeout ? Date.parse((detail && detail.expires_at) || '') : null;
+      if (!userName || (isTimeout && !Number.isFinite(expiresAtMs))) {
+        console.log(JSON.stringify({ ev: 'modact_unmapped', action, reason: 'missing_fields' }));
+        return null;
+      }
+      const mod = typeof event.moderator_user_name === 'string' && event.moderator_user_name ? event.moderator_user_name : 'a moderator';
+      const baseAction = action.startsWith('shared_chat_') ? action.slice('shared_chat_'.length) : action;
+      const source = action.startsWith('shared_chat_')
+        && typeof event.source_broadcaster_user_name === 'string' && event.source_broadcaster_user_name
+        ? event.source_broadcaster_user_name
+        : null;
+      let text;
+      switch (baseAction) {
+        case 'timeout':
+          text = `${mod} timed out ${userName} (${formatDuration((expiresAtMs - Date.now()) / 1000)})`;
+          break;
+        case 'ban':
+          text = `${mod} banned ${userName}`;
+          break;
+        case 'unban':
+          text = `${mod} unbanned ${userName}`;
+          break;
+        case 'untimeout':
+          text = `${mod} removed timeout on ${userName}`;
+          break;
+        case 'delete':
+          text = `${mod} deleted ${userName}'s message`;
+          break;
+        case 'warn':
+          text = `${mod} warned ${userName}`;
+          break;
+      }
+      if (source) text += ` (shared chat: ${source})`;
+      return { sys: 'modact', text };
+    }
     default:
       return null;
   }
@@ -2368,6 +2655,18 @@ export function mapEventToRow(subType, event) {
 // member_gift_received is excluded from financial so a gift bomb buzzes once,
 // not once per redemption row. Raids buzz (a raid scrolling past as gray noise
 // is how we missed one on-stream) but are never spoken.
+// Username color precedence, shared by both platforms: mod (authority,
+// includes broadcaster) > financial event (one-off, salient gold) >
+// paid member/sub (baseline status) > default text color. Twitch's
+// per-user chosen tags.color is deliberately never consulted here — role
+// color only, everyone else renders in the page's default text color.
+export function roleClass(msg) {
+  if (msg.isMod) return 'mod';
+  if (msg.kind) return 'paid';
+  if (msg.isMember) return 'member';
+  return '';
+}
+
 export function emitCategory(msg) {
   if (msg.kind && msg.kind !== 'member_gift_received') return 'financial';
   if (msg.sys === 'raid') return 'raid';
@@ -2393,10 +2692,13 @@ export function isEmittable(msg, { floor, spokenIds, now }) {
 }
 
 // Never reads msg.text — only user/kind/amount reach the synthesizer, so raw
-// chat text structurally cannot be spoken.
+// chat text structurally cannot be spoken. The name is run through
+// cleanSpokenName for speech only — msg.user itself is untouched, so the
+// on-screen row still shows the raw name; speaks-what-buzzes is intentionally
+// relaxed here (see docs/ARCHITECTURE.md).
 export function formatUtterance(msg) {
   const label = TTS_LABELS[msg.kind] || msg.kind;
-  const parts = [msg.user, label];
+  const parts = [cleanSpokenName(msg.user), label];
   if (msg.amount) parts.push(msg.amount);
   return parts.join(', ');
 }
@@ -2439,11 +2741,61 @@ export function pullPhase(deltaY, thresholdPx) {
   return deltaY >= thresholdPx ? 'ready' : 'pulling';
 }
 
+// Pull-to-refresh settle-listener race guard. triggerPullRefresh's
+// onConnected callback fires asynchronously, after a network round trip —
+// if this pull's own timeout settles it first (network slower than 3s), or
+// a newer pull has since started, the late callback must not attach a
+// {once:true} message/status listener: it could fire on a different pull's
+// socket and hide that pull's indicator before its own refresh completes.
+// start() is called once per pull gesture; isCurrent(token) is checked
+// right before attaching the listener.
+export function createPullGate() {
+  let token = 0;
+  return {
+    start() { return ++token; },
+    isCurrent(myToken) { return myToken === token; },
+  };
+}
+
 // Pull-to-refresh version gate. A missing version on either side (fetch
 // failed, or the client's own build const didn't interpolate) must never
 // force a reload loop — only an unambiguous, confirmed mismatch does.
+// Explicit undefined/null/'' checks, not Boolean() coercion — a legit
+// version value of 0 is falsy but must still count as present.
 export function versionMismatch(clientVersion, serverVersion) {
-  return Boolean(clientVersion) && Boolean(serverVersion) && clientVersion !== serverVersion;
+  const hasClient = clientVersion !== undefined && clientVersion !== null && clientVersion !== '';
+  const hasServer = serverVersion !== undefined && serverVersion !== null && serverVersion !== '';
+  return hasClient && hasServer && clientVersion !== serverVersion;
+}
+
+// forensics rec 1: the only staleness predicate — shared by the
+// visibilitychange check and the periodic watchdog interval below, so
+// "nothing (not even a ping) heard in a while" means the exact same thing
+// whichever trigger noticed it. lastActivityTs is bumped by every SSE
+// signal (open/message/ping/status/mark), not just chat messages, so a
+// quiet-but-live YT feed riding on Twitch/heartbeat traffic never trips
+// this on its own — see YT_FEED_LOSS_FORENSICS_2026-08-05.md rec 1.
+export function isClientStale(lastActivityTs, now, staleAfterMs) {
+  return now - lastActivityTs > staleAfterMs;
+}
+
+// forensics rec 1: connect() already called this inline before this
+// extraction — pulled out as its own predicate so the "a fresh connect()
+// always supersedes any prior EventSource first" guarantee has a direct
+// regression test, independent of DOM/EventSource plumbing this repo has no
+// harness for. This is what keeps a periodic watchdog-triggered connect()
+// from ever creating a same-page concurrent connection (the forensics doc's
+// one unconfirmed loss-mechanism lead, §5).
+export function supersedeSocket(prevSocket) {
+  if (prevSocket) {
+    try { prevSocket.close(); } catch {}
+  }
+}
+
+// forensics rec 5: session-scoped send cap for the client error beacon — a
+// looping error must never spam the endpoint or the log.
+export function shouldSendClientError(countSoFar, max) {
+  return countSoFar < max;
 }
 
 // ── Static page ──────────────────────────────────────────────────────────
@@ -2472,10 +2824,9 @@ function pageHtml(myName) {
 <link rel="apple-touch-icon" href="/icon-180.png">
 <title>multichat</title>
 <style>
-  :root { color-scheme: dark; }
+  :root { color-scheme: dark; --role-mod: #5096ff; --role-member: #2ecc71; }
   * { box-sizing: border-box; }
   html, body { margin: 0; height: 100%; background: #0b0b0f; color: #e8e8ea; font: 15px/1.4 -apple-system, system-ui, sans-serif; }
-  body.large { font-size: 18px; }
   #feed { height: 100%; overflow-y: auto; overscroll-behavior: contain; padding: calc(30px + env(safe-area-inset-top, 0px)) 10px 24px; -webkit-overflow-scrolling: touch; overflow-anchor: none; }
   .msg { padding: 3px 0; word-break: break-word; }
   .msg.paid { background: rgba(255, 200, 0, 0.1); border-left: 3px solid #ffc700; padding-left: 6px; margin-left: -9px; }
@@ -2485,15 +2836,16 @@ function pageHtml(myName) {
   .badge.yt { background: #FF0000; color: #fff; }
   .amount { display: inline-block; font-size: 10px; font-weight: 700; padding: 1px 5px; border-radius: 4px; background: #ffc700; color: #1a1400; margin-right: 5px; }
   .user { font-weight: 600; }
-  .user.mod { color: #5096ff; }
+  .user.mod { color: var(--role-mod); }
   .user.paid { color: #ffc700; }
-  .user.member { color: #2ecc71; }
+  .user.member { color: var(--role-member); }
   .mention { background: #e63946; color: #fff; border-radius: 3px; padding: 0 2px; }
   .msg.info { color: #8a8a90; }
   .msg.raid { border: 2px solid #9147ff; border-radius: 6px; background: rgba(145, 71, 255, 0.12); padding: 6px 8px; margin: 4px 0; font-weight: 700; font-size: 1.1em; }
   .msg.redeem { border-left: 3px solid #1fd1b5; background: rgba(31, 209, 181, 0.10); padding-left: 6px; margin-left: -9px; }
   .msg.deleted > span:last-of-type { text-decoration: line-through; opacity: .6; }
   .emote { height: 1.4em; width: auto; vertical-align: middle; }
+  .emote.gigantify { display: block; height: 4em; margin-top: 4px; }
   .firstmsg { margin-right: 4px; }
   #resume { position: fixed; top: calc(34px + env(safe-area-inset-top, 0px)); left: 50%; transform: translateX(-50%); background: #1f1f26; color: #e8e8ea; border: 1px solid #333; border-radius: 999px; padding: 6px 14px; font-size: 13px; display: none; z-index: 15; }
   #resume.show { display: block; }
@@ -2501,17 +2853,21 @@ function pageHtml(myName) {
   #pullIndicator.show { display: block; }
   #banner { position: fixed; top: 0; left: 0; right: 0; background: #5a1a1a; color: #fff; text-align: center; font-size: 13px; padding: calc(6px + env(safe-area-inset-top, 0px)) 6px 6px; display: none; z-index: 20; }
   #banner.show { display: block; }
-  #topbar { position: fixed; top: calc(6px + env(safe-area-inset-top, 0px)); left: 8px; right: 8px; display: flex; flex-wrap: nowrap; justify-content: space-between; align-items: center; font-size: 10px; color: #666; z-index: 10; pointer-events: none; }
-  #chips { display: flex; gap: 8px; }
-  .chip { display: flex; align-items: center; gap: 3px; }
-  .chip::before { content: ''; width: 6px; height: 6px; border-radius: 50%; background: #555; display: inline-block; }
+  #staleIndicator { position: fixed; bottom: calc(10px + env(safe-area-inset-bottom, 0px)); left: 50%; transform: translateX(-50%); background: #4a3a12; color: #e8c46a; border: 1px solid #6b5320; border-radius: 999px; padding: 4px 12px; font-size: 11px; display: none; z-index: 18; pointer-events: none; }
+  #staleIndicator.show { display: block; }
+  #topbar { position: fixed; top: calc(6px + env(safe-area-inset-top, 0px)); left: 8px; right: 8px; display: grid; grid-template-columns: auto 1fr auto; align-items: center; font-size: 10px; color: #666; z-index: 10; pointer-events: none; }
+  #chips { display: flex; gap: 8px; justify-self: center; }
+  .chip { display: flex; align-items: center; gap: 3px; transition: color .6s; }
+  .chip::before { content: ''; width: 6px; height: 6px; border-radius: 50%; background: #555; display: inline-block; transition: background-color .6s; }
   .chip.live::before { background: #2ecc71; }
   .chip.warn::before { background: #e2b93b; }
   .chip.stale::before { background: #c0392b; }
+  .chip.flash-gold { color: #ffc700; }
+  .chip.flash-gold::before { background: #ffc700; }
   .count { margin-left: 3px; }
   .count:empty { display: none; }
   .count.stale { opacity: .45; }
-  #controls { display: flex; gap: 4px; pointer-events: none; }
+  #controls { display: flex; gap: 4px; pointer-events: none; justify-self: end; }
   #fontToggle, #speakToggle, #tokenToggle, #refreshBtn { pointer-events: auto; background: #1f1f26; color: #e8e8ea; border: 1px solid #333; border-radius: 4px; font-size: 10px; padding: 2px 6px; }
   #tokenPrompt { position: fixed; top: 40%; left: 50%; transform: translateX(-50%); background: #1f1f26; border: 1px solid #333; border-radius: 8px; padding: 12px; display: none; z-index: 25; gap: 6px; }
   #tokenPrompt.show { display: flex; }
@@ -2521,14 +2877,15 @@ function pageHtml(myName) {
 </head>
 <body>
 <div id="banner">disconnected — reconnecting…</div>
+<div id="staleIndicator">connection lagging…</div>
 <div id="topbar">
   <button id="tokenToggle">⚿</button>
-  <div id="chips"><span class="chip" id="chip-tw">tw<span class="count" id="count-tw"></span></span><span class="chip" id="chip-yt">yt<span class="count" id="count-yt"></span></span></div>
+  <div id="chips"><span class="chip" id="chip-tw">TW<span class="count" id="count-tw"></span></span><span class="chip" id="chip-yt">YT<span class="count" id="count-yt"></span></span></div>
   <div id="controls">
-    <button id="fontToggle">A+</button>
     <button id="speakToggle">🔇</button>
+    <button id="fontToggle">A</button>
+    <button id="refreshBtn">↻</button>
   </div>
-  <button id="refreshBtn">↻</button>
 </div>
 <div id="feed"></div>
 <div id="pullIndicator"></div>
@@ -2548,6 +2905,7 @@ function pageHtml(myName) {
   const feed = document.getElementById('feed');
   const resumeBtn = document.getElementById('resume');
   const bannerEl = document.getElementById('banner');
+  const staleIndicatorEl = document.getElementById('staleIndicator');
   const refreshBtn = document.getElementById('refreshBtn');
   const chipTw = document.getElementById('chip-tw');
   const chipYt = document.getElementById('chip-yt');
@@ -2557,8 +2915,16 @@ function pageHtml(myName) {
   const MY_NAME = ${jsonForScript(myName)}; // empty disables self-mention highlighting
   const MAX_ROWS = 300;
   const STALE_AFTER_MS = 60_000; // reconnect if nothing (not even a ping) heard in this long while backgrounded
+  const WATCHDOG_POLL_MS = 15_000; // forensics rec 1: catches a foregrounded-but-lagging tab without waiting on visibilitychange
+  // forensics rec 2: derived from the server's own ping cadence (never a second
+  // hardcoded literal that could drift from it) — must clear it with real
+  // margin or the indicator flickers on every healthy connection whenever a
+  // ping lands a bit late.
+  const PING_INTERVAL_MS = ${HEARTBEAT_MS};
+  const SOFT_STALE_MS = PING_INTERVAL_MS + 15_000;
   const CHIP_WARN_MS = 60_000;
   const CHIP_STALE_MS = 90_000;
+  const CLIENT_ERROR_SEND_MAX = 5; // forensics rec 5: session-scoped cap — a looping error must never spam the endpoint/log
 
   let paused = false; // true once the viewer has scrolled down into history
   let unseenCount = 0;
@@ -2567,11 +2933,64 @@ function pageHtml(myName) {
   let es = null;
   let reconnectAttempt = 0;
   let reconnectTimer = null;
+  let clientErrorSentCount = 0;
 
-  if (localStorage.getItem('multichat-fontsize') === 'large') document.body.classList.add('large');
+  // forensics rec 5: minimal error beacon — this investigation hit a hard
+  // wall trying to explain a reported red YT chip with no way to see what
+  // the client actually did. Gated on the same view token /events already
+  // uses (handleClientError, worker.js), rate-capped client-side, fire-and-
+  // forget so a reporting failure can never itself break anything.
+  function reportClientError(info) {
+    if (!token || !shouldSendClientError(clientErrorSentCount, CLIENT_ERROR_SEND_MAX)) return;
+    clientErrorSentCount++;
+    let payload;
+    try {
+      payload = JSON.stringify({
+        message: String((info && info.message) || 'unknown error').slice(0, 500),
+        source: info && info.source ? String(info.source).slice(0, 500) : undefined,
+        line: info && Number.isFinite(info.line) ? info.line : undefined,
+        col: info && Number.isFinite(info.col) ? info.col : undefined,
+        stack: info && info.stack ? String(info.stack).slice(0, 500) : undefined,
+        ts: Date.now(),
+      });
+    } catch { return; }
+    const url = '/client-error?t=' + encodeURIComponent(token);
+    try {
+      if (navigator.sendBeacon) {
+        navigator.sendBeacon(url, new Blob([payload], { type: 'application/json' }));
+      } else {
+        fetch(url, { method: 'POST', headers: { 'content-type': 'application/json' }, body: payload, keepalive: true }).catch(() => {});
+      }
+    } catch {}
+  }
+  window.addEventListener('error', (e) => {
+    reportClientError({ message: e.message, source: e.filename, line: e.lineno, col: e.colno, stack: e.error && e.error.stack });
+  });
+  window.addEventListener('unhandledrejection', (e) => {
+    const reason = e.reason;
+    reportClientError({
+      message: 'unhandledrejection: ' + (reason && reason.message ? reason.message : String(reason)),
+      stack: reason && reason.stack,
+    });
+  });
+
+  // Font-size cycle: 4 fixed sizes, button label stays static ("A") — no per-size text.
+  // Namespaced key (distinct from the old binary 'multichat-fontsize') —
+  // an old 'large'/'normal' value simply misses FONT_SIZES.indexOf and
+  // falls back to the default, no migration needed.
+  const FONT_SIZES = [13, 15, 17, 20];
+  const FONT_SIZE_KEY = 'multichat-fontsize-px';
+  let fontSizeIdx = FONT_SIZES.indexOf(Number(localStorage.getItem(FONT_SIZE_KEY)));
+  if (fontSizeIdx === -1) fontSizeIdx = FONT_SIZES.indexOf(15);
+  function applyFontSize(px) {
+    document.body.style.fontSize = px + 'px';
+  }
+  applyFontSize(FONT_SIZES[fontSizeIdx]);
   fontToggle.addEventListener('click', () => {
-    const large = document.body.classList.toggle('large');
-    localStorage.setItem('multichat-fontsize', large ? 'large' : 'normal');
+    fontSizeIdx = (fontSizeIdx + 1) % FONT_SIZES.length;
+    const px = FONT_SIZES[fontSizeIdx];
+    localStorage.setItem(FONT_SIZE_KEY, String(px));
+    applyFontSize(px);
   });
 
   // ── TTS read-aloud ───────────────────────────────────────────────────
@@ -2584,14 +3003,20 @@ function pageHtml(myName) {
   // desync from the plain-text call sites below (isEmittable(...), etc.) — a client-side
   // ReferenceError that npm test can't catch (vitest imports the un-bundled source directly).
   // Currently inert: no minify setting in wrangler.jsonc.
+  ${roleClass}
   ${emitCategory}
   ${isEmittable}
   ${resolveToken}
+  ${cleanSpokenName}
   ${formatUtterance}
   ${enqueueCapped}
   ${formatCount}
   ${pullPhase}
   ${versionMismatch}
+  ${createPullGate}
+  ${isClientStale}
+  ${supersedeSocket}
+  ${shouldSendClientError}
 
   // Speak/buzz-once-per-id state. floor = high-water mark of fired ids; spokenIds
   // = recently-fired ids (TTL-pruned). Both persist so a page reload / iOS
@@ -2735,7 +3160,6 @@ function pageHtml(myName) {
   });
 
   const EMOTE_ID_RE = /^[A-Za-z0-9_]+$/;
-  const COLOR_RE = /^#[0-9a-fA-F]{6}$/;
   // Client-side re-check of the worker's emoji-host allowlist (defense in
   // depth — the worker already blanks disallowed urls at ingest, so this is a
   // belt-and-suspenders check, not the authoritative gate).
@@ -2798,7 +3222,7 @@ function pageHtml(myName) {
         const img = document.createElement('img');
         img.className = 'emote';
         img.alt = token;
-        img.src = 'https://static-cdn.jtvnw.net/emoticons/v2/' + id + '/static/dark/1.0';
+        img.src = 'https://static-cdn.jtvnw.net/emoticons/v2/' + id + '/default/dark/1.0';
         img.onerror = () => { img.replaceWith(document.createTextNode(token)); };
         container.append(img);
       } else {
@@ -2859,10 +3283,9 @@ function pageHtml(myName) {
     badge.className = 'badge ' + msg.platform;
     badge.textContent = msg.platform;
     const user = document.createElement('span');
-    // Precedence: mod (authority) > financial event (one-off, salient) > member/sub (baseline status) > personal color.
-    user.className = 'user' + (msg.isMod ? ' mod' : msg.kind ? ' paid' : msg.isMember ? ' member' : '');
+    const rc = roleClass(msg);
+    user.className = 'user' + (rc ? ' ' + rc : '');
     user.textContent = msg.user + ':';
-    if (!msg.isMod && !msg.isMember && !msg.kind && msg.color && COLOR_RE.test(msg.color)) user.style.color = msg.color;
     const text = document.createElement('span');
     renderText(text, msg.text, msg.emotes);
     row.append(badge, user);
@@ -2873,6 +3296,18 @@ function pageHtml(myName) {
       row.append(amount);
     }
     row.append(text);
+    // Gigantify gold row extra: large animated render of the gigantified
+    // emote alongside the existing label. Fail closed — missing/invalid
+    // emote leaves the label-only row exactly as it was before this feature.
+    if (msg.emote && msg.emote.id && EMOTE_ID_RE.test(msg.emote.id)) {
+      const big = document.createElement('img');
+      big.className = 'emote gigantify';
+      big.loading = 'lazy';
+      big.alt = msg.emote.name || msg.emote.id;
+      big.src = 'https://static-cdn.jtvnw.net/emoticons/v2/' + msg.emote.id + '/default/dark/3.0';
+      big.onerror = () => { big.remove(); };
+      row.append(big);
+    }
     feed.insertBefore(row, feed.firstChild);
     while (feed.childElementCount > MAX_ROWS) feed.removeChild(feed.lastChild);
     if (!paused) {
@@ -2889,11 +3324,16 @@ function pageHtml(myName) {
     fireEmission(msg, 80);
   }
 
-  function chipClass(ageMs) {
-    if (ageMs == null) return 'chip';
-    if (ageMs < CHIP_WARN_MS) return 'chip live';
-    if (ageMs < CHIP_STALE_MS) return 'chip warn';
-    return 'chip stale';
+  // classList-based (not a wholesale className reassignment) so it never
+  // clobbers a 'flash-gold' class added independently by maybeFlashGold —
+  // the two live on the same element but are driven by unrelated state
+  // (chat liveness vs. a count going up) and must not fight each other.
+  function setChipLiveness(el, ageMs) {
+    el.classList.remove('live', 'warn', 'stale');
+    if (ageMs == null) return;
+    if (ageMs < CHIP_WARN_MS) el.classList.add('live');
+    else if (ageMs < CHIP_STALE_MS) el.classList.add('warn');
+    else el.classList.add('stale');
   }
 
   // Dot state (chipClass) reflects platform chat liveness (lastSeen), fully
@@ -2907,10 +3347,45 @@ function pageHtml(myName) {
     el.classList.toggle('stale', Boolean((primary && primary.stale) || (secondary && secondary.stale)));
   }
 
+  // Gold flash on a chip whose watched value increased — generic so a
+  // viewer-count chip could opt in later by just calling maybeFlashGold
+  // with a different key/element/value. baseline===null means "no
+  // comparison point yet" (fresh connect, see resetFlashBaselines): the
+  // first value received after a reset only establishes the baseline, it
+  // never flashes. Only an increase flashes; a decrease just updates the
+  // baseline silently. The timer resets (not stacks) on a further increase
+  // within the flash window.
+  const FLASH_GOLD_MS = 30_000;
+  const flashBaseline = { tw: null, yt: null };
+  const flashTimer = { tw: null, yt: null };
+
+  function resetFlashBaselines() {
+    for (const key of Object.keys(flashBaseline)) {
+      flashBaseline[key] = null;
+      clearTimeout(flashTimer[key]);
+      flashTimer[key] = null;
+    }
+    chipTw.classList.remove('flash-gold');
+    chipYt.classList.remove('flash-gold');
+  }
+
+  function maybeFlashGold(key, el, value) {
+    if (value == null) return;
+    const prev = flashBaseline[key];
+    if (prev != null && value > prev) {
+      el.classList.add('flash-gold');
+      clearTimeout(flashTimer[key]);
+      flashTimer[key] = setTimeout(() => el.classList.remove('flash-gold'), FLASH_GOLD_MS);
+    }
+    flashBaseline[key] = value;
+  }
+
   function renderStatus(status) {
-    chipTw.className = chipClass(status.tw);
-    chipYt.className = chipClass(status.yt);
+    setChipLiveness(chipTw, status.tw);
+    setChipLiveness(chipYt, status.yt);
     const counts = status.counts || {};
+    maybeFlashGold('tw', chipTw, counts.twFollowers && counts.twFollowers.v);
+    maybeFlashGold('yt', chipYt, counts.ytLikes && counts.ytLikes.v);
     renderCount(countTw, counts.twViewers, counts.twFollowers, '☆');
     renderCount(countYt, counts.ytViewers, counts.ytLikes);
   }
@@ -2922,6 +3397,21 @@ function pageHtml(myName) {
   function hideBanner() {
     bannerEl.classList.remove('show');
     if (window.speechSynthesis && speakEnabled) startKeepalive();
+  }
+
+  // forensics rec 2: decoupled from the platform chips (server-driven,
+  // buildStatusPayload's lastSeen) and from #banner (hard disconnect only,
+  // fires on EventSource.CLOSED). This reflects the *local* link's own
+  // reckoning — "my connection is lagging" — visibly distinct from "YT chat
+  // is just quiet" (chips stay green/live either way) and from "fully
+  // disconnected, reconnecting" (banner already owns that state, so this
+  // never shows on top of it).
+  function updateStaleIndicator() {
+    if (bannerEl.classList.contains('show')) {
+      staleIndicatorEl.classList.remove('show');
+      return;
+    }
+    staleIndicatorEl.classList.toggle('show', isClientStale(lastActivityTs, Date.now(), SOFT_STALE_MS));
   }
 
   // Shared reconnect core for the refresh button + pull-to-refresh. refreshBusy
@@ -2997,9 +3487,12 @@ function pageHtml(myName) {
 
   function connect() {
     clearTimeout(reconnectTimer);
-    if (es) {
-      try { es.close(); } catch {}
-    }
+    supersedeSocket(es);
+    // Every (re)connect — first load, watchdog reconnect, refresh button,
+    // PTR — gets a fresh gold-flash baseline. Without this, the first
+    // status payload after any reconnect would flash on values that never
+    // actually changed, just re-observed after a gap.
+    resetFlashBaselines();
     const url = '/events?t=' + encodeURIComponent(token) + (lastMsgId ? '&lastEventId=' + lastMsgId : '');
     const socket = new EventSource(url);
     es = socket;
@@ -3013,6 +3506,7 @@ function pageHtml(myName) {
       // predicate (2.3) is what suppresses replay bursts on every (re)connect,
       // live and first-load alike, without a fixed post-open time window.
       hideBanner();
+      staleIndicatorEl.classList.remove('show');
     };
     socket.onmessage = (e) => {
       if (socket !== es) return;
@@ -3028,7 +3522,9 @@ function pageHtml(myName) {
     socket.addEventListener('status', (e) => {
       if (socket !== es) return;
       lastActivityTs = Date.now();
-      try { renderStatus(JSON.parse(e.data)); } catch {}
+      try { renderStatus(JSON.parse(e.data)); } catch (err) {
+        reportClientError({ message: 'status render failed: ' + (err && err.message), stack: err && err.stack });
+      }
     });
     // Transient live-only mark (delete/timeout/ban) — see markDeleted in worker.js.
     // Not replayed: rows already carrying msg.deleted arrive pre-marked instead.
@@ -3056,6 +3552,23 @@ function pageHtml(myName) {
       if (socket.readyState === EventSource.CLOSED) scheduleReconnect();
     };
   }
+
+  // forensics rec 1: shared by the visibilitychange check below and a new
+  // periodic watchdog timer — previously this only re-ran on visibilitychange,
+  // so a foregrounded-but-lagging tab (no backgrounding event to trigger the
+  // check) had to wait on the ~75s backpressure reaper before recovering.
+  // connect() always supersedes any prior socket first (supersedeSocket
+  // above), so calling it here on a timer can never create a same-page
+  // concurrent connection.
+  function checkStaleAndReconnect() {
+    if (token && isClientStale(lastActivityTs, Date.now(), STALE_AFTER_MS)) {
+      connect();
+    }
+  }
+  setInterval(() => {
+    checkStaleAndReconnect();
+    updateStaleIndicator();
+  }, WATCHDOG_POLL_MS);
 
   function showTokenPrompt() {
     tokenInput.value = '';
@@ -3113,9 +3626,7 @@ function pageHtml(myName) {
       // iOS can suspend the tab's network entirely in the background; if
       // nothing (not even a ping) came through recently, the EventSource is
       // likely dead without ever firing onerror — force a fresh connection.
-      if (token && Date.now() - lastActivityTs > STALE_AFTER_MS) {
-        connect();
-      }
+      checkStaleAndReconnect();
     }
   });
   // Some WebKit/iOS versions silently reject a wake-lock request that isn't
@@ -3134,6 +3645,7 @@ function pageHtml(myName) {
   const PULL_THRESHOLD_PX = 70;
   const pullIndicatorEl = document.getElementById('pullIndicator');
   let pullBusy = false;
+  const pullGate = createPullGate();
 
   function settlePull(timeoutId) {
     clearTimeout(timeoutId);
@@ -3157,17 +3669,19 @@ function pageHtml(myName) {
       return;
     }
     pullBusy = true;
+    const myPullToken = pullGate.start();
     pullIndicatorEl.textContent = 'refreshing…';
     pullIndicatorEl.classList.add('show');
     const timeoutId = setTimeout(() => settlePull(timeoutId), 3000);
     // Routed through the same refreshReconnect() core the refresh button uses
     // (version-check → reload/connect, in-flight guard) so pull-to-refresh
-    // isn't a second bespoke reconnect path. onConnected fires synchronously
-    // right after connect() reassigns es — still in time to attach these
-    // one-shot listeners for the *new* socket. onGaveUp covers the no-token /
-    // fetch-failed cases, which will never produce a message to settle on —
-    // settle instantly there instead of riding the 3s timeout.
+    // isn't a second bespoke reconnect path. onConnected fires asynchronously
+    // (after a network round trip) — if it lands after this pull's own 3s
+    // timeout already settled it AND a newer pull has since started,
+    // pullGate.isCurrent() rejects it so a stale listener never attaches to
+    // someone else's socket and hides their indicator early.
     refreshReconnect((socket) => {
+      if (!pullGate.isCurrent(myPullToken)) return;
       const onSettle = () => settlePull(timeoutId);
       socket.addEventListener('message', onSettle, { once: true });
       socket.addEventListener('status', onSettle, { once: true });

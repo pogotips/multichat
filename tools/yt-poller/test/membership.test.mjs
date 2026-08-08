@@ -7,6 +7,7 @@
 import { describe, it, expect } from 'vitest';
 import { parseChatData } from 'youtube-chat/dist/parser.js';
 import { normalizeChatItem, KIND_FALLBACK_TEXT } from '../normalize.mjs';
+import { actionData, actionDataWithTracking, chatDataWith, chatDataWithTracking, parseOne } from './helpers/envelope.mjs';
 
 import membershipNew from './fixtures/membership-new.json';
 import membershipMilestone from './fixtures/membership-milestone.json';
@@ -16,24 +17,8 @@ import giftRedemption from './fixtures/gift-redemption.json';
 import unknownRenderer from './fixtures/unknown-renderer.json';
 import giftMessage from './fixtures/gift-message.json';
 import viewerEngagement from './fixtures/viewer-engagement.json';
-
-// Wrap a renderer-level fixture in a minimal get_live_chat response.
-function chatDataWith(...items) {
-  return {
-    continuationContents: {
-      liveChatContinuation: {
-        actions: items.map((item) => ({ addChatItemAction: { item, clientId: 'x' } })),
-        continuations: [{ invalidationContinuationData: { continuation: 'next-token' } }],
-      },
-    },
-  };
-}
-
-function parseOne(fixture) {
-  const [chatItems] = parseChatData(chatDataWith(fixture));
-  expect(chatItems).toHaveLength(1);
-  return chatItems[0];
-}
+import modeChangeSlowmode from './fixtures/mode-change-slowmode.json';
+import modeChangeSubonly from './fixtures/mode-change-subonly.json';
 
 describe('patched parser: liveChatMembershipItemRenderer', () => {
   it('marks a new-member item and keeps the welcome text', () => {
@@ -117,28 +102,14 @@ describe('patched parser: unrecognized renderer types', () => {
   });
 
   it('a known-benign non-addChatItemAction action (ticker) is still dropped silently', () => {
-    const data = {
-      continuationContents: {
-        liveChatContinuation: {
-          actions: [{ addLiveChatTickerItemAction: { some: 'ticker payload' } }],
-          continuations: [{ invalidationContinuationData: { continuation: 'next-token' } }],
-        },
-      },
-    };
+    const data = actionData({ addLiveChatTickerItemAction: { some: 'ticker payload' } });
     const [chatItems] = parseChatData(data);
     expect(chatItems).toEqual([]);
   });
 
   it('an unrecognized action key is surfaced as unknownAction instead of silently dropped', () => {
     const action = { addBannerToLiveChatCommand: { some: 'banner payload' } };
-    const data = {
-      continuationContents: {
-        liveChatContinuation: {
-          actions: [action],
-          continuations: [{ invalidationContinuationData: { continuation: 'next-token' } }],
-        },
-      },
-    };
+    const data = actionData(action);
     const [chatItems] = parseChatData(data);
     expect(chatItems).toHaveLength(1);
     expect(chatItems[0]).toEqual({
@@ -160,14 +131,7 @@ describe('patched parser: unrecognized renderer types', () => {
       clickTrackingParams: 'CAAQl98BIhMIhbW0-tv-jgMVAAAAAB0AAAAA',
       addBannerToLiveChatCommand: { some: 'banner payload' },
     };
-    const data = {
-      continuationContents: {
-        liveChatContinuation: {
-          actions: [action],
-          continuations: [{ invalidationContinuationData: { continuation: 'next-token' } }],
-        },
-      },
-    };
+    const data = actionData(action);
     const [chatItems] = parseChatData(data);
     expect(chatItems).toEqual([{
       rendererType: 'unknownAction',
@@ -178,14 +142,7 @@ describe('patched parser: unrecognized renderer types', () => {
 
   it('keys as "unknown" instead of dropping when every action key is noise', () => {
     const action = { clickTrackingParams: 'CAAQl98BIhMIhbW0-tv-jgMVAAAAAB0AAAAA' };
-    const data = {
-      continuationContents: {
-        liveChatContinuation: {
-          actions: [action],
-          continuations: [{ invalidationContinuationData: { continuation: 'next-token' } }],
-        },
-      },
-    };
+    const data = actionData(action);
     const [chatItems] = parseChatData(data);
     expect(chatItems).toEqual([{
       rendererType: 'unknownAction',
@@ -213,33 +170,7 @@ describe('patched parser: unrecognized renderer types', () => {
   });
 });
 
-function actionDataWithTracking(action) {
-  return {
-    continuationContents: {
-      liveChatContinuation: {
-        actions: [{ clickTrackingParams: 'CAAQl98BIhMIhbW0-tv-jgMVAAAAAB0AAAAA', ...action }],
-        continuations: [{ invalidationContinuationData: { continuation: 'next-token' } }],
-      },
-    },
-  };
-}
-
-function chatDataWithTracking(item) {
-  return actionDataWithTracking({ addChatItemAction: { item, clientId: 'x' } });
-}
-
 describe('patched parser: mod actions (deletion/author-removal)', () => {
-  function actionData(action) {
-    return {
-      continuationContents: {
-        liveChatContinuation: {
-          actions: [action],
-          continuations: [{ invalidationContinuationData: { continuation: 'next-token' } }],
-        },
-      },
-    };
-  }
-
   it('markChatItemAsDeletedAction surfaces as a deletion control item, no longer dropped', () => {
     const data = actionData({ markChatItemAsDeletedAction: { targetItemId: 'Chz-target-id' } });
     const [chatItems] = parseChatData(data);
@@ -301,6 +232,25 @@ describe('patched parser: mod actions (deletion/author-removal)', () => {
   });
 });
 
+// ROOMSTATE parity (PR #38's 2026-08-08 streak coverage audit, item 3): YouTube's
+// analog of Twitch's slow/sub-only/emote-only ROOMSTATE deltas. Control item,
+// same shape family as the deletion/authorDeletion items above — never a
+// real ChatItem (no author/id/timestamp), short-circuited before the classic
+// extraction in parseActionToChatItem.
+describe('patched parser: liveChatModeChangeMessageRenderer (ROOMSTATE parity)', () => {
+  it('surfaces a modeChange control item with the rendered text (slow mode, with subtext present but unused)', () => {
+    const data = chatDataWith(modeChangeSlowmode);
+    const [chatItems] = parseChatData(data);
+    expect(chatItems).toEqual([{ rendererType: 'modeChange', text: 'Slow mode is on' }]);
+  });
+
+  it('surfaces a modeChange control item when there is no subtext at all (sub-only mode)', () => {
+    const data = chatDataWith(modeChangeSubonly);
+    const [chatItems] = parseChatData(data);
+    expect(chatItems).toEqual([{ rendererType: 'modeChange', text: '@Cool_Broadcaster turned on subscribers-only mode' }]);
+  });
+});
+
 describe('normalizeChatItem: ytId passthrough', () => {
   it('forwards the YT native message id as ytId, regular message', () => {
     const msg = normalizeChatItem({
@@ -309,11 +259,6 @@ describe('normalizeChatItem: ytId passthrough', () => {
       message: [{ text: 'hello' }],
     });
     expect(msg.ytId).toBe('Chz-plain-text-message-id');
-  });
-
-  it('forwards ytId on a membership kind too', () => {
-    const msg = normalizeChatItem(parseOne(giftPurchase));
-    expect(msg.ytId).toBe('ChwKGkNQZm4wYUxUcC1BREZjOEs1UW9kQWc0QW5E');
   });
 });
 

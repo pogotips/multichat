@@ -1,0 +1,25 @@
+{
+  "subscription": {
+    "id": "b3c4d5a9-383c-61b1-c387-2143f9c6e3d6",
+    "type": "channel.bits.use",
+    "version": "1",
+    "status": "enabled",
+    "cost": 0,
+    "condition": { "broadcaster_user_id": "1349263833" },
+    "transport": { "method": "webhook", "callback": "https://example.com/eventsub/callback" },
+    "created_at": "2026-08-01T00:00:00Z"
+  },
+  "event": {
+    "user_id": "9012",
+    "user_login": "third_user",
+    "user_name": "Third_User",
+    "broadcaster_user_id": "1349263833",
+    "broadcaster_user_login": "cooler_user",
+    "broadcaster_user_name": "Cooler_User",
+    "bits": 1000,
+    "type": "power_up",
+    "power_up": { "type": "celebration" },
+    "custom_power_up": null,
+    "message": null
+  }
+}

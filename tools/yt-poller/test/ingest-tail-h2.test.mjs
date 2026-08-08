@@ -55,8 +55,8 @@ async function drainLoopMirror(queue, sendFn, initialBackoffMs, maxBackoffMs) {
 }
 
 describe('Phase 4b: H2 head-of-line-blocking fingerprint', () => {
-  const INITIAL_BACKOFF_MS = 200; // scaled down from poller.mjs's real 5,000ms — see file header
-  const MAX_BACKOFF_MS = 2_000;
+  const INITIAL_BACKOFF_MS = 50; // scaled down from poller.mjs's real 5,000ms — see file header
+  const MAX_BACKOFF_MS = 500;
 
   it('a message queued behind a failing/retrying one is delayed by the full backoff — H2 predicted shape', async () => {
     const queue = [];

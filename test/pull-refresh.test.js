@@ -3,7 +3,9 @@
 // guarantee (reusing connect()'s Last-Event-ID replay must not duplicate
 // rows), and the Rider-2 DO-blocking instrumentation log shape.
 import { describe, it, expect, vi, afterEach } from 'vitest';
-import worker, { ChatHub, pullPhase, versionMismatch } from '../src/worker.js';
+import worker, { pullPhase, versionMismatch, createPullGate } from '../src/worker.js';
+import { makeHub } from './helpers/makeHub.js';
+import { logEvents } from './helpers/logEvents.js';
 
 describe('pullPhase', () => {
   const THRESHOLD = 70;
@@ -28,6 +30,49 @@ describe('pullPhase', () => {
   });
 });
 
+describe('createPullGate (PTR settle-listener race guard)', () => {
+  afterEach(() => {
+    vi.useRealTimers();
+  });
+
+  it('fire-before-attach: a pull whose own 3s timeout settles it before its async onConnected arrives is rejected once a newer pull has started', () => {
+    vi.useFakeTimers();
+    const gate = createPullGate();
+    const settled = [];
+
+    // Pull #1 starts, and — mirroring triggerPullRefresh — its 3s fallback
+    // timeout is scheduled immediately.
+    const token1 = gate.start();
+    const timeout1 = setTimeout(() => settled.push('pull1-timeout'), 3000);
+
+    // Network is slower than 3s: the timeout fires first (fire-before-attach)
+    // and settles pull #1 before refreshReconnect's onConnected ever runs.
+    vi.advanceTimersByTime(3000);
+    expect(settled).toEqual(['pull1-timeout']);
+
+    // Pull #1's onConnected finally arrives late, but no other pull has
+    // started yet — attaching here is harmless (it'll settle an already-
+    // settled state), so the gate still reports it current.
+    expect(gate.isCurrent(token1)).toBe(true);
+
+    // The user pulls again — pull #2 begins, incrementing the gate.
+    const token2 = gate.start();
+    clearTimeout(timeout1);
+
+    // Now pull #1's (still in-flight) onConnected would land: it must be
+    // rejected, since attaching its settle listener to pull #2's socket
+    // would hide pull #2's indicator before its own refresh completes.
+    expect(gate.isCurrent(token1)).toBe(false);
+    expect(gate.isCurrent(token2)).toBe(true);
+  });
+
+  it('a single in-order pull (no race) stays current through its own settle', () => {
+    const gate = createPullGate();
+    const token = gate.start();
+    expect(gate.isCurrent(token)).toBe(true);
+  });
+});
+
 describe('versionMismatch', () => {
   it('false when versions match', () => {
     expect(versionMismatch('2026.07.27', '2026.07.27')).toBe(false);
@@ -41,6 +86,14 @@ describe('versionMismatch', () => {
     expect(versionMismatch(null, '2026.07.27')).toBe(false);
     expect(versionMismatch('2026.07.27', null)).toBe(false);
     expect(versionMismatch(undefined, undefined)).toBe(false);
+    expect(versionMismatch('', '2026.07.27')).toBe(false);
+    expect(versionMismatch('2026.07.27', '')).toBe(false);
+  });
+
+  it('a legit 0 version value counts as present, not missing — Boolean(0) coercion would wrongly treat it as absent', () => {
+    expect(versionMismatch(0, '2026.07.27')).toBe(true);
+    expect(versionMismatch(0, 0)).toBe(false);
+    expect(versionMismatch(0, 1)).toBe(true);
   });
 });
 
@@ -54,19 +107,9 @@ describe('GET /api/version', () => {
   });
 });
 
-function makeHub(envOverrides = {}) {
-  const env = {
-    TWITCH_CHANNEL: 'testchannel',
-    CAPTURE: { async put() {} },
-    ...envOverrides,
-  };
-  const ctx = { storage: { async setAlarm() {}, async get() { return undefined; }, async put() {} } };
-  return new ChatHub(ctx, env);
-}
-
 describe('resync-is-silent: reconnecting at the current high-water mark replays nothing', () => {
   it('a manual pull-refresh reconnect (same lastMsgId) enqueues zero rows to the new controller', () => {
-    const hub = makeHub();
+    const { hub } = makeHub();
     hub.pushMessage('tw', { user: 'Alice', text: 'hi' });
     hub.pushMessage('tw', { user: 'Bob', text: 'yo' });
     const lastMsgId = hub.nextId; // client's lastMsgId after having seen both live
@@ -84,7 +127,7 @@ describe('resync-is-silent: reconnecting at the current high-water mark replays 
   });
 
   it('a stale lastMsgId (gap, not a resync) still replays only the newer entries — sanity check on the filter itself', () => {
-    const hub = makeHub();
+    const { hub } = makeHub();
     hub.pushMessage('tw', { user: 'Alice', text: 'hi' });
     const beforeSecond = hub.nextId;
     hub.pushMessage('tw', { user: 'Bob', text: 'yo' });
@@ -100,17 +143,16 @@ describe('Rider 2: DO-blocking instrumentation log shape', () => {
   });
 
   it('pollTwitchViewers logs a do_fetch_timing span around the Helix fetch', async () => {
-    const hub = makeHub({ TWITCH_CLIENT_ID: 'cid', TWITCH_CLIENT_SECRET: 'csecret' });
+    const { hub } = makeHub({ envOverrides: { TWITCH_CLIENT_ID: 'cid', TWITCH_CLIENT_SECRET: 'csecret' } });
     const fetchSpy = vi.fn()
       .mockResolvedValueOnce({ ok: true, json: async () => ({ access_token: 'tok1', expires_in: 3600 }) })
       .mockResolvedValueOnce({ ok: true, json: async () => ({ data: [{ viewer_count: 55 }] }) });
     vi.stubGlobal('fetch', fetchSpy);
     const logSpy = vi.spyOn(console, 'log').mockImplementation(() => {});
     await hub.pollTwitchViewers();
-    const timings = logSpy.mock.calls.map((c) => JSON.parse(c[0])).filter((e) => e.ev === 'do_fetch_timing');
     // app_token now instrumented — its span precedes helix_viewer_poll's
     // since getTwitchAppToken is awaited first.
-    expect(timings).toEqual([
+    expect(logEvents(logSpy, 'do_fetch_timing')).toEqual([
       expect.objectContaining({ op: 'app_token', durationMs: expect.any(Number), outcome: 'ok', span_id: expect.any(String) }),
       expect.objectContaining({ op: 'helix_viewer_poll', durationMs: expect.any(Number), outcome: 'ok', span_id: expect.any(String) }),
     ]);
@@ -118,7 +160,7 @@ describe('Rider 2: DO-blocking instrumentation log shape', () => {
   });
 
   it('refreshTwitchUserToken logs a do_fetch_timing span around the token refresh', async () => {
-    const hub = makeHub({ TWITCH_CLIENT_ID: 'cid', TWITCH_CLIENT_SECRET: 'csecret' });
+    const { hub } = makeHub({ envOverrides: { TWITCH_CLIENT_ID: 'cid', TWITCH_CLIENT_SECRET: 'csecret' } });
     const fetchSpy = vi.fn().mockResolvedValueOnce({
       ok: true,
       json: async () => ({ access_token: 'tok', refresh_token: 'rot', expires_in: 3600 }),
@@ -126,34 +168,31 @@ describe('Rider 2: DO-blocking instrumentation log shape', () => {
     vi.stubGlobal('fetch', fetchSpy);
     const logSpy = vi.spyOn(console, 'log').mockImplementation(() => {});
     await hub.refreshTwitchUserToken('seed-refresh-token');
-    const timings = logSpy.mock.calls.map((c) => JSON.parse(c[0])).filter((e) => e.ev === 'do_fetch_timing');
-    expect(timings).toEqual([expect.objectContaining({ op: 'token_refresh', durationMs: expect.any(Number), outcome: 'ok' })]);
+    expect(logEvents(logSpy, 'do_fetch_timing')).toEqual([expect.objectContaining({ op: 'token_refresh', durationMs: expect.any(Number), outcome: 'ok' })]);
     logSpy.mockRestore();
   });
 
   it('recoverGap logs a do_fetch_timing span around the backfill fetch', async () => {
-    const hub = makeHub();
+    const { hub } = makeHub();
     const fetchSpy = vi.fn().mockResolvedValueOnce({ ok: true, json: async () => ({ messages: [] }) });
     vi.stubGlobal('fetch', fetchSpy);
     const logSpy = vi.spyOn(console, 'log').mockImplementation(() => {});
     await hub.recoverGap();
-    const timings = logSpy.mock.calls.map((c) => JSON.parse(c[0])).filter((e) => e.ev === 'do_fetch_timing');
-    expect(timings).toEqual([expect.objectContaining({ op: 'backfill', durationMs: expect.any(Number), outcome: 'ok' })]);
+    expect(logEvents(logSpy, 'do_fetch_timing')).toEqual([expect.objectContaining({ op: 'backfill', durationMs: expect.any(Number), outcome: 'ok' })]);
     logSpy.mockRestore();
   });
 
   it('a throwing backfill fetch still emits do_fetch_timing, with outcome "error"', async () => {
-    const hub = makeHub();
+    const { hub } = makeHub();
     vi.stubGlobal('fetch', vi.fn().mockRejectedValueOnce(new Error('aborted')));
     const logSpy = vi.spyOn(console, 'log').mockImplementation(() => {});
     await hub.recoverGap(); // outer catch swallows — must not throw out
-    const timings = logSpy.mock.calls.map((c) => JSON.parse(c[0])).filter((e) => e.ev === 'do_fetch_timing');
-    expect(timings).toEqual([expect.objectContaining({ op: 'backfill', durationMs: expect.any(Number), outcome: 'error' })]);
+    expect(logEvents(logSpy, 'do_fetch_timing')).toEqual([expect.objectContaining({ op: 'backfill', durationMs: expect.any(Number), outcome: 'error' })]);
     logSpy.mockRestore();
   });
 
   it('maybeEnsureEventSub logs a do_fetch_timing span around the whole ensure cycle', async () => {
-    const hub = makeHub({ EVENTSUB_SECRET: 'sec', TWITCH_BROADCASTER_ID: '123', TWITCH_CLIENT_ID: 'cid', TWITCH_CLIENT_SECRET: 'csecret' });
+    const { hub } = makeHub({ envOverrides: { EVENTSUB_SECRET: 'sec', TWITCH_BROADCASTER_ID: '123', TWITCH_CLIENT_ID: 'cid', TWITCH_CLIENT_SECRET: 'csecret' } });
     hub.esOrigin = 'https://example.com';
     const fetchSpy = vi.fn()
       .mockResolvedValueOnce({ ok: true, json: async () => ({ access_token: 'tok1', expires_in: 3600 }) }) // app token
@@ -162,7 +201,7 @@ describe('Rider 2: DO-blocking instrumentation log shape', () => {
     const logSpy = vi.spyOn(console, 'log').mockImplementation(() => {});
     hub.maybeEnsureEventSub();
     await vi.waitFor(() => {
-      const timings = logSpy.mock.calls.map((c) => { try { return JSON.parse(c[0]); } catch { return null; } }).filter((e) => e && e.ev === 'do_fetch_timing');
+      const timings = logEvents(logSpy, 'do_fetch_timing');
       expect(timings.some((t) => t.op === 'eventsub_ensure' && (t.outcome === 'ok' || t.outcome === 'error'))).toBe(true);
     });
     logSpy.mockRestore();
@@ -178,7 +217,7 @@ describe('Ingest-tail: ingest_timing correlation', () => {
   });
 
   it('positive: an ingest overlapping a slow outbound fetch attributes the delay to that span', async () => {
-    const hub = makeHub({ TWITCH_CLIENT_ID: 'cid', TWITCH_CLIENT_SECRET: 'secret' });
+    const { hub } = makeHub({ envOverrides: { TWITCH_CLIENT_ID: 'cid', TWITCH_CLIENT_SECRET: 'secret' } });
     let resolveSlowFetch;
     const slowFetch = new Promise((resolve) => { resolveSlowFetch = resolve; });
     vi.stubGlobal('fetch', vi.fn(() => slowFetch));
@@ -207,7 +246,7 @@ describe('Ingest-tail: ingest_timing correlation', () => {
     resolveSlowFetch({ ok: true, json: async () => ({ access_token: 'tok', expires_in: 3600 }) });
     await slowCallPromise;
 
-    const ingestTiming = logSpy.mock.calls.map((c) => JSON.parse(c[0])).find((e) => e.ev === 'ingest_timing');
+    const ingestTiming = logEvents(logSpy, 'ingest_timing')[0];
     expect(ingestTiming.req_id).toBe('req-positive');
     expect(ingestTiming.overlap_spans.length).toBeGreaterThan(0);
     expect(ingestTiming.overlap_ms).toBeGreaterThan(0);
@@ -216,7 +255,7 @@ describe('Ingest-tail: ingest_timing correlation', () => {
   });
 
   it('negative: an ingest with no outbound fetch in flight attributes nothing — empty overlap_spans, delay lands in unattributed_ms', async () => {
-    const hub = makeHub();
+    const { hub } = makeHub();
     const logSpy = vi.spyOn(console, 'log').mockImplementation(() => {});
     const req = new Request('https://do/ingest/yt', {
       method: 'POST',
@@ -224,7 +263,7 @@ describe('Ingest-tail: ingest_timing correlation', () => {
       body: JSON.stringify({ user: 'Bob', text: 'yo' }),
     });
     await hub.handleIngestYt(req);
-    const ingestTiming = logSpy.mock.calls.map((c) => JSON.parse(c[0])).find((e) => e.ev === 'ingest_timing');
+    const ingestTiming = logEvents(logSpy, 'ingest_timing')[0];
     expect(ingestTiming.req_id).toBe('req-negative');
     expect(ingestTiming.overlap_spans).toEqual([]);
     expect(ingestTiming.overlap_ms).toBe(0);
@@ -234,12 +273,11 @@ describe('Ingest-tail: ingest_timing correlation', () => {
   });
 
   it('error: a failed outbound fetch still logs outcome "error" from finally, and leaves no leaked in-flight entry to poison a later ingest', async () => {
-    const hub = makeHub({ TWITCH_CLIENT_ID: 'cid', TWITCH_CLIENT_SECRET: 'secret' });
+    const { hub } = makeHub({ envOverrides: { TWITCH_CLIENT_ID: 'cid', TWITCH_CLIENT_SECRET: 'secret' } });
     vi.stubGlobal('fetch', vi.fn().mockRejectedValueOnce(new Error('network down')));
     const logSpy = vi.spyOn(console, 'log').mockImplementation(() => {});
     await hub.getTwitchAppToken(); // outer catch swallows — must not throw out
-    const fetchTimings = logSpy.mock.calls.map((c) => JSON.parse(c[0])).filter((e) => e.ev === 'do_fetch_timing');
-    expect(fetchTimings).toEqual([
+    expect(logEvents(logSpy, 'do_fetch_timing')).toEqual([
       expect.objectContaining({ op: 'app_token', outcome: 'error', span_id: expect.any(String) }),
     ]);
     logSpy.mockRestore();
@@ -249,7 +287,7 @@ describe('Ingest-tail: ingest_timing correlation', () => {
     const logSpy2 = vi.spyOn(console, 'log').mockImplementation(() => {});
     const req = new Request('https://do/ingest/yt', { method: 'POST', body: JSON.stringify({ user: 'Carl', text: 'hey' }) });
     await hub.handleIngestYt(req);
-    const ingestTiming = logSpy2.mock.calls.map((c) => JSON.parse(c[0])).find((e) => e.ev === 'ingest_timing');
+    const ingestTiming = logEvents(logSpy2, 'ingest_timing')[0];
     expect(ingestTiming.overlap_spans).toEqual([]);
     logSpy2.mockRestore();
   });

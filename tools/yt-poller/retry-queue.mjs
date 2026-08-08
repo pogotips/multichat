@@ -34,3 +34,18 @@ export async function drainBatch(queue, sendFn, concurrency = SEND_CONCURRENCY) 
   queue.unshift(...failed);
   return { attempted: results.length, sent: results.length - failed.length };
 }
+
+// Per-attempt counter for ingest send logs (Phase 6 gap: no retry-number
+// field existed anywhere in the send path). A WeakMap keyed by message
+// identity — not a property stamped on msg itself — so the count never
+// gets serialized into the outgoing JSON POST body. Non-object msgs (e.g.
+// a bare string in a test double) can't be WeakMap keys; they just always
+// read as attempt 1.
+const attemptCounts = new WeakMap();
+
+export function nextAttempt(msg) {
+  if (!msg || typeof msg !== 'object') return 1;
+  const n = (attemptCounts.get(msg) || 0) + 1;
+  attemptCounts.set(msg, n);
+  return n;
+}

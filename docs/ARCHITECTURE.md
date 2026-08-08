@@ -132,7 +132,7 @@ precedence comment, `src/worker.js:1825`).
 | `kind` | Source | TTS label (`TTS_LABELS`) | Notes |
 |---|---|---|---|
 | `cheer` | Twitch `PRIVMSG` with a `bits` tag (`parsePrivmsg`) | "cheer" | `amount` = `"<N> bits"` |
-| `sub` | Twitch `USERNOTICE` `msg-id=sub|resub` (`parseUsernotice`) | "sub" | |
+| `sub` | Twitch `USERNOTICE` `msg-id=sub|resub` (`parseUsernotice`) | "sub" | `resub` appends `(<N> months[, <M>-month streak])` — read directly from `msg-param-cumulative-months`/`msg-param-streak-months` tags, not `system-msg` wording; absent/zero/unparseable tags omit the segment (`formatResubStreakInfo`) |
 | `giftsub` | Twitch `USERNOTICE` `msg-id=subgift|submysterygift|giftpaidupgrade|anongiftpaidupgrade` | "gift sub" | |
 | `superchat` | YT `item.superchat` (non-sticker) | "superchat" | `amount` = superchat amount string |
 | `supersticker` | YT `item.superchat.sticker` | "super sticker" | |
@@ -162,22 +162,27 @@ string if unmapped).
 |---|---|---|
 | `raid` | Twitch `USERNOTICE msg-id=raid` (`parseUsernotice`) | **Purple raid banner** (`.msg.raid`, border `#9147ff`, bold, 🎉 prefix) — promoted out of the gray tier specifically because a raid scrolled past unnoticed as gray noise on a real stream. Distinct double vibrate `[80, 40, 80]` via the same `isEmittable`/`fireEmission` gate as financial rows (fires once per id, live or replayed). No TTS — `emitCategory` maps `sys:'raid'` to category `'raid'` (buzz only, never spoken), never `'financial'`. |
 | `announce` | Twitch `USERNOTICE msg-id=announcement` | Standard gray info row, `"<user>: <text>"` |
-| `deleted` | Twitch: synthesized by `applyClearmsg` after `CLEARMSG`. YouTube: synthesized by `applyYtDelete`/`applyYtAuthorDelete` after a `{type:'mod'}` control POST (poller-parsed `markChatItemAsDeletedAction`/`removeChatItemAction`/`markChatItemsByAuthorAsDeletedAction`) | Gray row naming the author when the target/author is still in the 200-entry ring (`"<login>'s message deleted"` / `"<user>'s message deleted"` / `"<user>'s messages were removed"`), generic fallback text when it's scrolled out; **also** mutates the matching ring entry/entries in place (`entry.deleted = true`) so replayed rows arrive pre-struck, plus a transient live-only `mark` SSE event for already-rendered rows. Twitch matches by `twId` (`[data-twid]`); YouTube matches by `ytId` for a single message or `authorId` for all of one author's rows (`[data-ytid]` / `[data-ytauthor]`, `CSS.escape`d). |
-| `timeout` | `applyClearchat` — Twitch `CLEARCHAT` with a `ban-duration` tag | Gray row `"timeout: <login>, <N>s"` + same in-place `deleted` marking, matched by `login` (never display name — mod-action tags don't carry it) |
-| `ban` | `applyClearchat` — `CLEARCHAT` without `ban-duration` | Gray row `"ban: <login>"` + same marking by `login` |
-| `clear` | Bare `CLEARCHAT` (no trailing target — the "Clear Chat" button) | Gray row `"chat cleared"` **only** — never wipes the feed, never marks any row |
+| `deleted` | Twitch: synthesized by `applyClearmsg` after `CLEARMSG`. YouTube: synthesized by `applyYtDelete`/`applyYtAuthorDelete` after a `{type:'mod'}` control POST (poller-parsed `markChatItemAsDeletedAction`/`removeChatItemAction`/`markChatItemsByAuthorAsDeletedAction`) | Gray row naming the author when the target/author is still in the 200-entry ring (`"<login>'s message deleted"` / `"<user>'s message deleted"` / `"<user>'s messages were removed"`), generic fallback text when it's scrolled out; **also** mutates the matching ring entry/entries in place (`entry.deleted = true`) so replayed rows arrive pre-struck, plus a transient live-only `mark` SSE event for already-rendered rows. Twitch matches by `twId` (`[data-twid]`); YouTube matches by `ytId` for a single message or `authorId` for all of one author's rows (`[data-ytid]` / `[data-ytauthor]`, `CSS.escape`d). **Twitch's row is suppressed when `esModerateHealthy` is true** (same rule as `timeout`/`ban` above — `channel.moderate`'s `delete` action owns the attributed row instead); the strike-mark always happens either way. YouTube is unaffected — no YouTube EventSub equivalent exists, see §3a. |
+| `timeout` | `applyClearchat` — Twitch `CLEARCHAT` with a `ban-duration` tag | Gray row `"timeout: <login>, <N>s"` + same in-place `deleted` marking, matched by `login` (never display name — mod-action tags don't carry it). **Suppressed when `esModerateHealthy` is true** — `channel.moderate` (§3a) owns the attributed row instead; the strike-mark still always happens. |
+| `ban` | `applyClearchat` — `CLEARCHAT` without `ban-duration` | Gray row `"ban: <login>"` + same marking by `login`. Suppressed under the same `esModerateHealthy` rule as `timeout` above. |
+| `clear` | Bare `CLEARCHAT` (no trailing target — the "Clear Chat" button) | Gray row `"chat cleared"` **only** — never wipes the feed, never marks any row. **Never suppressed** — `channel.moderate` has no `clear`-equivalent action, so IRC keeps sole ownership regardless of `esModerateHealthy`. |
+| `modact` | Twitch EventSub `channel.moderate` v2 (§3a) — owns 11 of its ~30 possible `action` values | Standard gray info row, `"<mod> <verb> <user>[ (<dur>)][ (shared chat: <source>)]"` — e.g. `"quotrok timed out baduser (10m)"`. Renders **only** while `esModerateHealthy` is true; IRC's own `timeout`/`ban`/`deleted` rows above are this feature's fallback, not a second copy. |
 | `roomstate` | Non-first `ROOMSTATE` delta (`parseRoomstate`) — slow/subs-only/emote-only/followers-only/r9k | One gray row per changed setting's human-readable text. The **first** `ROOMSTATE` after each (re)connect is Twitch's full-state burst and is swallowed (`roomStateInit` flag, reset on every WS open) — never rendered. |
 | `redeem` | Twitch EventSub `channel.channel_points_custom_reward_redemption.add` (§3a) | **Distinct teal row** (`.msg.redeem`, `#1fd1b5`) — `"<user> redeemed <rewardTitle>: <userInput>"` (input omitted when empty, e.g. button-only rewards). `rewardTitle`/`userInput` are ellipsized (64/200 chars) *before* they ever reach `pushMessage`/the ring — viewer-controlled EventSub text is never stored uncapped. Silent by design: `emitCategory` only treats `kind` or `sys:'raid'` as non-silent, so redemptions never buzz or speak. |
 | `hype` | Twitch EventSub `channel.hype_train.begin`/`.progress`/`.end` (§3a) | Standard gray info row. `begin` and `end` always render; `progress` renders **only on a level-up** (DO tracks `hypeLevel`, reset on `end`) — every individual contribution otherwise fires `.progress`, which would flood the feed at exactly its busiest moments. The underlying bits/subs still render as their own gold IRC rows — nothing financial is lost by the suppression. |
 | `ad` | Twitch EventSub `channel.ad_break.begin` (§3a) | Standard gray info row, `"Ad break — <duration>s"` (+ `" (auto)"` suffix when Twitch-initiated rather than manual). |
+| `viewermilestone` | Twitch `USERNOTICE msg-id=viewermilestone` (`parseUsernotice`) — watch-streak notices | Standard gray info row, `system-msg` verbatim (e.g. `"<user> watched <N> consecutive streams and sparked a watch streak!"`). Rendered unconditionally off `msg-id`, not filtered on `msg-param-category`. Silent — not `sys:'raid'`, so `emitCategory` treats it as `'silent'`. |
+| `modechange` | YouTube `liveChatModeChangeMessageRenderer` (patched parser → `{type:'mod', action:'mode_change'}` POST → `applyYtModeChange`) — ROOMSTATE parity for slow/sub-only/emote-only toggles | Standard gray info row, renderer's own `text.runs` verbatim, ellipsized to 200 chars server-side. |
 
 ### 2c. Other per-message flags (not a `kind`, not a `sys`)
 
 | Flag | Source | Render treatment |
 |---|---|---|
 | `firstMsg` | Twitch `first-msg=1` tag | `✦` glyph prefix on an otherwise-normal row |
-| `isMod` | Twitch `mod=1` tag or `broadcaster` badge | Blue username (`.user.mod`) — highest color precedence, above paid/member |
-| `isMember` | Twitch `subscriber=1` tag or `founder` badge; YT `item.isMembership` (badge-only signal, **not** a membership-money event — see the `member_*` kinds above for those) | Green username (`.user.member`), lowest color precedence |
+| `isMod` | Twitch `mod=1` tag or `broadcaster` badge; YT `item.isModerator`/`item.isOwner` | Blue username (`--role-mod`, `.user.mod`) — highest color precedence, wins even inside a gold financial row |
+| `isMember` | Twitch `subscriber=1` tag **only** (a `founder` or `vip` badge alone grants no color); YT `item.isMembership` (badge-only signal, **not** a membership-money event — see the `member_*` kinds above for those) | Green username (`--role-member`, `.user.member`) — below a financial `kind`'s gold, above default |
+
+Role color precedence (`roleClass()`, shared by both platforms): `isMod` > financial `kind` (gold) > `isMember` > default text color. Twitch's per-user `tags.color` is parsed nowhere and never applied — role color only, everyone else (including VIPs and founders with no independent subscription) renders in the page's default text color.
 | `emotes` | Twitch `emotes` tag (`parseEmotes`) — entries `{id,start,end}`. YouTube custom emojis (poller `normalize.mjs`, worker `sanitizeYtEmotes`) — entries `{url,alt,start,end}` | Shared `renderText()` walker, one array, two entry shapes: Twitch derives the CDN URL from `id` (`EMOTE_ID_RE`-anchored before touching `img.src`); YouTube uses `url` directly (worker-side host-allowlisted at ingest, client re-checks as defense in depth — see §3). Both: inline `<img class="emote">` at text height, `onerror` falls back to the original text/shortcode. **`start`/`end` are Unicode code-point offsets (`[...str]` semantics), end inclusive, on both the Twitch and YouTube paths** — the poller computes YT offsets the same way the client walks them, verified by a multibyte fixture (astral + CJK + ZWJ-sequence emoji before a custom emoji). Standard unicode emoji never get an entry — they're plain text. |
 | `recovered` | Gap-recovery paths (both platforms, §4) | `.msg.recovered { opacity: .55 }`. **No longer TTS-suppressed by the `recovered` flag** (2026.07.20.3): a financial row that landed during a connection blip and is replayed as `recovered` now buzzes/speaks **once** via the `isEmittable` id-set gate, because it carries a fresh monotonic id above the floor. Re-replays and already-heard ids are deduped by `spokenIds`; rows older than `EMIT_TTL_MS` (30 min) never fire. |
 | *(uncaptured, unclassified)* | Any Twitch IRC line the parser doesn't recognize and isn't known connection/membership scaffolding (`isProtocolNoise`) | Never rendered — written to R2 capture (§4) as untrusted data, never dropped silently |
@@ -322,9 +327,11 @@ failed delete (logged `ev:'eventsub_delete_failed'`) would leave Twitch with
 two enabled subscriptions of the same type, double-delivering every event; a
 failed delete instead leaves that slot unhealthy for the next hourly retry.
 A 409 on create is treated as benign (already exists, e.g. a race with a
-prior ensure) and never fails the routine. All five subscribed types use
-scopes the broadcaster already consented to, so every subscription costs
-**0** against the account's EventSub subscription limit.
+prior ensure) and never fails the routine. Six of the seven subscribed types
+use scopes the broadcaster already consented to, so those cost **0** against
+the account's EventSub subscription limit; the seventh, `channel.moderate`,
+needs its own separate 8-scope re-consent before it can ever go healthy —
+see below.
 
 **Chronic 403, root-caused and fixed 2026-07-28.** The "already consented"
 claim above was false from 2026-07-22 through 2026-07-27: only
@@ -355,10 +362,75 @@ count populated live in the same session. If 403s resurface, suspect a
 revoked/expired consent chain (re-run this flow) before suspecting a code
 regression.
 
-**Subscribed set** (`buildDesiredSubs`, `condition: {broadcaster_user_id}`
-for all): `channel.channel_points_custom_reward_redemption.add` v1,
+**`channel.bits.use` — Bits-funded power-up gold rows (2026-08-01).** Twitch's
+chat "Power-ups" (Gigantify an Emote, Message Effect, On-Screen Celebration)
+and broadcaster-defined Custom Power-ups (still Twitch BETA) don't set any
+documented IRC tag carrying a price — `channel.bits.use` v1, Twitch's
+all-purpose "any Bits use" event, is the only documented way to get gold-row
+treatment (a real bits amount) for any of them. Full investigation trail:
+`GIGANTIFY_INVESTIGATION_2026-08-01.md` in the worker root. The event's
+`type` field is `cheer` | `power_up` | `custom_power_up`; only `cheer` is
+dropped before mapping — IRC's own `bits` tag already owns cheer rows, and
+this event would otherwise double-render every one. `power_up` (all 3
+built-in variants) and `custom_power_up` both get identical gold treatment,
+since both cost real bits. Render mapping (`mapEventToRow`): a single new
+`kind: 'power_up'` (`VALID_KINDS`/`TTS_LABELS`, `src/lib.js`) covers all 4
+variants. The row carries `powerUpType`/`powerUpLabel` as server-side-only
+fields (consumed by `mapEventToRow` and its tests) — `pushMessage`'s field
+allowlist does not forward either to the client, so a viewer only ever sees
+the rendered `text` field, set to the label (`event.custom_power_up.title`
+for custom power-ups, ellipsized via the same `ellipsize()`/
+`REWARD_TITLE_MAX` helper the channel-points redemption case already uses).
+Both branches fail closed: an unrecognized `power_up.type` (a future Twitch
+addition) or a missing/malformed `custom_power_up.title` drop the row
+entirely rather than render a guessed/generic label — each drop logs a
+`{ev: 'bits_use_unmapped', branch, type}` line so a real bits spend never
+vanishes without a trace.
+
+**No IRC/EventSub correlation exists.** Verified against Twitch's full
+`channel.bits.use` event field reference
+(`https://dev.twitch.tv/docs/eventsub/eventsub-reference/#channel-bits-use-event`)
+— there's no `id`/`message_id` field of any kind, nothing correlatable to an
+IRC PRIVMSG's own `id` tag. **Accepted consequence:** if a viewer types a
+message alongside a Gigantify/Message-Effect/Custom-Power-up use, IRC still
+delivers that text as its own ordinary, non-gold PRIVMSG (IRC carries zero
+power-up/bits signal on that line at all), and `channel.bits.use` separately
+delivers a second, gold row summarizing the bits spent — two rows for one
+real-world action, with no way to suppress or merge them. This mirrors the
+existing precedent where a channel-points redemption's optional `user_input`
+already renders as its own distinct `sys: 'redeem'` row — not a new pattern,
+not a bug. On-Screen Celebration is exempt from this double-row
+consideration — it never posts to IRC at all, so it produces only the one
+gold row. Flip side of the same gap: `mapEventToRow` unconditionally drops
+`type: 'cheer'` (IRC's own `bits` tag is assumed to own cheer rows), so if
+the Twitch IRC connection is down when a cheer arrives, the EventSub
+`channel.bits.use` cheer event is dropped too and the cheer never renders.
+Known, accepted — same no-persistence posture as the rest of this Worker.
+
+**Scope 403 diagnosis.** `createEventSubSubscription` failures for
+`channel.bits.use` specifically get a `diagnosis` field
+(`'scope_not_granted'` / `'not_a_scope_issue'` / `'scope_check_unavailable'`),
+computed by cross-referencing the one-time-per-DO-lifetime
+`eventsub_scope_check` result against whether `bits:read` was present —
+gated to 403 responses only (a 400/401/404/500 gets no diagnosis, since
+those aren't scope-related). This exists specifically to avoid repeating the
+Chronic 403 incident's multi-day unexplained-403 pattern above, for this
+newest scope. **Known staleness caveat**: the scope check runs once per DO
+lifetime and is never refreshed — a `not_a_scope_issue` diagnosis reflects
+the grant as of that one check, not a live guarantee, if the grant is
+revoked mid-lifetime.
+
+**Merge-order invariant.** Per the CLAUDE.md "Standing invariants" bullet on
+EventSub scope additions, the broadcaster's single-URL 5-scope re-consent
+must complete and be verified live before this feature's branch merges — else
+this repeats the exact 2026-07-22→2026-07-28 chronic-403 pattern documented
+above, just for `bits:read` instead of the original 3 scopes.
+
+**Subscribed set** (`buildDesiredSubs`): `channel.channel_points_custom_reward_redemption.add` v1,
 `channel.hype_train.begin`/`.progress`/`.end` **v2**, `channel.ad_break.begin`
-v1. Hype Train was originally pinned to v1 — the fields actually read
+v1, `channel.bits.use` **v1** — all with `condition: {broadcaster_user_id}`.
+`channel.moderate` **v2** is the one exception, needing its own two-field
+`condition: {broadcaster_user_id, moderator_user_id}` — see below. Hype Train was originally pinned to v1 — the fields actually read
 (`level`/`total`/`progress`/`goal`) are identical between versions, and v1 is
 what the installed `twitch-cli` 1.1.25 can mock (`event trigger ... -v 2`
 errors "Invalid version given. Valid version(s): 1"). Moved to **v2** on
@@ -376,11 +448,111 @@ on EventSub subscription health. `channel.raid` is deliberately **not**
 subscribed — adding it would either double-render every raid or require
 suppressing the proven IRC path in favor of one with a dead-sub failure mode.
 
-**`channel.moderate` (out of scope, optional future add).** Mirroring
-IRC-visible mod actions via EventSub would require a large additional scope
-grant (`channel:moderate` plus per-action scopes) and fresh broadcaster
-consent beyond the four scopes already granted for this phase. Deliberately
-excluded; revisit only as an explicit, separately-scoped follow-up.
+**`channel.moderate` v2 — moderator attribution (2026-08-05).** IRC's
+`CLEARCHAT`/`CLEARMSG` never carry an actor — the `timeout`/`ban`/`deleted`
+rows above can only ever name the *target*. `channel.moderate` v2 does carry
+the acting moderator (`event.moderator_user_name`), so this feature adds it
+as an eighth-condition-field desired sub and renders an attributed row
+instead, wherever it's healthy.
+
+*Condition & the moderator_user_id citation.* Unlike every other desired sub
+(`condition: {broadcaster_user_id}` only), `channel.moderate` needs
+`{broadcaster_user_id, moderator_user_id}` — set to the broadcaster's own id
+for both. **`moderator_user_id` is an authorization identity, not an actor
+filter** — Twitch's own docs example ("Payload Example - Adding a Moderator")
+subscribes with condition `{broadcaster_user_id: "1337"}` (no
+`moderator_user_id` at all) yet delivers an event whose `moderator_user_id`/
+`moderator_user_login` (`"424596340"/"quotrok"`) is a different party than
+the user acted on — proof the subscription isn't scoped to one moderator's
+actions. This matches the documented pattern for sibling condition-having
+types (`automod.message.hold`, `channel.unban_request.resolve`): "the ID in
+the `moderator_user_id` condition parameter must match the user ID in the
+access token" — i.e. it identifies whose grant authorizes the subscription,
+not which moderator's actions get delivered. Because this is inferred from a
+same-vendor sibling pattern rather than stated verbatim for `channel.moderate`
+itself, it needs one live check post-consent: have a moderator **other than**
+the broadcaster take an action and confirm the subscription still delivers
+it, before leaning on "every moderator's actions are covered" as fact.
+
+*Scopes — 8 new, on top of the existing 5.* v2's authorization is 8 OR-groups
+(read variant chosen — least privilege for a display feature; 6 of the 8 also
+accept a `manage:` alternative, the other 2 — `moderators`/`vips` — have no
+manage alternative at all):
+`moderator:read:blocked_terms`, `moderator:read:chat_settings`,
+`moderator:read:unban_requests`, `moderator:read:banned_users`,
+`moderator:read:chat_messages`, `moderator:read:warnings`,
+`moderator:read:moderators`, `moderator:read:vips`. v2 does **not** need the
+old v1 `channel:moderate` scope. Checked by `logEventSubScopeCheck`'s
+`hasAllModerateScopes` (`MODERATE_SCOPE_GROUPS`, `src/worker.js`) — same
+one-time-per-DO-lifetime diagnostic as `hasBitsRead`/`hasAllEventSubScopes`,
+extended rather than duplicated.
+
+*Merge-order invariant — 13-scope union, single re-consent.* Per CLAUDE.md's
+"Standing invariants" bullet: the broadcaster's one OAuth authorization must
+request all 13 scopes at once (the existing 5 — `moderator:read:followers`,
+`channel:read:redemptions`, `channel:read:hype_train`, `channel:read:ads`,
+`bits:read` — plus these 8) before this feature's branch merges, verified
+live via CF Observability (`hasBitsRead && hasAllEventSubScopes &&
+hasAllModerateScopes`, never `wrangler tail`) — never an incremental
+per-scope consent, which would silently regress the others onto a narrower
+token. Same failure class as the 2026-07-28 chronic-403 incident above, just
+for a ninth scope group instead of the original three.
+
+*Render mapping (`mapEventToRow`, `case 'channel.moderate'`).* 11 of the
+~30 possible `action` values render (rest return `null` silently — frequent/
+expected settings toggles, VIP/mod grants, raids, etc, never logged): the
+core 6 — `timeout`/`ban`/`unban`/`untimeout`/`delete`/`warn` — plus the 5
+`shared_chat_*` variants (un-deferred, not a follow-up: once
+`applyClearchat`/`applyClearmsg` suppress their own row for an action
+`channel.moderate` owns, IRC has no shared-chat-aware fallback row at all —
+rendering these directly avoids making shared-chat moderation strictly worse
+than before this feature). `<dur>` (`formatDuration`) **rounds** to the
+nearest unit (`598s → "10m"`, never floored to `"9m"`). An **owned** action
+with a missing/malformed expected field (schema drift — should never happen
+per the documented payload shapes) logs `{ev: 'modact_unmapped', action,
+reason: 'missing_fields'}` before returning `null`, mirroring
+`bits_use_unmapped`'s fail-closed-and-loud precedent above.
+
+*Ownership / dedupe — one action, one row, decided by health not timing.*
+`applyClearchat`/`applyClearmsg` always strike-mark (`markDeleted`) regardless
+of `channel.moderate`'s health — IRC is fast and works even if EventSub lags
+or drops. Only the *attributed gray row* is gated: suppressed when
+`this.esModerateHealthy` is true (channel.moderate renders it instead via the
+normal EventSub notification path), pushed as today's target-only row when
+false. This sidesteps EventSub-vs-IRC arrival-ordering entirely — ownership
+is decided by subscription health, a piece of DO/config state, never by which
+of the two deliveries happens to arrive first. Bare `CLEARCHAT` (`sys:'clear'`,
+full-clear button) is never gated — `channel.moderate` has no equivalent
+action, so IRC keeps permanent, unconditional ownership there.
+
+*`esModerateHealthy` — persisted, not just in-memory.* Tracked and persisted
+(`ctx.storage` key `esModerateHealthy`) at the end of every
+`ensureEventSubSubscriptions` reconcile pass, mirrored into the in-memory
+field read by `applyClearchat`/`applyClearmsg`. Hydrated in the constructor
+via `ctx.blockConcurrencyWhile` (blocks `fetch()` until the read resolves) —
+without this, a DO cold start (eviction between streams, a redeploy) would
+default the flag to `false` in-memory while the real Twitch-side subscription
+is still genuinely enabled from before, double-rendering every moderation
+action until the next reconcile happened to run. Default `false` applies
+**only** when no value has ever been persisted (first boot / pre-feature
+DOs); once any reconcile runs, the persisted value always wins.
+**Accepted mirror window:** the flag can still read stale-`true` for one
+window — the sub is revoked/deleted server-side but no reconcile has run
+since (DO evicted right after the last persist, or a fail-closed
+`listEventSubSubscriptions` throw left the value unchanged). During that
+window: **zero** moderation rows (IRC believes EventSub owns it and stays
+suppressed; EventSub delivers nothing because the sub is actually dead) until
+the next client attach triggers a reconcile, which observes the dead/missing
+slot and flips the flag back. Bound: at most one attach-to-attach gap — the
+same structural exposure `esAllHealthy` already has today, undocumented; this
+plan is more conservative only in writing the bound down. Silent-zero-rows
+is the deliberately safer failure direction versus silent-double-rows, which
+is why the flag defaults conservatively and why this window is accepted
+rather than engineered away.
+
+*YouTube stays out of scope* — the anonymous YT feed carries no actor field
+(`CAPTURE_AUDIT_2026-08-05.md`), and existing YT deletion handling is already
+classified; this is a Twitch-only feature end to end.
 
 **No rate limit on `/eventsub/callback` (accepted).** It's the only public
 unauthenticated route, but a forged/spam request is 403'd cheaply — body-size
@@ -489,6 +661,15 @@ retries rather than an attacker. Accepted as-is rather than adding a
     `pushMessage` call (see §2a's `kind` table for the set). **Never the
     message body** — same privacy rule as capture. This is what makes
     donations enumerable in Workers Observability going forward.
+  - `tts_name_sep_candidate {name}` — fires alongside `financial`, only when
+    the TTS-cleaned name (`cleanSpokenName`, Step1 only — trailing digits,
+    absorbing one preceding `_`/`-`) still contains a separator. The
+    speaks-what-buzzes invariant is intentionally relaxed for name suffixes:
+    the spoken name may differ from the displayed one (`msg.user` itself is
+    never touched). Exists solely to accumulate real separator-name cases for
+    evaluating Step2 (a full trailing separator-segment strip, e.g.
+    `darc-ttv` -> `darc`), which stays deferred/unimplemented — see
+    `TTS_NAME_CLEANUP_DRYRUN_2026-08-05.md`.
   - Cross-referencing `tw_close`/`tw_open` against `sse_close`/`sse_open` by
     timestamp resolves "Twitch disconnects often" reports: IRC staying up
     while SSE drops points at the viewer's phone/LTE; both dropping together
@@ -849,7 +1030,14 @@ All client behavior lives in the inline `<script>` inside `PAGE_HTML`
   now capped at 30min regardless of how long the underlying connection
   otherwise stays healthy. Accepted tradeoff: these logs are forensic (query
   after the fact), not a live stream — don't build anything that assumes
-  near-real-time delivery on them.
+  near-real-time delivery on them. Relatedly, the `query_worker_observability`
+  MCP tool's `events`/`invocations` views zod-throw on DO-internal rows where
+  `$workers.outcome` is null — an intermittent Cloudflare telemetry gap on
+  `ChatHub` invocations, not deterministic by route (confirmed 2026-08-02: same
+  route shows both populated and null `outcome`). Use the `calculations` view
+  with a `groupBy $workers.entrypoint` and an `is_null` filter on
+  `$workers.outcome` instead — it doesn't validate that field and returns
+  accurate counts either way.
 - **Twitch socket was cycling every ~2-3min off-stream (root-caused
   2026-07-21, fixed same day).** 30/30 `tw_close` events in a 76min
   Observability window were code `1006` ("WebSocket disconnected without
@@ -868,3 +1056,22 @@ All client behavior lives in the inline `<script>` inside `PAGE_HTML`
   `stopIrcKeepalive()`) — never runs while disconnected. Post-deploy
   verification: `tw_close` over a 60min window should collapse from ~30/76min
   toward zero, zero `silence-close`, alarm still mostly `noop`.
+- **`tw_user_token_refresh_failed` can permanently strand a DO's EventSub
+  scope check.** `getTwitchUserToken()` (§1 "Live counts" refresh chain)
+  logs `{ev: 'tw_user_token_refresh_failed', source}` when the stored
+  refresh token, and then the seed, both fail — most often a transient
+  window where `TWITCH_CLIENT_SECRET` was just rotated but a refresh call
+  raced the old value. Observed 2026-08-01: 6 hits (3 `storage_chain` + 3
+  `all`) clustered tightly around two same-day `wrangler secret put` events,
+  zero hits before or after — self-healed once the correct secret value was
+  in place. The interaction worth knowing: `logEventSubScopeCheck` (§3a)
+  sets `esScopeChecked = true` *before* attempting the token fetch and never
+  retries for that DO's lifetime, so any DO instance whose first
+  `ensureEventSubSubscriptions` call happens to land during one of these
+  failure windows gets a permanent `no_user_token` scope-check result (and
+  `scope_check_unavailable` diagnosis on any later `channel.bits.use` 403)
+  for its entire lifetime — not refreshed until the DO itself is evicted and
+  recreated. Didn't cause a visible problem in the observed incident only
+  because zero subscription creates happened to 403 during the affected
+  DOs' lifetimes. See `POST_STREAM_AUDIT_2026-08-01.md` for the full
+  incident writeup.

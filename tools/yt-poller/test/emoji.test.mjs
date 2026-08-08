@@ -4,29 +4,12 @@
 // emoji must stay text-only; a plain message must be byte-identical to
 // pre-emoji-support behavior (regression guard).
 import { describe, it, expect } from 'vitest';
-import { parseChatData } from 'youtube-chat/dist/parser.js';
 import { normalizeChatItem } from '../normalize.mjs';
+import { parseOne } from './helpers/envelope.mjs';
 
 import customEmojiMessage from './fixtures/custom-emoji-message.json';
 import standardEmojiMessage from './fixtures/standard-emoji-message.json';
 import multibyteCustomEmojiMessage from './fixtures/multibyte-custom-emoji-message.json';
-
-function chatDataWith(...items) {
-  return {
-    continuationContents: {
-      liveChatContinuation: {
-        actions: items.map((item) => ({ addChatItemAction: { item, clientId: 'x' } })),
-        continuations: [{ invalidationContinuationData: { continuation: 'next-token' } }],
-      },
-    },
-  };
-}
-
-function parseOne(fixture) {
-  const [chatItems] = parseChatData(chatDataWith(fixture));
-  expect(chatItems).toHaveLength(1);
-  return chatItems[0];
-}
 
 describe('normalizeChatItem: custom emoji -> emotes', () => {
   it('a custom emoji mid-message produces a code-point-offset emotes entry', () => {

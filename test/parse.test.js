@@ -1,4 +1,5 @@
 import { describe, it, expect, vi } from 'vitest';
+import { logEvents } from './helpers/logEvents.js';
 import {
   parseIrcTags,
   parsePrivmsg,
@@ -13,6 +14,7 @@ import {
   filterRecoveredMessages,
   addToBoundedSet,
   addToBoundedMap,
+  roleClass,
 } from '../src/worker.js';
 
 describe('parseIrcTags', () => {
@@ -51,16 +53,16 @@ describe('parseIrcTags', () => {
 });
 
 describe('parsePrivmsg', () => {
-  it('parses a tagged PRIVMSG line', () => {
+  it('parses a tagged PRIVMSG line, ignoring the viewer-chosen color tag', () => {
     const line = '@badge-info=;badges=;color=#1E90FF;display-name=CoolViewer;emotes= :coolviewer!coolviewer@coolviewer.tmi.twitch.tv PRIVMSG #somechannel :hello chat!';
     const parsed = parsePrivmsg(line);
-    expect(parsed).toEqual({ user: 'CoolViewer', login: 'coolviewer', color: '#1E90FF', text: 'hello chat!' });
+    expect(parsed).toEqual({ user: 'CoolViewer', login: 'coolviewer', text: 'hello chat!' });
   });
 
   it('falls back to nick when display-name tag is absent', () => {
     const line = ':plainnick!plainnick@plainnick.tmi.twitch.tv PRIVMSG #somechannel :no tags here';
     const parsed = parsePrivmsg(line);
-    expect(parsed).toEqual({ user: 'plainnick', login: 'plainnick', color: undefined, text: 'no tags here' });
+    expect(parsed).toEqual({ user: 'plainnick', login: 'plainnick', text: 'no tags here' });
   });
 
   it('preserves unicode and emote text', () => {
@@ -69,14 +71,11 @@ describe('parsePrivmsg', () => {
     expect(parsed.text).toBe('Kappa 🎉 héllo');
   });
 
-  it('returns null for PING lines', () => {
-    expect(parsePrivmsg('PING :tmi.twitch.tv')).toBeNull();
-  });
-
-  it('returns null for malformed lines', () => {
+  it('returns null for malformed or non-PRIVMSG lines', () => {
     expect(parsePrivmsg('not an irc line')).toBeNull();
     expect(parsePrivmsg(':foo!foo@foo.tmi.twitch.tv JOIN #chan')).toBeNull();
     expect(parsePrivmsg('@display-name=Foo')).toBeNull();
+    expect(parsePrivmsg('PING :tmi.twitch.tv')).toBeNull();
   });
 
   it('marks a cheer via the bits tag', () => {
@@ -85,18 +84,10 @@ describe('parsePrivmsg', () => {
     expect(parsed).toEqual({
       user: 'Cheerer',
       login: 'cheerer',
-      color: undefined,
       text: 'Cheer500 nice stream!',
       kind: 'cheer',
       amount: '500 bits',
     });
-  });
-
-  it('has no kind/amount for a plain message', () => {
-    const line = ':plainnick!plainnick@plainnick.tmi.twitch.tv PRIVMSG #chan :hi';
-    const parsed = parsePrivmsg(line);
-    expect(parsed.kind).toBeUndefined();
-    expect(parsed.amount).toBeUndefined();
   });
 
   it('marks isMod via the mod tag', () => {
@@ -114,14 +105,25 @@ describe('parsePrivmsg', () => {
     expect(parsePrivmsg(line).isMember).toBe(true);
   });
 
-  it('marks isMember via a founder badge even when subscriber=0', () => {
+  it('does NOT mark isMember via a founder badge alone — founders get default color unless independently subscribed', () => {
     const line = '@subscriber=0;badges=founder/0;display-name=Founder :founder!founder@founder.tmi.twitch.tv PRIVMSG #chan :hi';
-    expect(parsePrivmsg(line).isMember).toBe(true);
+    expect(parsePrivmsg(line).isMember).toBeUndefined();
   });
 
-  it('has no isMod/isMember for a plain viewer', () => {
+  it('does NOT mark isMod or isMember via a VIP badge alone', () => {
+    const line = '@mod=0;subscriber=0;badges=vip/1;display-name=VeryImportant :vip!vip@vip.tmi.twitch.tv PRIVMSG #chan :hi';
+    const parsed = parsePrivmsg(line);
+    expect(parsed.isMod).toBeUndefined();
+    expect(parsed.isMember).toBeUndefined();
+  });
+
+  // Absorbs the former separate "has no kind/amount for a plain message" —
+  // same literal line, same shape, one assertion set.
+  it('a plain viewer message carries no optional fields', () => {
     const line = ':plainnick!plainnick@plainnick.tmi.twitch.tv PRIVMSG #chan :hi';
     const parsed = parsePrivmsg(line);
+    expect(parsed.kind).toBeUndefined();
+    expect(parsed.amount).toBeUndefined();
     expect(parsed.isMod).toBeUndefined();
     expect(parsed.isMember).toBeUndefined();
   });
@@ -198,13 +200,12 @@ describe('parseEmotes', () => {
 });
 
 describe('parseUsernotice', () => {
-  it('parses a resub with a trailing user message', () => {
+  it('parses a resub with a trailing user message, ignoring the viewer-chosen color tag', () => {
     const line = '@badge-info=;badges=staff/1;color=#008000;display-name=ronni;login=ronni;msg-id=resub;system-msg=ronni\\shas\\ssubscribed\\sfor\\s6\\smonths! :tmi.twitch.tv USERNOTICE #dallas :Great stream -- keep it up!';
     const parsed = parseUsernotice(line);
     expect(parsed).toEqual({
       user: 'ronni',
       login: 'ronni',
-      color: '#008000',
       kind: 'sub',
       text: 'ronni has subscribed for 6 months! — Great stream -- keep it up!',
     });
@@ -213,13 +214,35 @@ describe('parseUsernotice', () => {
   it('parses a plain sub with no trailing message', () => {
     const line = '@display-name=ronni;login=ronni;msg-id=sub;system-msg=ronni\\ssubscribed! :tmi.twitch.tv USERNOTICE #dallas';
     const parsed = parseUsernotice(line);
-    expect(parsed).toEqual({ user: 'ronni', login: 'ronni', color: undefined, kind: 'sub', text: 'ronni subscribed!' });
+    expect(parsed).toEqual({ user: 'ronni', login: 'ronni', kind: 'sub', text: 'ronni subscribed!' });
   });
 
   it('maps gift-sub msg-ids to giftsub', () => {
     for (const msgId of ['subgift', 'submysterygift', 'giftpaidupgrade', 'anongiftpaidupgrade']) {
       const line = `@display-name=TWW2;login=tww2;msg-id=${msgId};system-msg=TWW2\\sgifted\\sa\\ssub! :tmi.twitch.tv USERNOTICE #dallas`;
       expect(parseUsernotice(line)?.kind).toBe('giftsub');
+    }
+  });
+
+  it('submysterygift prefers the msg-param-mass-gift-count tag over system-msg text', () => {
+    const line = '@display-name=TWW2;login=tww2;msg-id=submysterygift;msg-param-mass-gift-count=5;system-msg=TWW2\\sis\\sgifting\\s5\\sSubs\\sto\\sTWW2\'s\\scommunity! :tmi.twitch.tv USERNOTICE #dallas';
+    expect(parseUsernotice(line)?.amount).toBe('5 gifts');
+  });
+
+  it('submysterygift falls back to a comma-aware system-msg regex when the tag is absent — a naive /\\d+/ would truncate "1,000" to "1"', () => {
+    const line = "@display-name=TWW2;login=tww2;msg-id=submysterygift;system-msg=TWW2\\sis\\sgifting\\s1,000\\sSubs\\sto\\sTWW2's\\scommunity! :tmi.twitch.tv USERNOTICE #dallas";
+    expect(parseUsernotice(line)?.amount).toBe('1000 gifts');
+  });
+
+  it('submysterygift singular gift count reads "1 gift", not "1 gifts"', () => {
+    const line = '@display-name=TWW2;login=tww2;msg-id=submysterygift;msg-param-mass-gift-count=1;system-msg=TWW2\\sis\\sgifting\\sa\\sSub\\sto\\sTWW2\'s\\scommunity! :tmi.twitch.tv USERNOTICE #dallas';
+    expect(parseUsernotice(line)?.amount).toBe('1 gift');
+  });
+
+  it('subgift/giftpaidupgrade/anongiftpaidupgrade carry no amount — count only applies to submysterygift', () => {
+    for (const msgId of ['subgift', 'giftpaidupgrade', 'anongiftpaidupgrade']) {
+      const line = `@display-name=TWW2;login=tww2;msg-id=${msgId};system-msg=TWW2\\sgifted\\sa\\ssub! :tmi.twitch.tv USERNOTICE #dallas`;
+      expect(parseUsernotice(line)?.amount).toBeUndefined();
     }
   });
 
@@ -264,6 +287,93 @@ describe('parseUsernotice', () => {
     const parsed = parseUsernotice(line);
     expect(parsed.isMod).toBe(true);
     expect(parsed.isMember).toBe(true);
+  });
+
+  // Watch-streak notice (PR #38's 2026-08-08 streak coverage audit, §2): sample
+  // payload confirms msg-param-category is always watch-streak, but this is
+  // rendered unconditionally off msg-id alone — category isn't consulted.
+  it('parses viewermilestone as a sys row, not a gold kind', () => {
+    const line = '@display-name=airbrake88;login=airbrake88;msg-id=viewermilestone;msg-param-category=watch-streak;msg-param-value=100;system-msg=airbrake88\\swatched\\s100\\sconsecutive\\sstreams\\sand\\ssparked\\sa\\swatch\\sstreak! :tmi.twitch.tv USERNOTICE #dallas';
+    const parsed = parseUsernotice(line);
+    expect(parsed).toEqual({
+      user: 'airbrake88',
+      login: 'airbrake88',
+      sys: 'viewermilestone',
+      text: 'airbrake88 watched 100 consecutive streams and sparked a watch streak!',
+    });
+    expect(parsed.kind).toBeUndefined();
+  });
+
+  // Resub streak-months (PR #38's 2026-08-08 streak coverage audit, §3): read
+  // msg-param-cumulative-months / msg-param-streak-months directly instead of
+  // relying on Twitch's system-msg wording. Gold kind/TTS/ledger unaffected —
+  // display text only.
+  describe('resub streak-months', () => {
+    const base = '@display-name=ronni;login=ronni;msg-id=resub;system-msg=ronni\\sresubbed!';
+    const line = (tags) => `${base};${tags} :tmi.twitch.tv USERNOTICE #dallas`;
+
+    it('both cumulative and streak present appends both', () => {
+      const parsed = parseUsernotice(line('msg-param-cumulative-months=12;msg-param-streak-months=5'));
+      expect(parsed.text).toBe('ronni resubbed! (12 months, 5-month streak)');
+      expect(parsed.kind).toBe('sub');
+    });
+
+    it('streak-months absent (share-streak off) appends cumulative only', () => {
+      const parsed = parseUsernotice(line('msg-param-cumulative-months=12'));
+      expect(parsed.text).toBe('ronni resubbed! (12 months)');
+    });
+
+    it('streak-months=0 is treated the same as absent', () => {
+      const parsed = parseUsernotice(line('msg-param-cumulative-months=12;msg-param-streak-months=0'));
+      expect(parsed.text).toBe('ronni resubbed! (12 months)');
+    });
+
+    it('cumulative-months only, no streak tag at all', () => {
+      const parsed = parseUsernotice(line('msg-param-cumulative-months=3'));
+      expect(parsed.text).toBe('ronni resubbed! (3 months)');
+    });
+
+    it('garbage/non-numeric values fail open — unchanged from current behavior', () => {
+      const parsed = parseUsernotice(line('msg-param-cumulative-months=abc;msg-param-streak-months=xyz'));
+      expect(parsed.text).toBe('ronni resubbed!');
+    });
+
+    it('both tags absent fails open — unchanged from current behavior', () => {
+      const parsed = parseUsernotice(`${base} :tmi.twitch.tv USERNOTICE #dallas`);
+      expect(parsed.text).toBe('ronni resubbed!');
+    });
+
+    it('does not apply to a plain sub (no cumulative/streak concept on a first sub)', () => {
+      const subLine = '@display-name=ronni;login=ronni;msg-id=sub;msg-param-cumulative-months=12;system-msg=ronni\\ssubscribed! :tmi.twitch.tv USERNOTICE #dallas';
+      const parsed = parseUsernotice(subLine);
+      expect(parsed.text).toBe('ronni subscribed!');
+    });
+  });
+});
+
+// roleClass drives the client's username color class for both platforms —
+// mod (blue, includes broadcaster) > financial kind (gold) > paid member
+// (green) > default. Twitch's tags.color is never consulted here; a
+// role-classified user always wins over any personal color.
+describe('roleClass', () => {
+  it('mod wins over everything, including a simultaneous financial kind and member status', () => {
+    expect(roleClass({ isMod: true, isMember: true, kind: 'cheer' })).toBe('mod');
+  });
+
+  it('a financial kind wins over member status when not mod', () => {
+    expect(roleClass({ isMember: true, kind: 'sub' })).toBe('paid');
+  });
+
+  it('member status applies when there is no kind or mod', () => {
+    expect(roleClass({ isMember: true })).toBe('member');
+  });
+
+  it('a plain viewer with none of the above gets the default (empty) class', () => {
+    expect(roleClass({})).toBe('');
+  });
+
+  it('a YouTube moderator/owner (isMod from the poller) resolves the same as Twitch', () => {
+    expect(roleClass({ isMod: true })).toBe('mod');
   });
 });
 
@@ -469,12 +579,10 @@ describe('normalizeYt', () => {
     expect(result.amount).toBe('5 gifts');
   });
 
-  it('accepts yt_gift (paid Jewels/animated-gift, distinct from member_gift)', () => {
-    const result = normalizeYt({ user: 'Jaydengames017', text: 'sent Gold coin', kind: 'yt_gift' });
-    expect(result.kind).toBe('yt_gift');
-  });
-
-  it('yt_gift carries the gift name in amount', () => {
+  // Covers "accepts yt_gift at all" (paid Jewels/animated-gift, distinct from
+  // member_gift) as well as the amount passthrough — the kind assertion below
+  // is what the former standalone acceptance test asserted.
+  it('yt_gift is accepted and carries the gift name in amount', () => {
     const result = normalizeYt({
       user: 'Jaydengames017',
       text: 'sent Gold coin',
@@ -564,7 +672,12 @@ describe('normalizeYt', () => {
       });
       expect(result.emotes).toEqual([{ start: 3, end: 10, alt: ':_smile:' }]);
       expect(result.emotes[0].url).toBeUndefined();
-      expect(spy).toHaveBeenCalledWith(JSON.stringify({ ev: 'emoji_host_rejected', host: 'evil.example.com' }));
+      // Parse-then-match rather than comparing the serialized string: the old
+      // form pinned JSON key ORDER, so reordering {host, ev} failed with no
+      // behavior change. The emotes assertions above are the security coverage.
+      expect(logEvents(spy, 'emoji_host_rejected')).toContainEqual(
+        expect.objectContaining({ host: 'evil.example.com' }),
+      );
       spy.mockRestore();
     });
 

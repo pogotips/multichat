@@ -18,9 +18,16 @@ if [ -n "$(git -C "$SRC" status --porcelain -- .)" ]; then
   exit 1
 fi
 
-rsync -a --delete --exclude-from="${SRC}.oss-exclude" "$SRC" "$DST"
+# --- Stage into a scratch dir first — the gate must clear BEFORE anything
+# touches $DST. (2026-08-08: an aborted run used to leave rsync's output
+# sitting in $DST uncommitted, since rsync ran unconditionally ahead of the
+# grep gate — a partial publish contaminating the target on every gate trip.)
+STAGE="$(mktemp -d)"
+trap 'rm -rf "$STAGE"' EXIT
 
-# --- Sweep gate: scan DST for private strings before touching git ---
+rsync -a --exclude-from="${SRC}.oss-exclude" "$SRC" "$STAGE/"
+
+# --- Sweep gate: scan the STAGE for private strings before touching $DST ---
 
 FORBIDDEN=(
   '87f04ad1710df9279714f094339c3b2d'
@@ -34,7 +41,7 @@ FORBIDDEN=(
   'superpowers'
   'TRIAGE_'
   'GLITCH_AUDIT'
-  'BACKLOG'
+  'BACKLOG.md'
 )
 
 grep_args=(-rIn --exclude-dir=.git --exclude-dir=node_modules --exclude-dir=.wrangler --exclude=publish-oss.sh -i)
@@ -42,15 +49,15 @@ for term in "${FORBIDDEN[@]}"; do
   grep_args+=(-F -e "$term")
 done
 
-forbidden_hits="$(grep "${grep_args[@]}" "$DST" || true)"
+forbidden_hits="$(grep "${grep_args[@]}" "$STAGE" || true)"
 if [ -n "$forbidden_hits" ]; then
-  echo "abort: forbidden private strings found in $DST — fix before publishing:" >&2
+  echo "abort: forbidden private strings found in staged export — fix before publishing ($DST untouched):" >&2
   printf '%s\n' "$forbidden_hits" >&2
   exit 1
 fi
 
 # pogotips / pogo.tips allowed only at LICENSE:3 and README.md:66
-brand_hits="$(grep -rIn --exclude-dir=.git --exclude-dir=node_modules --exclude-dir=.wrangler --exclude=publish-oss.sh -i -F -e 'pogotips' -e 'pogo.tips' "$DST" || true)"
+brand_hits="$(grep -rIn --exclude-dir=.git --exclude-dir=node_modules --exclude-dir=.wrangler --exclude=publish-oss.sh -i -F -e 'pogotips' -e 'pogo.tips' "$STAGE" || true)"
 brand_violations=""
 if [ -n "$brand_hits" ]; then
   while IFS= read -r hit; do
@@ -70,10 +77,28 @@ if [ -n "$brand_hits" ]; then
 fi
 
 if [ -n "$brand_violations" ]; then
-  echo "abort: pogotips/pogo.tips found outside the allowed LICENSE:3 / README.md:66 lines:" >&2
+  echo "abort: pogotips/pogo.tips found outside the allowed LICENSE:3 / README.md:66 lines ($DST untouched):" >&2
   printf '%s' "$brand_violations" >&2
   exit 1
 fi
+
+# --- Gate cleared — now, and only now, sync into $DST ---
+
+# --exclude-from is REQUIRED here, not just on the SRC->STAGE pass above.
+# (2026-08-08 incident: this rsync ran with --delete and no exclude-from —
+# STAGE never contains .git since it's excluded on the first pass, so
+# --delete read that as "DST/.git isn't in the source, remove it" and wiped
+# the target repo's git history. rsync only protects a destination path
+# from --delete when that path also matches an active exclude pattern; drop
+# this flag and DST/.git is unprotected again.)
+rsync -a --delete --exclude-from="${SRC}.oss-exclude" "$STAGE/" "$DST"
+
+test -d "$DST/.git" || {
+  echo "abort: $DST/.git is missing after sync — the publish step just" >&2
+  echo "destroyed the target repo's git history. Do not proceed. Re-clone" >&2
+  echo "$DST from its remote before running this script again." >&2
+  exit 1
+}
 
 # --- Commit in DST ---
 

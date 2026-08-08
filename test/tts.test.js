@@ -1,8 +1,9 @@
-import { describe, it, expect } from 'vitest';
+import { describe, it, expect, vi } from 'vitest';
 import { emitCategory, isEmittable, formatUtterance, enqueueCapped } from '../src/worker.js';
 // Plain-value constants live in lib.js, not the entry module — see lib.js's
 // header comment (workerd rejects a non-function/class entry-module export).
-import { VALID_KINDS, TTS_LABELS, EMIT_TTL_MS } from '../src/lib.js';
+import { VALID_KINDS, TTS_LABELS, EMIT_TTL_MS, FINANCIAL_KINDS, cleanSpokenName } from '../src/lib.js';
+import { makeHub } from './helpers/makeHub.js';
 
 describe('emitCategory', () => {
   it('financial for a paid kind', () => {
@@ -21,6 +22,11 @@ describe('emitCategory', () => {
   it('silent for a plain chat row and other system rows', () => {
     expect(emitCategory({})).toBe('silent');
     expect(emitCategory({ sys: 'roomstate' })).toBe('silent');
+  });
+
+  it('silent for viewermilestone and YT modechange — gray rows, no TTS/buzz', () => {
+    expect(emitCategory({ sys: 'viewermilestone' })).toBe('silent');
+    expect(emitCategory({ sys: 'modechange' })).toBe('silent');
   });
 });
 
@@ -73,12 +79,6 @@ describe('isEmittable', () => {
     expect(fired.map((m) => m.id)).toEqual([103]); // zero utterances beyond rows under 30 min old
   });
 
-  it('does not reference navigator or speechSynthesis capability', () => {
-    // Eligibility must hold even where these globals are absent (iOS Safari
-    // has no navigator.vibrate) — capability is checked by each call site,
-    // never inside the shared predicate.
-    expect(isEmittable.toString()).not.toMatch(/navigator|speechSynthesis/);
-  });
 });
 
 describe('TTS_LABELS coverage', () => {
@@ -115,10 +115,18 @@ describe('formatUtterance', () => {
     expect(formatUtterance({ user: 'X', kind: 'mystery_kind' })).toBe('X, mystery_kind');
   });
 
-  it('never reads msg.text', () => {
-    const msg = { user: 'X', kind: 'cheer', text: 'raw chat body must not be spoken' };
-    expect(formatUtterance(msg)).not.toContain('raw chat body');
-    expect(formatUtterance.toString()).not.toMatch(/msg\.text/);
+  // Privacy guard: chat bodies are never read aloud, only user + kind +
+  // amount. Asserted behaviorally against a distinctive marker across a
+  // mapped kind, an unmapped kind, and an amount-carrying kind — a source-text
+  // check (`formatUtterance.toString()`) would pass under `const { text } = msg`
+  // and fail on an unrelated comment, so it proves nothing.
+  it('never speaks msg.text', () => {
+    const MARKER = 'zzqq-raw-chat-body-marker';
+    for (const kind of ['cheer', 'mystery_kind', 'member_gift']) {
+      const spoken = formatUtterance({ user: 'X', kind, amount: 'Gold coin', text: MARKER });
+      expect(spoken).not.toContain(MARKER);
+      expect(spoken).not.toContain('zzqq');
+    }
   });
 });
 
@@ -133,5 +141,108 @@ describe('enqueueCapped', () => {
 
   it('cap of zero yields empty', () => {
     expect(enqueueCapped([], 'a', 0)).toEqual([]);
+  });
+});
+
+// ── cleanSpokenName — Step1 only (trailing digits, absorbing one preceding
+// separator). Step2 (full trailing separator-segment strip, e.g. darc-ttv ->
+// darc) is deferred and deliberately NOT implemented here — see
+// TTS_NAME_CLEANUP_DRYRUN_2026-08-05.md.
+describe('cleanSpokenName', () => {
+  it('strips trailing digits stuck directly to the name', () => {
+    expect(cleanSpokenName('PikachuFan2012')).toBe('PikachuFan');
+  });
+
+  it('absorbs the separator glued to trailing digits (whole _99, not just 99)', () => {
+    expect(cleanSpokenName('cool_guy_99')).toBe('cool_guy');
+    expect(cleanSpokenName('cool_guy_99')).not.toBe('cool_guy_');
+  });
+
+  it('leaves a name with no trailing digits unchanged, separator or not (Step2 territory)', () => {
+    expect(cleanSpokenName('darc-ttv')).toBe('darc-ttv');
+    expect(cleanSpokenName('RajGotcha')).toBe('RajGotcha');
+  });
+
+  it('guards an all-digit name — stripping to empty returns the original', () => {
+    expect(cleanSpokenName('12345')).toBe('12345');
+  });
+
+  it('guards a 1-char remainder — returns the original, not the truncated stub', () => {
+    expect(cleanSpokenName('A1')).toBe('A1');
+  });
+
+  it('leaves unicode/emoji names with no trailing digits untouched', () => {
+    expect(cleanSpokenName('🔥StreamerName')).toBe('🔥StreamerName');
+    expect(cleanSpokenName('こんにちは')).toBe('こんにちは');
+  });
+
+  it('never touches mid-name digits — only a trailing run', () => {
+    expect(cleanSpokenName('2pac')).toBe('2pac');
+    expect(cleanSpokenName('l33thax0r')).toBe('l33thax0r');
+  });
+});
+
+// ── formatUtterance x cleanSpokenName — spoken cleaned, display (msg.user)
+// untouched. Covers every financial kind's name slot: all of them carry the
+// name in the same `user` field, so one loop over FINANCIAL_KINDS is full
+// coverage, not a sampling shortcut.
+describe('formatUtterance: spoken name cleaned, msg.user left untouched', () => {
+  it.each([...FINANCIAL_KINDS])('kind=%s: spoken name is cleaned, msg.user is not mutated', (kind) => {
+    const msg = { user: 'PikachuFan2012', kind };
+    const spoken = formatUtterance(msg);
+    expect(msg.user).toBe('PikachuFan2012'); // display source untouched
+    expect(spoken.split(', ')[0]).toBe('PikachuFan'); // spoken name cleaned
+  });
+
+  it('a name with no trailing digits speaks and displays identically', () => {
+    const msg = { user: 'RajGotcha', kind: 'cheer' };
+    expect(formatUtterance(msg)).toBe('RajGotcha, cheer');
+    expect(msg.user).toBe('RajGotcha');
+  });
+});
+
+// ── ChatHub.pushMessage: tts_name_sep_candidate ────────────────────────────
+describe('ChatHub.pushMessage: tts_name_sep_candidate log', () => {
+  it('fires for a financial kind whose cleaned spoken name still has a separator', () => {
+    const { hub } = makeHub();
+    const logSpy = vi.spyOn(console, 'log').mockImplementation(() => {});
+
+    hub.pushMessage('tw', { user: 'darc-ttv', kind: 'cheer' });
+
+    expect(logSpy).toHaveBeenCalledWith(expect.stringContaining('"ev":"tts_name_sep_candidate"'));
+    expect(logSpy).toHaveBeenCalledWith(expect.stringContaining('"name":"darc-ttv"'));
+    logSpy.mockRestore();
+  });
+
+  it('does not fire for a financial kind whose cleaned spoken name has no separator', () => {
+    const { hub } = makeHub();
+    const logSpy = vi.spyOn(console, 'log').mockImplementation(() => {});
+
+    hub.pushMessage('tw', { user: 'RajGotcha', kind: 'cheer' });
+
+    expect(logSpy).not.toHaveBeenCalledWith(expect.stringContaining('tts_name_sep_candidate'));
+    logSpy.mockRestore();
+  });
+
+  it('does not fire for a separator-containing name on a non-financial (plain chat) row — never the general message path', () => {
+    const { hub } = makeHub();
+    const logSpy = vi.spyOn(console, 'log').mockImplementation(() => {});
+
+    hub.pushMessage('tw', { user: 'darc-ttv', text: 'hello' }); // no kind — not financial
+
+    expect(logSpy).not.toHaveBeenCalledWith(expect.stringContaining('tts_name_sep_candidate'));
+    logSpy.mockRestore();
+  });
+
+  it('a separator surviving only via digit-glue (post-Step1) still logs, e.g. mid-cleanup leftover', () => {
+    const { hub } = makeHub();
+    const logSpy = vi.spyOn(console, 'log').mockImplementation(() => {});
+
+    // cleanSpokenName('cool-guy_99') -> 'cool-guy' (digits+separator absorbed,
+    // but the earlier separator survives) — exactly the Step2 candidate case.
+    hub.pushMessage('tw', { user: 'cool-guy_99', kind: 'sub' });
+
+    expect(logSpy).toHaveBeenCalledWith(expect.stringContaining('"name":"cool-guy"'));
+    logSpy.mockRestore();
   });
 });

@@ -1,5 +1,37 @@
 import { describe, it, expect } from 'vitest';
-import { enqueueRetry, drainBatch, isRetryable, RETRY_QUEUE_MAX, SEND_CONCURRENCY } from '../retry-queue.mjs';
+import { enqueueRetry, drainBatch, isRetryable, RETRY_QUEUE_MAX, SEND_CONCURRENCY, nextAttempt } from '../retry-queue.mjs';
+
+describe('nextAttempt', () => {
+  it('starts at 1 and increments per call for the same message identity', () => {
+    const msg = { user: 'Alice', text: 'hi' };
+    expect(nextAttempt(msg)).toBe(1);
+    expect(nextAttempt(msg)).toBe(2);
+    expect(nextAttempt(msg)).toBe(3);
+  });
+
+  it('tracks each message object independently — one message\'s retries never inflate another\'s count', () => {
+    const msgA = { user: 'Alice', text: 'hi' };
+    const msgB = { user: 'Bob', text: 'yo' };
+    expect(nextAttempt(msgA)).toBe(1);
+    expect(nextAttempt(msgA)).toBe(2);
+    expect(nextAttempt(msgB)).toBe(1);
+  });
+
+  it('two distinct objects with identical content are still counted separately (identity, not equality)', () => {
+    const first = { user: 'Alice', text: 'hi' };
+    const second = { user: 'Alice', text: 'hi' };
+    expect(nextAttempt(first)).toBe(1);
+    expect(nextAttempt(second)).toBe(1);
+    expect(nextAttempt(first)).toBe(2);
+  });
+
+  it('a non-object msg (e.g. a bare string test double) always reads as attempt 1, never throws', () => {
+    expect(nextAttempt('msgA')).toBe(1);
+    expect(nextAttempt('msgA')).toBe(1);
+    expect(nextAttempt(null)).toBe(1);
+    expect(nextAttempt(undefined)).toBe(1);
+  });
+});
 
 describe('isRetryable', () => {
   it('excludes heartbeats', () => {
@@ -59,9 +91,19 @@ describe('drainBatch', () => {
   it('runs the batch concurrently, not sequentially', async () => {
     const queue = ['a', 'b', 'c', 'd'];
     const delay = (ms) => new Promise((r) => setTimeout(r, ms));
-    const started = Date.now();
-    await drainBatch(queue, async () => { await delay(30); return true; }, 4);
-    expect(Date.now() - started).toBeLessThan(30 * 4); // parallel, not 4x30ms serial
+    // Peak-in-flight counter, not a real-clock bound — deterministic and
+    // immune to CI scheduling jitter, but still fails if dispatch is
+    // serialized (peak would drop to 1).
+    let inFlight = 0;
+    let peakInFlight = 0;
+    await drainBatch(queue, async () => {
+      inFlight++;
+      peakInFlight = Math.max(peakInFlight, inFlight);
+      await delay(30);
+      inFlight--;
+      return true;
+    }, 4);
+    expect(peakInFlight).toBe(4);
   });
 
   it('requeues failures at the front, preserving their relative order', async () => {

@@ -1,0 +1,31 @@
+{
+  "subscription": {
+    "id": "a2b3c498-272b-50a0-b276-1032e8b5f2d5",
+    "type": "channel.bits.use",
+    "version": "1",
+    "status": "enabled",
+    "cost": 0,
+    "condition": { "broadcaster_user_id": "1349263833" },
+    "transport": { "method": "webhook", "callback": "https://example.com/eventsub/callback" },
+    "created_at": "2026-08-01T00:00:00Z"
+  },
+  "event": {
+    "user_id": "5678",
+    "user_login": "another_user",
+    "user_name": "Another_User",
+    "broadcaster_user_id": "1349263833",
+    "broadcaster_user_login": "cooler_user",
+    "broadcaster_user_name": "Cooler_User",
+    "bits": 200,
+    "type": "power_up",
+    "power_up": {
+      "type": "message_effect",
+      "message_effect_id": "rainbow-explosion"
+    },
+    "custom_power_up": null,
+    "message": {
+      "text": "let's gooo",
+      "fragments": [{ "type": "text", "text": "let's gooo", "cheermote": null, "emote": null }]
+    }
+  }
+}

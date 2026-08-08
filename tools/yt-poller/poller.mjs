@@ -25,7 +25,7 @@ import path from 'node:path';
 import { LiveChat } from 'youtube-chat';
 import { normalizeChatItem } from './normalize.mjs';
 import { classifyYtItem } from './recovery.mjs';
-import { enqueueRetry, drainBatch, isRetryable, RETRY_QUEUE_MAX, SEND_CONCURRENCY } from './retry-queue.mjs';
+import { enqueueRetry, drainBatch, isRetryable, RETRY_QUEUE_MAX, SEND_CONCURRENCY, nextAttempt } from './retry-queue.mjs';
 import { bumpCount, appendCapture, CAPTURE_DIR, CAPTURE_FILE } from './capture.mjs';
 import { createVideoIdTracker, fetchYtCounts } from './yt-counts.mjs';
 
@@ -101,6 +101,23 @@ let cycleFetched = 0;
 let cyclePosted = 0;
 let cycleFailed = 0;
 
+// forensics rec 4 (YT_FEED_LOSS_FORENSICS_2026-08-05.md): heartbeat-payload
+// health fields + the empty-200 zombie watchdog. lastChatAt/liveChatSessionActive/
+// currentLiveChat are module-level (not run()-scoped) because the heartbeat
+// setInterval below is itself module-level and outlives any single run()
+// call/reconnect — they're the bridge between a run()-scoped LiveChat session
+// and the persistent heartbeat cadence.
+let lastChatAt = null;           // ms epoch of the last real chat item, across reconnects
+let liveChatSessionActive = false; // true only between a session's 'start' and 'end'
+let currentLiveChat = null;        // current run()'s LiveChat instance, for the watchdog's forced-reconnect
+let zeroStreak = 0;                // consecutive ungated heartbeat cycles with cycleFetched===0 while a session is active
+// 3 min conservative: the 2026-08-05 quiet stretch had isolated zero-message
+// minutes (00:34, 00:36, 00:41) interspersed with 1-3 msg/min minutes, never
+// three *consecutive* zero minutes — this threshold would not have false-fired
+// that night.
+const ZOMBIE_WATCHDOG_MIN = 3;
+const ZOMBIE_WATCHDOG_CYCLES = (ZOMBIE_WATCHDOG_MIN * 60_000) / 15_000; // heartbeat cadence, 15s
+
 // Ingest-tail RTT tracking (Phase 3) — RTT is
 // measured entirely on this process's own clock (performance.now(), never
 // diffed against a worker-side timestamp — that would measure clock skew
@@ -143,6 +160,7 @@ function randReqId() {
 // calls back into, and directly for heartbeats (which never touch the queue).
 async function sendOnce(msg) {
   const reqId = randReqId();
+  const attempt = nextAttempt(msg);
   const rttStart = performance.now();
   try {
     const res = await fetch(INGEST_URL, {
@@ -157,13 +175,13 @@ async function sendOnce(msg) {
     });
     recordRtt(performance.now() - rttStart);
     if (!res.ok) {
-      console.error(`ingest failed: ${res.status} ${await res.text()}`);
+      console.error(`ingest failed: ${res.status} ${await res.text()} attempt=${attempt}`);
       if (msg.type !== 'heartbeat') cycleFailed++;
     }
     return res.ok;
   } catch (err) {
     recordRtt(performance.now() - rttStart);
-    console.error(`ingest error: ${err.message}`);
+    console.error(`ingest error: ${err.message} attempt=${attempt}`);
     if (msg.type !== 'heartbeat') cycleFailed++;
     return false;
   }
@@ -246,6 +264,7 @@ async function run() {
   // actually attaches to anything live.
   videoIdTracker.reset();
   const liveChat = new LiveChat({ channelId: YT_CHANNEL_ID });
+  currentLiveChat = liveChat;
   let consecutiveErrors = 0;
   // armedAt is set from the 'start' event, not here — that's the moment this
   // session actually establishes, before any chat items can arrive (the
@@ -256,11 +275,14 @@ async function run() {
   liveChat.on('start', (liveId) => {
     videoIdTracker.onStart(liveId); // youtube-chat resolves this itself — never a search.list call
     if (isReconnect) ephemeral = { ...ephemeral, armedAt: Date.now() };
+    liveChatSessionActive = true;
+    zeroStreak = 0; // clean slate for the new session
   });
 
   liveChat.on('chat', (item) => {
     consecutiveErrors = 0;
     cycleFetched++;
+    lastChatAt = Date.now();
     // 'unknown' = an addChatItemAction whose item renderer we've never seen;
     // 'unknownAction' = a top-level action key we've never seen (see the
     // patch). Same capture sink for both — closes the gap for both classes.
@@ -294,6 +316,15 @@ async function run() {
       post({ type: 'mod', action: 'author_delete', authorId: item.authorChannelId });
       return;
     }
+    // ROOMSTATE parity: slow/sub-only/emote-only toggles — gray info row, no
+    // classification, same control-item path as the deletions above. Empty
+    // text (a shape the renderer isn't expected to produce, but the
+    // extraction can't rule out) is dropped rather than posting a blank row.
+    if (item.rendererType === 'modeChange') {
+      const text = typeof item.text === 'string' ? item.text.trim() : '';
+      if (text) post({ type: 'mod', action: 'mode_change', text });
+      return;
+    }
     const result = classifyYtItem(item, ephemeral, seenYtIds);
     ephemeral = result.ephemeral;
     if (!result.send) return;
@@ -315,6 +346,7 @@ async function run() {
 
   liveChat.on('end', () => {
     videoIdTracker.onEnd(); // session's gone — stop spending quota on an ended stream's stats
+    liveChatSessionActive = false; // idle until the next 'start' — zombie watchdog must not count offline silence
     console.error('live chat ended (stream offline, or forced reconnect after errors) — retrying');
     scheduleReconnect(isStreamNotFound(lastErrorMsg) ? NOT_FOUND_BACKOFF_MS : undefined);
   });
@@ -351,7 +383,14 @@ setInterval(async () => {
   // call still came back empty (quota death, revoked key, malformed
   // response) — previously indistinguishable from "not live" and silent.
   const countsOutcome = (!YOUTUBE_API_KEY || !videoId) ? 'skip' : (counts ? 'ok' : 'err');
-  const status = await post({ type: 'heartbeat', unknownRenderers: { ...unknownRendererCounts }, ...(counts || {}) });
+  const lastMessageAgeSec = lastChatAt ? Math.round((Date.now() - lastChatAt) / 1000) : null;
+  const status = await post({
+    type: 'heartbeat',
+    unknownRenderers: { ...unknownRendererCounts },
+    fetched: cycleFetched,
+    lastMessageAgeSec,
+    ...(counts || {}),
+  });
   console.log(JSON.stringify({
     ev: 'poller_heartbeat',
     fetched: cycleFetched,
@@ -363,6 +402,29 @@ setInterval(async () => {
     rtt_max_ms: Math.round(cycleRttMaxMs),
     rtt_count: cycleRttCount,
   }));
+  // forensics rec 4: empty-200 zombie watchdog. Gated on liveChatSessionActive
+  // — this heartbeat interval is deliberately NOT live-gated (see comment
+  // above), so cycleFetched===0 is the normal, permanent state whenever
+  // there's no stream at all; ungated, this would force a "reconnect" every
+  // ZOMBIE_WATCHDOG_MIN minutes all night, every night, with no stream up.
+  // Both a real stuck-continuation zombie and genuinely dead-quiet chat look
+  // identical from fetched=0 alone — forcing a continuation refresh is
+  // cheap/safe either way (same path real errors already use), so this
+  // doesn't need to (and can't) tell them apart.
+  if (liveChatSessionActive) {
+    if (cycleFetched === 0) {
+      zeroStreak++;
+      if (zeroStreak >= ZOMBIE_WATCHDOG_CYCLES) {
+        console.log(JSON.stringify({ ev: 'zombie_watchdog_reconnect', zeroStreakMin: ZOMBIE_WATCHDOG_MIN }));
+        zeroStreak = 0; // avoid a second immediate fire before 'end' flips liveChatSessionActive
+        currentLiveChat?.stop('zombie watchdog: sustained fetched=0');
+      }
+    } else {
+      zeroStreak = 0;
+    }
+  } else {
+    zeroStreak = 0; // idle/offline — explicit reset, not just "don't increment"
+  }
   cycleFetched = 0;
   cyclePosted = 0;
   cycleFailed = 0;

@@ -1,0 +1,25 @@
+{
+  "subscription": {
+    "id": "c4d5e6b0-494d-72c2-d498-3254f0d7e5e7",
+    "type": "channel.bits.use",
+    "version": "1",
+    "status": "enabled",
+    "cost": 0,
+    "condition": { "broadcaster_user_id": "1349263833" },
+    "transport": { "method": "webhook", "callback": "https://example.com/eventsub/callback" },
+    "created_at": "2026-08-01T00:00:00Z"
+  },
+  "event": {
+    "user_id": "3456",
+    "user_login": "fourth_user",
+    "user_name": "Fourth_User",
+    "broadcaster_user_id": "1349263833",
+    "broadcaster_user_login": "cooler_user",
+    "broadcaster_user_name": "Cooler_User",
+    "bits": 300,
+    "type": "custom_power_up",
+    "power_up": null,
+    "custom_power_up": { "title": "Confetti Bomb", "reward_id": "92af127c-7326-4483-a52b-b0da0be61c01" },
+    "message": null
+  }
+}

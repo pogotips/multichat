@@ -1,0 +1,11 @@
+{
+  "liveChatModeChangeMessageRenderer": {
+    "icon": { "iconType": "SLOW_MODE" },
+    "text": {
+      "runs": [{ "text": "Slow mode is on" }]
+    },
+    "subtext": {
+      "runs": [{ "text": "Chat messages can only be sent once every 10 seconds, unless you are a moderator." }]
+    }
+  }
+}

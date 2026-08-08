@@ -1,5 +1,5 @@
 diff --git a/node_modules/youtube-chat/dist/parser.js b/node_modules/youtube-chat/dist/parser.js
-index 2245f50..2df346c 100644
+index 2245f50..d3dc43a 100644
 --- a/node_modules/youtube-chat/dist/parser.js
 +++ b/node_modules/youtube-chat/dist/parser.js
 @@ -104,6 +104,23 @@ function parseMessages(runs) {
@@ -26,7 +26,7 @@ index 2245f50..2df346c 100644
  /** actionの種類を判別してRendererを返す */
  function rendererFromAction(action) {
      if (!action.addChatItemAction) {
-@@ -120,14 +137,143 @@ function rendererFromAction(action) {
+@@ -120,14 +137,157 @@ function rendererFromAction(action) {
          return item.liveChatPaidStickerRenderer;
      }
      else if (item.liveChatMembershipItemRenderer) {
@@ -52,6 +52,14 @@ index 2245f50..2df346c 100644
 +    }
 +    else if (item.liveChatSponsorshipsGiftRedemptionAnnouncementRenderer) {
 +        return Object.assign({}, item.liveChatSponsorshipsGiftRedemptionAnnouncementRenderer, { rendererType: "giftRedemption" });
++    }
++    else if (item.liveChatModeChangeMessageRenderer) {
++        // Slow mode / sub-only / emote-only toggles — YouTube's analog of
++        // Twitch's ROOMSTATE deltas. Control item, not a real chat message —
++        // tagged so parseActionToChatItem can short-circuit into a plain
++        // {rendererType, text} shape (no author/id/timestamp fields exist on
++        // this renderer, same reasoning as the mod-action control items).
++        return Object.assign({}, item.liveChatModeChangeMessageRenderer, { rendererType: "modeChange" });
 +    }
 +    else if (item.giftMessageViewModel) {
 +        // Newer paid Jewels/animated-gift feature. Unlike every renderer above,
@@ -129,6 +137,12 @@ index 2245f50..2df346c 100644
 +        // assumed to have any of those fields.
 +        return messageRenderer;
 +    }
++    if (messageRenderer && messageRenderer.rendererType === "modeChange") {
++        // Same short-circuit shape as the 'unknown'/'deletion' control items
++        // above — this is never a real ChatItem (no author/id/timestamp), so
++        // it skips the classic-renderer extraction below entirely.
++        return { rendererType: "modeChange", text: textFromHeader(messageRenderer.text) };
++    }
 +    if (messageRenderer && messageRenderer.rendererType === "giftMessage") {
 +        // ViewModel shape has no authorName.simpleText, message.runs,
 +        // timestampUsec, or authorPhoto — build the ChatItem directly instead
@@ -171,7 +185,7 @@ index 2245f50..2df346c 100644
      if (messageRenderer === null) {
          return null;
      }
-@@ -136,7 +282,8 @@ function parseActionToChatItem(data) {
+@@ -136,7 +296,8 @@ function parseActionToChatItem(data) {
          message = messageRenderer.message.runs;
      }
      else if ("headerSubtext" in messageRenderer) {
@@ -181,7 +195,7 @@ index 2245f50..2df346c 100644
      }
      const authorNameText = (_b = (_a = messageRenderer.authorName) === null || _a === void 0 ? void 0 : _a.simpleText) !== null && _b !== void 0 ? _b : "";
      const ret = {
-@@ -191,6 +338,31 @@ function parseActionToChatItem(data) {
+@@ -191,6 +352,31 @@ function parseActionToChatItem(data) {
              color: convertColorToHex6(messageRenderer.bodyBackgroundColor),
          };
      }

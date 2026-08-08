@@ -1,0 +1,8 @@
+{
+  "liveChatModeChangeMessageRenderer": {
+    "icon": { "iconType": "MEMBERS_ONLY" },
+    "text": {
+      "runs": [{ "text": "@Cool_Broadcaster turned on subscribers-only mode" }]
+    }
+  }
+}
