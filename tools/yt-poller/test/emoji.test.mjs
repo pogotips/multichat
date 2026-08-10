@@ -10,6 +10,8 @@ import { parseOne } from './helpers/envelope.mjs';
 import customEmojiMessage from './fixtures/custom-emoji-message.json';
 import standardEmojiMessage from './fixtures/standard-emoji-message.json';
 import multibyteCustomEmojiMessage from './fixtures/multibyte-custom-emoji-message.json';
+import globalEmojiMessage from './fixtures/global-emoji-message.json';
+import globalEmojiMissingImage from './fixtures/global-emoji-missing-image.json';
 
 describe('normalizeChatItem: custom emoji -> emotes', () => {
   it('a custom emoji mid-message produces a code-point-offset emotes entry', () => {
@@ -32,6 +34,40 @@ describe('normalizeChatItem: custom emoji -> emotes', () => {
     const item = parseOne(customEmojiMessage);
     const msg = normalizeChatItem(item);
     expect(msg.authorId).toBe('UCemojifan0000000000000000');
+  });
+});
+
+describe('normalizeChatItem: global (non-member) YouTube emoji -> emotes', () => {
+  it('a global emoji (isCustomEmoji:false, PUA emojiId) mid-message produces a code-point-offset emotes entry', () => {
+    const item = parseOne(globalEmojiMessage);
+    const msg = normalizeChatItem(item);
+    const shortcut = ':hand-pink-waving:';
+    expect(msg.text).toBe(`hey ${shortcut} team`);
+    const start = [...'hey '].length;
+    const end = start + [...shortcut].length - 1;
+    expect(msg.emotes).toEqual([
+      { start, end, url: 'https://www.gstatic.com/youtube/img/emojis/emoji_u1f44b_pink.png', alt: shortcut },
+    ]);
+  });
+
+  it('a global emoji with no image thumbnail falls back to its shortcut as plain text, no emotes entry', () => {
+    const item = parseOne(globalEmojiMissingImage);
+    const msg = normalizeChatItem(item);
+    expect(msg.text).toBe('hey :hand-pink-waving: team');
+    expect(msg.emotes).toBeUndefined();
+  });
+
+  // Pins that isGlobalEmoji's PUA-codepoint regex is what discriminates —
+  // not just isCustomEmoji:false + url present. A real Unicode-Consortium
+  // emoji (emojiId "😀", non-PUA) with isCustomEmoji:false and an image URL
+  // must still stay plain text: standardEmojiMessage's emojiId is a real
+  // codepoint outside the PUA ranges, so isGlobalEmoji correctly returns
+  // false even though every other signal matches a global emoji.
+  it('a standard Unicode emoji (non-PUA emojiId, isCustomEmoji:false, image present) does not produce an emotes entry', () => {
+    const item = parseOne(standardEmojiMessage);
+    const msg = normalizeChatItem(item);
+    expect(msg.text).toBe('nice 😀 stream');
+    expect(msg.emotes).toBeUndefined();
   });
 });
 

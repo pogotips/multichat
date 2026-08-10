@@ -21,6 +21,15 @@
 export const PENDING_MOD_TTL_MS = 5 * 60_000;
 export const PENDING_MOD_MAX = 64;
 
+// Heuristic correlation window between a channel.bits.use gigantify_an_emote
+// event and the plain IRC PRIVMSG it accompanies — no id correlates the two
+// (see docs/ARCHITECTURE.md §3a), so this bounds how long either side waits
+// for its match before giving up. Deliberately short: a real gigantify's
+// PRIVMSG and EventSub notification arrive within the same second in
+// practice, and a long window would risk matching an unrelated later message
+// from the same user.
+export const GIGANTIFY_SUPPRESS_WINDOW_MS = 10_000;
+
 // YouTube member_* kinds are announcement events the poller identifies by
 // renderer type (its patched youtube-chat parser) — never by the isMembership
 // badge flag, which is true on every message from any existing member. The

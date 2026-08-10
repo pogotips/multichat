@@ -18,15 +18,45 @@ export const KIND_FALLBACK_TEXT = {
 // never even makes it into the POST body.
 const MAX_EMOTES = 20;
 
+// youtube-chat's patched parser (patches/youtube-chat+2.2.0.patch,
+// parseMessages) sets emojiText = isCustomEmoji ? shortcut : run.emoji.emojiId
+// for every emoji run, custom or not — so a real Unicode-Consortium emoji
+// (e.g. "😀") and YouTube's own globally-supported non-member emoji both
+// arrive with isCustomEmoji:false. The only remaining signal is emojiId
+// itself: real Unicode emoji live in the standard emoji blocks and render
+// natively as text; YouTube's global emoji are assigned Private-Use-Area
+// codepoints, which have no font glyph and render as invisible/tofu if left
+// as plain text — the class (b) bug this fixes. A single codepoint inside a
+// PUA range is the fail-safe signal to route through the image path instead.
+const PRIVATE_USE_EMOJI_RE = /^[\u{E000}-\u{F8FF}\u{F0000}-\u{FFFFD}\u{100000}-\u{10FFFD}]$/u;
+
+function isGlobalEmoji(part) {
+  return !part.isCustomEmoji && typeof part.emojiText === 'string'
+    && PRIVATE_USE_EMOJI_RE.test(part.emojiText);
+}
+
+// Global emoji's own emojiText is the unrenderable PUA codepoint (see
+// isGlobalEmoji above) — prefer the human-readable shortcut (part.alt,
+// already extracted by the lib regardless of isCustomEmoji) for both the
+// in-text fallback and the eventual client display. Fail open to emojiText
+// if the shortcut itself is missing rather than emit an empty chunk.
+function chunkText(part, global) {
+  if (part.text !== undefined) return part.text;
+  if (global) return (part.alt && part.alt.length ? part.alt : part.emojiText) ?? '';
+  return part.emojiText ?? '';
+}
+
 // Builds text + emotes in one pass over item.message, tracking the running
 // offset in Unicode CODE POINTS (via [...str].length), never UTF-16 code
 // units (.length) — must match the client's [...text] walker exactly (see
 // renderText in src/worker.js) or astral/CJK/ZWJ-sequence text before a
-// custom emoji desyncs the image position. Standard (non-custom) emoji
-// contribute only emojiText to the string, no emotes entry. Only meaningful
-// for plain-message text — callers must not use this on header-prefixed
-// finalText (member/gift kinds), where custom emojis don't occur and offsets
-// wouldn't match the reshaped string.
+// custom emoji desyncs the image position. Standard (real Unicode) emoji
+// contribute only emojiText to the string, no emotes entry — member-custom
+// and global YouTube emoji both flow through the same image-offset entry
+// (see isGlobalEmoji above). Only meaningful for plain-message text —
+// callers must not use this on header-prefixed finalText (member/gift
+// kinds), where custom emojis don't occur and offsets wouldn't match the
+// reshaped string.
 //
 // Offsets are tracked against the UNTRIMMED joined text, then shifted by
 // however many leading code points .trim() removes — computing them against
@@ -37,8 +67,9 @@ function buildTextAndEmotes(parts) {
   const rawEmotes = [];
   let cpOffset = 0;
   for (const part of parts) {
-    const chunk = part.text ?? part.emojiText ?? '';
-    if (part.isCustomEmoji && part.url && rawEmotes.length < MAX_EMOTES) {
+    const global = isGlobalEmoji(part);
+    const chunk = chunkText(part, global);
+    if ((part.isCustomEmoji || global) && part.url && rawEmotes.length < MAX_EMOTES) {
       const len = [...chunk].length;
       rawEmotes.push({ start: cpOffset, end: cpOffset + len - 1, url: part.url, alt: part.alt });
     }

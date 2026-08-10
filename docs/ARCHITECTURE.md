@@ -391,21 +391,89 @@ vanishes without a trace.
 `channel.bits.use` event field reference
 (`https://dev.twitch.tv/docs/eventsub/eventsub-reference/#channel-bits-use-event`)
 — there's no `id`/`message_id` field of any kind, nothing correlatable to an
-IRC PRIVMSG's own `id` tag. **Accepted consequence:** if a viewer types a
-message alongside a Gigantify/Message-Effect/Custom-Power-up use, IRC still
-delivers that text as its own ordinary, non-gold PRIVMSG (IRC carries zero
-power-up/bits signal on that line at all), and `channel.bits.use` separately
-delivers a second, gold row summarizing the bits spent — two rows for one
-real-world action, with no way to suppress or merge them. This mirrors the
-existing precedent where a channel-points redemption's optional `user_input`
-already renders as its own distinct `sys: 'redeem'` row — not a new pattern,
-not a bug. On-Screen Celebration is exempt from this double-row
-consideration — it never posts to IRC at all, so it produces only the one
-gold row. Flip side of the same gap: `mapEventToRow` unconditionally drops
-`type: 'cheer'` (IRC's own `bits` tag is assumed to own cheer rows), so if
-the Twitch IRC connection is down when a cheer arrives, the EventSub
-`channel.bits.use` cheer event is dropped too and the cheer never renders.
-Known, accepted — same no-persistence posture as the rest of this Worker.
+IRC PRIVMSG's own `id` tag. If a viewer types a message alongside a
+Gigantify/Message-Effect/Custom-Power-up use, IRC still delivers that text as
+its own ordinary, non-gold PRIVMSG (IRC carries zero power-up/bits signal on
+that line at all), and `channel.bits.use` separately delivers a second, gold
+row summarizing the bits spent — two rows for one real-world action. This
+still mirrors the existing precedent where a channel-points redemption's
+optional `user_input` already renders as its own distinct `sys: 'redeem'`
+row — not a new pattern, not a bug — for Message Effects and Custom
+Power-ups, which keep this double-row behavior unchanged. On-Screen
+Celebration is exempt from this double-row consideration entirely — it
+never posts to IRC at all, so it produces only the one gold row.
+
+**Gigantify an Emote double-display suppression (2026-08-08, selector +
+unification pass 2026-08-08).** Gigantify specifically gets a best-effort fix
+for the plain-row half of the double-row above:
+`ChatHub.handleGigantifyDedupe`/`consumePendingGigantify` heuristically hide
+the plain PRIVMSG, matched on same login + the gigantified emote within
+`GIGANTIFY_SUPPRESS_WINDOW_MS` (10s, `src/lib.js`). Both arrival orders now
+push every PRIVMSG through the exact same path — `handleIrcData` always calls
+`pushMessage` first (ring/`recentTwitchIds`/`lastTwTmiSentTs`/SSE all fire
+normally, gap-recovery-consistent by construction) — and suppression is
+always a *second*, follow-up step: an in-place `superseded: true` ring
+mutation plus a transient `mark` (`action: 'supersede'`) SSE broadcast via
+`ChatHub.markSuperseded`, the same shape `markDeleted`/CLEARMSG uses. One
+suppression mechanism, two triggers. A client hides a superseded row entirely
+(`addRow` skips it, the `mark` listener removes an already-rendered one),
+never strikes it through like a moderated message.
+
+*Candidate selection (`selectGigantifyCandidates`/`pickGigantifyCandidate`,
+`src/worker.js`).* IRC-first (the common case — PRIVMSG already in the ring
+when the webhook lands) scans for candidates in two tiers: (1) prefer ring
+rows whose own `emotes` tag data (copied verbatim from the PRIVMSG's IRC
+`emotes` tag) contains the gigantified emote's id
+(`event.power_up.emote.id`) — exact, can't collide on emote-name text; (2)
+only when no id-tagged candidate exists, fall back to rows that carry no
+emote data at all, matched by `gigantifyTextMatches` (a whole whitespace-
+token match, not a bare substring — "Kappa" inside "KappaPride" doesn't
+count) on the emote's name. A row that has emote data but no id match is
+never eligible for the text fallback — its tagged emotes are known and don't
+include this one, so a same-word text hit there would be a real collision,
+not the gigantified message. Among the surviving candidates, the one
+selected is whichever minimizes `|row.twTs − eventTs|` — `row.twTs` is
+Twitch's own `tmi-sent-ts` tag value copied onto the ring entry by
+`pushMessage`, and `eventTs` is `Date.parse` of the `Twitch-Eventsub-
+Message-Timestamp` header, forwarded edge→DO as `x-es-ts` alongside `x-es-id`
+in `handleEventSubCallback` (both are HMAC-covered inputs to
+`verifySignature`, so forwarding either is the same "recoverable only via
+header" case). Comparing two Twitch-side clocks avoids the DO's own receipt
+clock, which would be skewed by exactly the kind of queueing delay this
+selector exists to be robust against. A missing/unparseable `eventTs`, or an
+exact tie, resolves to the newest candidate (ring-ordered, oldest first).
+This replaced an earlier `ring.find()` (oldest-match) selector: picking
+"first found" rather than "closest in time" meant a same-login
+spam-then-gigantify sequence ("Kappa … Kappa … *gigantifies Kappa*") could
+supersede the earlier, unrelated real message instead of the actual
+gigantify PRIVMSG (see `PR41_GIGANTIFY_REVIEW_2026-08-08.md` finding F1). Zero
+candidates in the window: IRC hasn't delivered the PRIVMSG yet (or never
+will) — buffer `{login, emoteName, emoteId, ts}` in
+`ChatHub.pendingGigantifies` (bounded to `PENDING_MOD_MAX`) for
+`handleIrcData` to consume once it arrives, single-use, so one gigantify can
+only ever suppress one PRIVMSG.
+
+**The gold row itself is never suppressed, delayed, or gated on finding a
+match** — worst-case failure mode is a duplicate plain row still showing,
+never a vanished paid row. Redelivery-safe for free: the existing `x-es-id`
+dedupe gate in `handleEventSub` drops a redelivered notification before
+`handleGigantifyDedupe` ever runs, so a redelivery can't supersede a second
+row or double-buffer. Because every PRIVMSG always pushes through the normal
+path first, a disconnect shortly after a suppressed gigantify can no longer
+resurrect it via gap recovery either: `recoverGap`'s `filterRecoveredMessages`
+call excludes it on both of its independent guards — `recentTwitchIds`
+already has its id, and `lastTwTmiSentTs` already advanced past its
+`tmi-sent-ts` — where the pre-unification version's early `continue` (before
+`pushMessage`) skipped both (see finding F2, closed by this same structural
+change rather than a separate patch). Scoped to Gigantify only — Message
+Effects share the same "no correlation id" gap but are mechanically identical
+enough that a future extension could reuse this same machinery; deliberately
+not done here to keep this change scoped to the one reported case. Flip side
+of the same gap: `mapEventToRow` unconditionally drops `type: 'cheer'` (IRC's
+own `bits` tag is assumed to own cheer rows), so if the Twitch IRC connection
+is down when a cheer arrives, the EventSub `channel.bits.use` cheer event is
+dropped too and the cheer never renders. Known, accepted — same
+no-persistence posture as the rest of this Worker.
 
 **Scope 403 diagnosis.** `createEventSubSubscription` failures for
 `channel.bits.use` specifically get a `diagnosis` field

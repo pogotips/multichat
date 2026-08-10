@@ -9,8 +9,11 @@ import {
   mapEventToRow,
   buildDesiredSubs,
   handleEventSubCallback,
+  gigantifyTextMatches,
 } from '../src/worker.js';
+import { GIGANTIFY_SUPPRESS_WINDOW_MS, PENDING_MOD_MAX } from '../src/lib.js';
 import { makeEventSubHub, makeStorage } from './helpers/makeHub.js';
+import { withFakeTimers } from './helpers/withFakeTimers.js';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 
@@ -530,8 +533,10 @@ describe('handleEventSubCallback', () => {
   it('forwards a notification to the DO via ctx.waitUntil, never reading a type/sub-type header for routing', async () => {
     const env = makeEdgeEnv();
     const ctx = makeCtx();
+    const timestamp = new Date().toISOString();
     const req = signedRequest({
       id: 'msg-fwd-1',
+      timestamp,
       messageType: 'notification',
       body: { subscription: { type: 'channel.ad_break.begin' }, event: { duration_seconds: 30 } },
     });
@@ -542,6 +547,11 @@ describe('handleEventSubCallback', () => {
     expect(env._huBFetchCalls).toHaveLength(1);
     const forwarded = env._huBFetchCalls[0];
     expect(forwarded.opts.headers['x-es-id']).toBe('msg-fwd-1');
+    // x-es-ts carries the edge-verified envelope timestamp — same
+    // HMAC-covered-input rationale as x-es-id (see handleEventSubCallback);
+    // ChatHub.handleGigantifyDedupe reads it for candidate-timestamp
+    // selection.
+    expect(forwarded.opts.headers['x-es-ts']).toBe(timestamp);
     // No x-es-type / x-es-sub-type header — signed-truth rule: the DO must
     // read subscription.type from the (HMAC-covered) forwarded body itself.
     expect(forwarded.opts.headers['x-es-type']).toBeUndefined();
@@ -556,10 +566,14 @@ describe('handleEventSubCallback', () => {
 });
 
 // ── ChatHub.handleEventSub (DO internal route) ──────────────────────────────
-function eventSubDoRequest(id, subscriptionType, event) {
+function eventSubDoRequest(id, subscriptionType, event, { esTs } = {}) {
   return new Request('https://do/eventsub', {
     method: 'POST',
-    headers: { 'content-type': 'application/json', 'x-es-id': id },
+    headers: {
+      'content-type': 'application/json',
+      'x-es-id': id,
+      ...(esTs ? { 'x-es-ts': esTs } : {}),
+    },
     body: JSON.stringify({ subscription: { type: subscriptionType }, event }),
   });
 }
@@ -1279,6 +1293,319 @@ describe('mapEventToRow: channel.bits.use redelivery/dedupe proof', () => {
     expect(replay.status).toBe(200);
     expect(spy).toHaveBeenCalledTimes(1); // still just the one — the redelivery never reaches mapEventToRow
     expect(hub.ring).toHaveLength(1);
+  });
+});
+
+// ── Gigantify double-display suppression ───────────────────────────────────
+// See docs/ARCHITECTURE.md §3a and ChatHub.handleGigantifyDedupe /
+// consumePendingGigantify. No id correlates a channel.bits.use
+// gigantify_an_emote event to the plain IRC PRIVMSG it accompanies — the
+// match is heuristic: same login + gigantifyTextMatches + a tight time
+// window (GIGANTIFY_SUPPRESS_WINDOW_MS). Covers both arrival orders.
+describe('gigantifyTextMatches', () => {
+  it.each([
+    { label: 'exact match', text: 'PogChamp', emoteName: 'PogChamp', expected: true },
+    { label: 'emote as one token among others (real channel.chat.message shape, twitchdev/issues#1047)', text: 'PogChamp cohhStaring', emoteName: 'PogChamp', expected: true },
+    { label: 'emote preceded by other text', text: 'hey chat PogChamp', emoteName: 'PogChamp', expected: true },
+    { label: 'substring, not a whole token — must NOT match', text: 'PogChampion', emoteName: 'PogChamp', expected: false },
+    { label: 'substring inside a longer emote name — must NOT match', text: 'KappaPride', emoteName: 'Kappa', expected: false },
+    { label: 'case-sensitive — Twitch emote codes are exact', text: 'pogchamp', emoteName: 'PogChamp', expected: false },
+    { label: 'unrelated text entirely', text: 'hello world', emoteName: 'PogChamp', expected: false },
+    { label: 'empty text', text: '', emoteName: 'PogChamp', expected: false },
+    { label: 'empty emote name', text: 'PogChamp', emoteName: '', expected: false },
+    { label: 'non-string text', text: null, emoteName: 'PogChamp', expected: false },
+  ])('$label', ({ text, emoteName, expected }) => {
+    expect(gigantifyTextMatches(text, emoteName)).toBe(expected);
+  });
+});
+
+describe('ChatHub gigantify double-display suppression', () => {
+  // login: cool_user, power_up.emote.name: PogChamp, bits: 500 — see
+  // test/fixtures/eventsub/bits-use-gigantify.v1.json.
+  const GIGANTIFY_EVENT = FIXTURES['channel.bits.use'].event;
+  const ircLine = (id, login, text) =>
+    `@id=${id};display-name=${login} :${login}!${login}@${login}.tmi.twitch.tv PRIVMSG #testchannel :${text}`;
+
+  it('IRC-first: supersedes the matching ring entry, broadcasts mark:supersede, and the gold row still renders', async () => {
+    const hub = makeEventSubHub();
+    hub.pushMessage('tw', { user: 'Cool_User', login: 'cool_user', text: 'PogChamp' }, { id: 'irc-msg-1' });
+    const broadcastSpy = vi.spyOn(hub, 'broadcastEvent');
+
+    const res = await hub.handleEventSub(eventSubDoRequest('gig-order-a-1', 'channel.bits.use', GIGANTIFY_EVENT));
+    expect(res.status).toBe(200);
+
+    const plain = hub.ring.find((e) => e.twId === 'irc-msg-1');
+    expect(plain.superseded).toBe(true);
+
+    const gold = hub.ring.at(-1);
+    expect(gold.kind).toBe('power_up'); // gold row unconditionally rendered — never gated on the match
+    expect(gold.text).toBe('Gigantify an Emote');
+
+    const markCall = broadcastSpy.mock.calls.find(([event]) => event === 'mark');
+    expect(markCall[1]).toEqual({ action: 'supersede', targetId: 'irc-msg-1' });
+  });
+
+  it('EventSub-first: buffers the pending gigantify, then push-then-supersedes the matching PRIVMSG on arrival; gold row already rendered', async () => {
+    const hub = makeEventSubHub();
+    const broadcastSpy = vi.spyOn(hub, 'broadcastEvent');
+    const res = await hub.handleEventSub(eventSubDoRequest('gig-order-b-1', 'channel.bits.use', GIGANTIFY_EVENT));
+    expect(res.status).toBe(200);
+    expect(hub.ring).toHaveLength(1); // gold row only — PRIVMSG hasn't arrived yet
+    expect(hub.pendingGigantifies).toHaveLength(1);
+
+    hub.handleIrcData(ircLine('irc-msg-2', 'cool_user', 'PogChamp'));
+
+    // Structural fix: the PRIVMSG always pushes normally first (unified with
+    // the IRC-first order below) — it's briefly a real ring entry, not
+    // dropped on arrival — then immediately superseded via the same
+    // markSuperseded path.
+    expect(hub.ring).toHaveLength(2); // gold + the now-superseded plain row
+    const plain = hub.ring.find((e) => e.twId === 'irc-msg-2');
+    expect(plain.superseded).toBe(true);
+    expect(hub.recentTwitchIds.has('irc-msg-2')).toBe(true); // pushMessage's normal bookkeeping ran
+    expect(hub.pendingGigantifies).toHaveLength(0); // consumed
+
+    const markCall = broadcastSpy.mock.calls.find(([event]) => event === 'mark');
+    expect(markCall[1]).toEqual({ action: 'supersede', targetId: 'irc-msg-2' });
+  });
+
+  it('non-matching text from the SAME login is never eaten, either order — a same-login unrelated message must survive', async () => {
+    const hubA = makeEventSubHub(); // IRC-first
+    hubA.pushMessage('tw', { user: 'Cool_User', login: 'cool_user', text: 'hey chat, unrelated message' }, { id: 'irc-unrelated-1' });
+    await hubA.handleEventSub(eventSubDoRequest('gig-nomatch-a-1', 'channel.bits.use', GIGANTIFY_EVENT));
+    expect(hubA.ring.find((e) => e.twId === 'irc-unrelated-1').superseded).toBeUndefined();
+
+    const hubB = makeEventSubHub(); // EventSub-first
+    await hubB.handleEventSub(eventSubDoRequest('gig-nomatch-b-1', 'channel.bits.use', GIGANTIFY_EVENT));
+    hubB.handleIrcData(ircLine('irc-unrelated-2', 'cool_user', 'hey chat, unrelated message'));
+    expect(hubB.ring).toHaveLength(2); // gold row + the unrelated PRIVMSG, both present
+    expect(hubB.ring.find((e) => e.twId === 'irc-unrelated-2')).toBeTruthy();
+  });
+
+  it('a different login with the exact same emote text is never matched', async () => {
+    const hub = makeEventSubHub();
+    hub.pushMessage('tw', { user: 'Someone_Else', login: 'someone_else', text: 'PogChamp' }, { id: 'irc-diff-login-1' });
+    await hub.handleEventSub(eventSubDoRequest('gig-diff-login-1', 'channel.bits.use', GIGANTIFY_EVENT));
+    expect(hub.ring.find((e) => e.twId === 'irc-diff-login-1').superseded).toBeUndefined();
+  });
+
+  it('window expiry — IRC-first: a ring entry older than GIGANTIFY_SUPPRESS_WINDOW_MS is not superseded', () => withFakeTimers(async () => {
+    const hub = makeEventSubHub();
+    hub.pushMessage('tw', { user: 'Cool_User', login: 'cool_user', text: 'PogChamp' }, { id: 'irc-stale-1' });
+    vi.advanceTimersByTime(GIGANTIFY_SUPPRESS_WINDOW_MS + 1);
+
+    await hub.handleEventSub(eventSubDoRequest('gig-expiry-a-1', 'channel.bits.use', GIGANTIFY_EVENT));
+    expect(hub.ring.find((e) => e.twId === 'irc-stale-1').superseded).toBeUndefined();
+    expect(hub.pendingGigantifies).toHaveLength(1); // falls through to the pending buffer — no ring match found
+  }));
+
+  it('window expiry — EventSub-first: a pending gigantify older than GIGANTIFY_SUPPRESS_WINDOW_MS no longer suppresses its PRIVMSG', () => withFakeTimers(async () => {
+    const hub = makeEventSubHub();
+    await hub.handleEventSub(eventSubDoRequest('gig-expiry-b-1', 'channel.bits.use', GIGANTIFY_EVENT));
+    expect(hub.pendingGigantifies).toHaveLength(1);
+
+    vi.advanceTimersByTime(GIGANTIFY_SUPPRESS_WINDOW_MS + 1);
+    hub.handleIrcData(ircLine('irc-late-1', 'cool_user', 'PogChamp'));
+
+    expect(hub.ring.find((e) => e.twId === 'irc-late-1')).toBeTruthy(); // pushed normally, not suppressed
+    expect(hub.pendingGigantifies).toHaveLength(0); // stale entry pruned on this call
+  }));
+
+  it('redelivery: a redelivered gigantify (same x-es-id) never supersedes a second row and never double-buffers', async () => {
+    const hub = makeEventSubHub();
+    hub.pushMessage('tw', { user: 'Cool_User', login: 'cool_user', text: 'PogChamp' }, { id: 'irc-redeliv-1' });
+    const broadcastSpy = vi.spyOn(hub, 'broadcastEvent');
+
+    await hub.handleEventSub(eventSubDoRequest('gig-redeliv-1', 'channel.bits.use', GIGANTIFY_EVENT));
+    expect(broadcastSpy.mock.calls.filter(([event]) => event === 'mark')).toHaveLength(1);
+    expect(hub.ring).toHaveLength(2); // plain (now superseded) + gold
+
+    await hub.handleEventSub(eventSubDoRequest('gig-redeliv-1', 'channel.bits.use', GIGANTIFY_EVENT)); // same x-es-id
+    expect(broadcastSpy.mock.calls.filter(([event]) => event === 'mark')).toHaveLength(1); // still just the one
+    expect(hub.ring).toHaveLength(2); // no second gold row
+    expect(hub.pendingGigantifies).toHaveLength(0); // and no stray pending entry either
+  });
+
+  it('gold row renders even when no plain PRIVMSG ever matches — never gated on the dedupe outcome', async () => {
+    const hub = makeEventSubHub();
+    const res = await hub.handleEventSub(eventSubDoRequest('gig-goldonly-1', 'channel.bits.use', GIGANTIFY_EVENT));
+    expect(res.status).toBe(200);
+    expect(hub.ring).toHaveLength(1);
+    expect(hub.ring[0].kind).toBe('power_up');
+    expect(hub.ring[0].amount).toBe('500 bits');
+  });
+
+  it('message_effect (a different power_up type) never triggers gigantify dedupe — no pending entry, no ring scan side effect', async () => {
+    const hub = makeEventSubHub();
+    hub.pushMessage('tw', { user: 'Cool_User', login: 'cool_user', text: 'PogChamp' }, { id: 'irc-msg-effect-1' });
+    const { event } = loadFixture('bits-use-message-effect.v1.json');
+
+    await hub.handleEventSub(eventSubDoRequest('gig-not-applicable-1', 'channel.bits.use', event));
+
+    expect(hub.pendingGigantifies).toHaveLength(0);
+    expect(hub.ring.find((e) => e.twId === 'irc-msg-effect-1').superseded).toBeUndefined();
+  });
+
+  // ── F1 regression: multi-candidate wrong-victim selection ─────────────────
+  // See PR41_GIGANTIFY_REVIEW_2026-08-08.md finding F1 — the original
+  // ring.find() picked the OLDEST same-login token match, which eats an
+  // unrelated earlier message whenever a spam-then-gigantify sequence
+  // ("Kappa … Kappa … *gigantifies Kappa*") puts more than one candidate in
+  // the window. pickGigantifyCandidate now selects by proximity to the
+  // EventSub envelope timestamp (x-es-ts) instead. twTs values below are a
+  // synthetic Twitch-side clock, deliberately decoupled from the real
+  // Date.now() the ring's own GIGANTIFY_SUPPRESS_WINDOW_MS check uses (both
+  // pushes happen within the same test tick, well inside that window).
+  const TW_CLOCK_BASE = 1_700_000_000_000;
+
+  it('F1 regression, spam-BEFORE: an earlier same-login lookalike survives; the later real gigantify message is superseded', async () => {
+    const hub = makeEventSubHub();
+    hub.pushMessage('tw', { user: 'Cool_User', login: 'cool_user', text: 'PogChamp' }, { id: 'irc-spam-1', ts: TW_CLOCK_BASE });
+    hub.pushMessage('tw', { user: 'Cool_User', login: 'cool_user', text: 'PogChamp' }, { id: 'irc-real-1', ts: TW_CLOCK_BASE + 5000 });
+
+    const esTs = new Date(TW_CLOCK_BASE + 5001).toISOString(); // close to the real (later) message
+    await hub.handleEventSub(eventSubDoRequest('gig-f1-before-1', 'channel.bits.use', GIGANTIFY_EVENT, { esTs }));
+
+    expect(hub.ring.find((e) => e.twId === 'irc-spam-1').superseded).toBeUndefined();
+    expect(hub.ring.find((e) => e.twId === 'irc-real-1').superseded).toBe(true);
+  });
+
+  it('F1 regression, spam-AFTER: a later same-login lookalike survives; the earlier real gigantify message is superseded', async () => {
+    const hub = makeEventSubHub();
+    hub.pushMessage('tw', { user: 'Cool_User', login: 'cool_user', text: 'PogChamp' }, { id: 'irc-real-2', ts: TW_CLOCK_BASE });
+    hub.pushMessage('tw', { user: 'Cool_User', login: 'cool_user', text: 'PogChamp' }, { id: 'irc-spam-2', ts: TW_CLOCK_BASE + 5000 });
+
+    const esTs = new Date(TW_CLOCK_BASE + 1).toISOString(); // close to the real (earlier) message
+    await hub.handleEventSub(eventSubDoRequest('gig-f1-after-1', 'channel.bits.use', GIGANTIFY_EVENT, { esTs }));
+
+    expect(hub.ring.find((e) => e.twId === 'irc-real-2').superseded).toBe(true);
+    expect(hub.ring.find((e) => e.twId === 'irc-spam-2').superseded).toBeUndefined();
+  });
+
+  it('F1 regression: an id-tagged emote match wins over a same-text row lacking emote data, regardless of timestamp proximity', async () => {
+    const hub = makeEventSubHub();
+    // Text-only lookalike, no emotes tag — closer in time to the event but
+    // must lose to the id match below.
+    hub.pushMessage('tw', { user: 'Cool_User', login: 'cool_user', text: 'PogChamp' }, { id: 'irc-text-only-1', ts: TW_CLOCK_BASE + 4900 });
+    // Real gigantify PRIVMSG: carries the emotes tag with the gigantified id.
+    hub.pushMessage(
+      'tw',
+      { user: 'Cool_User', login: 'cool_user', text: 'PogChamp', emotes: [{ id: 'emotesv2_abc123', start: 0, end: 7 }] },
+      { id: 'irc-id-match-1', ts: TW_CLOCK_BASE }
+    );
+
+    const esTs = new Date(TW_CLOCK_BASE + 4901).toISOString(); // much closer to the text-only row
+    await hub.handleEventSub(eventSubDoRequest('gig-f1-idmatch-1', 'channel.bits.use', GIGANTIFY_EVENT, { esTs }));
+
+    expect(hub.ring.find((e) => e.twId === 'irc-text-only-1').superseded).toBeUndefined();
+    expect(hub.ring.find((e) => e.twId === 'irc-id-match-1').superseded).toBe(true);
+  });
+
+  it('server-side replay (Last-Event-ID resume) carries superseded: true through to a reconnecting client', async () => {
+    const hub = makeEventSubHub({ TWITCH_CHANNEL: 'testchannel' });
+    hub.pushMessage('tw', { user: 'Cool_User', login: 'cool_user', text: 'PogChamp' }, { id: 'irc-replay-1' });
+    await hub.handleEventSub(eventSubDoRequest('gig-replay-1', 'channel.bits.use', GIGANTIFY_EVENT));
+
+    const supersededRow = hub.ring.find((e) => e.twId === 'irc-replay-1');
+    expect(supersededRow.superseded).toBe(true);
+
+    const sseRes = hub.handleEvents(new Request('https://do/events', { headers: { 'Last-Event-ID': String(supersededRow.id - 1) } }));
+    const reader = sseRes.body.getReader();
+    const decoder = new TextDecoder();
+    const frames = [];
+    // status + the superseded plain row + the gold row — three enqueues,
+    // one per read() (a default, non-byte ReadableStream never coalesces).
+    for (let i = 0; i < 3; i++) {
+      const { value, done } = await reader.read();
+      if (done) break;
+      const text = decoder.decode(value);
+      const dataMatch = text.match(/^data: (.+)$/m);
+      frames.push(dataMatch ? JSON.parse(dataMatch[1]) : null);
+    }
+    await reader.cancel();
+
+    const replayedPlain = frames.find((f) => f && f.twId === 'irc-replay-1');
+    expect(replayedPlain).toBeTruthy();
+    expect(replayedPlain.superseded).toBe(true);
+  });
+
+  it('pendingGigantifies is bounded to PENDING_MOD_MAX — oldest pending gigantify is evicted on overflow', async () => {
+    const hub = makeEventSubHub();
+    for (let i = 0; i < PENDING_MOD_MAX; i++) {
+      await hub.handleEventSub(eventSubDoRequest(`gig-cap-${i}`, 'channel.bits.use', { ...GIGANTIFY_EVENT, user_login: `user_${i}` }));
+    }
+    expect(hub.pendingGigantifies).toHaveLength(PENDING_MOD_MAX);
+    expect(hub.pendingGigantifies[0].login).toBe('user_0');
+
+    await hub.handleEventSub(eventSubDoRequest('gig-cap-overflow', 'channel.bits.use', { ...GIGANTIFY_EVENT, user_login: 'user_overflow' }));
+
+    expect(hub.pendingGigantifies).toHaveLength(PENDING_MOD_MAX);
+    expect(hub.pendingGigantifies[0].login).toBe('user_1'); // user_0 evicted, FIFO
+    expect(hub.pendingGigantifies.at(-1).login).toBe('user_overflow');
+  });
+
+  it('gap recovery after EventSub-first suppression does NOT resurrect the superseded PRIVMSG (F2)', async () => {
+    const hub = makeEventSubHub({ TWITCH_CHANNEL: 'testchannel' });
+    const line = (id, sentTs, text) =>
+      `@display-name=Cool_User;id=${id};tmi-sent-ts=${sentTs} :cool_user!cool_user@cool_user.tmi.twitch.tv PRIVMSG #testchannel :${text}`;
+
+    await hub.handleEventSub(eventSubDoRequest('gig-gap-1', 'channel.bits.use', GIGANTIFY_EVENT));
+    expect(hub.pendingGigantifies).toHaveLength(1);
+
+    const sentTs = Date.now();
+    const rawLine = line('irc-gap-1', sentTs, 'PogChamp');
+    hub.handleIrcData(rawLine);
+
+    const superseded = hub.ring.find((e) => e.twId === 'irc-gap-1');
+    expect(superseded.superseded).toBe(true);
+    // The structural fix (push-then-supersede) means the suppressed PRIVMSG
+    // ran through pushMessage's normal bookkeeping exactly like any other —
+    // both of recoverGap's independent guards (seenIds and the cutoffTs
+    // watermark) now cover it.
+    expect(hub.recentTwitchIds.has('irc-gap-1')).toBe(true);
+    expect(hub.lastTwTmiSentTs).toBe(sentTs);
+
+    vi.stubGlobal('fetch', vi.fn().mockResolvedValueOnce({ ok: true, json: async () => ({ messages: [rawLine] }) }));
+    await hub.recoverGap();
+    vi.unstubAllGlobals();
+
+    expect(hub.ring.filter((e) => e.twId === 'irc-gap-1')).toHaveLength(1); // no resurrected second copy
+    expect(hub.ring.find((e) => e.twId === 'irc-gap-1').superseded).toBe(true);
+  });
+
+  // ── PR41 fast-follow R1/R3 (2026-08-08): consumePendingGigantify now
+  // applies the same two-tier gigantifyRowMatches rule selectGigantifyCandidates
+  // already used for the IRC-first order. ─────────────────────────────────
+  it('R3: power_up.emote.id missing — falls to the text tier, gold row still renders normally', async () => {
+    const hub = makeEventSubHub();
+    hub.pushMessage('tw', { user: 'Cool_User', login: 'cool_user', text: 'PogChamp' }, { id: 'irc-noid-1' });
+    const noIdEvent = { ...GIGANTIFY_EVENT, power_up: { ...GIGANTIFY_EVENT.power_up, emote: { name: 'PogChamp' } } };
+
+    const res = await hub.handleEventSub(eventSubDoRequest('gig-r3-noid-1', 'channel.bits.use', noIdEvent));
+    expect(res.status).toBe(200);
+
+    expect(hub.ring.find((e) => e.twId === 'irc-noid-1').superseded).toBe(true); // text-tier fallback still fires
+
+    const gold = hub.ring.at(-1);
+    expect(gold.kind).toBe('power_up');
+    expect(gold.text).toBe('Gigantify an Emote');
+  });
+
+  it('R1 regression, EventSub-first: a same-login row with non-matching emote ids is NOT superseded by a coincidental text match; the row with the matching id IS', async () => {
+    const hub = makeEventSubHub();
+    const lineWithEmote = (id, emoteId, text) =>
+      `@display-name=Cool_User;emotes=${emoteId}:0-${text.length - 1};id=${id} :cool_user!cool_user@cool_user.tmi.twitch.tv PRIVMSG #testchannel :${text}`;
+
+    await hub.handleEventSub(eventSubDoRequest('gig-r1-1', 'channel.bits.use', GIGANTIFY_EVENT)); // buffers pending, emoteId emotesv2_abc123
+    expect(hub.pendingGigantifies).toHaveLength(1);
+
+    hub.handleIrcData(lineWithEmote('irc-wrongid-1', 'emotesv2_WRONG', 'PogChamp')); // text matches, id doesn't
+    expect(hub.ring.find((e) => e.twId === 'irc-wrongid-1').superseded).toBeUndefined();
+    expect(hub.pendingGigantifies).toHaveLength(1); // not consumed — still buffered
+
+    hub.handleIrcData(lineWithEmote('irc-rightid-1', 'emotesv2_abc123', 'PogChamp')); // matching id
+    expect(hub.ring.find((e) => e.twId === 'irc-rightid-1').superseded).toBe(true);
+    expect(hub.pendingGigantifies).toHaveLength(0); // consumed
   });
 });
 

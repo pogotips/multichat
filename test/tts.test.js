@@ -130,6 +130,58 @@ describe('formatUtterance', () => {
   });
 });
 
+// ── formatUtterance: resub streak — structured streakMonths field, never
+// parsed from msg.text (see parseUsernotice). Cumulative months is
+// display-only and never reaches formatUtterance at all.
+describe('formatUtterance: resub streak', () => {
+  it('speaks the streak at 2 months', () => {
+    expect(formatUtterance({ user: 'ronni', kind: 'sub', streakMonths: 2 }))
+      .toBe('ronni, sub, 2 month streak');
+  });
+
+  it('speaks a longer streak (5 months)', () => {
+    expect(formatUtterance({ user: 'ronni', kind: 'sub', streakMonths: 5 }))
+      .toBe('ronni, sub, 5 month streak');
+  });
+
+  it('omits below 2 months (streak=1 is a real but too-short streak)', () => {
+    expect(formatUtterance({ user: 'ronni', kind: 'sub', streakMonths: 1 })).toBe('ronni, sub');
+  });
+
+  it('omits when streakMonths=0 (tag present but hidden/should-share-streak=0)', () => {
+    expect(formatUtterance({ user: 'ronni', kind: 'sub', streakMonths: 0 })).toBe('ronni, sub');
+  });
+
+  it('omits when streakMonths is absent (tag never sent)', () => {
+    expect(formatUtterance({ user: 'ronni', kind: 'sub' })).toBe('ronni, sub');
+  });
+
+  it('spoken name is cleaned in the streak form same as the plain form', () => {
+    expect(formatUtterance({ user: 'PikachuFan2012', kind: 'sub', streakMonths: 5 }))
+      .toBe('PikachuFan, sub, 5 month streak');
+  });
+
+  it('a giftsub never speaks streak even if the field is somehow present (sub-kind-only gate)', () => {
+    expect(formatUtterance({ user: 'ronni', kind: 'giftsub', streakMonths: 5, amount: '3 gifts' }))
+      .toBe('ronni, gift sub, 3 gifts');
+  });
+
+  it('omits when shouldShareStreak=false even with a nonzero streakMonths — the leak case: Twitch can send a real streak-months value alongside should-share-streak=0', () => {
+    expect(formatUtterance({ user: 'ronni', kind: 'sub', streakMonths: 5, shouldShareStreak: false }))
+      .toBe('ronni, sub');
+  });
+
+  it('speaks when shouldShareStreak=true and streakMonths qualifies', () => {
+    expect(formatUtterance({ user: 'ronni', kind: 'sub', streakMonths: 5, shouldShareStreak: true }))
+      .toBe('ronni, sub, 5 month streak');
+  });
+
+  it('speaks when shouldShareStreak is absent (tag never sent) and streakMonths qualifies — fail-open', () => {
+    expect(formatUtterance({ user: 'ronni', kind: 'sub', streakMonths: 5 }))
+      .toBe('ronni, sub, 5 month streak');
+  });
+});
+
 describe('enqueueCapped', () => {
   it('appends under cap', () => {
     expect(enqueueCapped(['a'], 'b', 3)).toEqual(['a', 'b']);

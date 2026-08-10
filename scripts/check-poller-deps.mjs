@@ -3,7 +3,14 @@
 // skimmed CI log) when the poller subtree's own node_modules was never
 // installed — it's a separate package.json, `npm install` at repo root
 // doesn't touch it.
-import { existsSync } from 'node:fs';
+//
+// Also guards the present-but-unpatched case: patch-package printed its
+// success checkmark while liveChatModeChangeMessageRenderer was absent from
+// the installed dist (confirmed 2026-08-10 — patch-package's own exit
+// status/log line is not proof the patch content actually landed). Without
+// this, npm install "succeeding" silently drops member_new/milestone/gift/
+// modeChange handling with no error, only downstream test failures.
+import { existsSync, readFileSync } from 'node:fs';
 import { fileURLToPath } from 'node:url';
 import path from 'node:path';
 
@@ -15,6 +22,20 @@ if (!existsSync(marker)) {
     '\nmultichat: tools/yt-poller/node_modules missing (youtube-chat not found).\n' +
     'The poller has its own package.json — root `npm install` does not install it.\n' +
     'Run: npm install --prefix tools/yt-poller\n'
+  );
+  process.exit(1);
+}
+
+const parserDist = path.join(marker, 'dist', 'parser.js');
+const sentinel = 'liveChatModeChangeMessageRenderer';
+
+if (!existsSync(parserDist) || !readFileSync(parserDist, 'utf8').includes(sentinel)) {
+  console.error(
+    '\nmultichat: tools/yt-poller/node_modules/youtube-chat is installed but NOT patched\n' +
+    `(missing sentinel "${sentinel}" in dist/parser.js).\n` +
+    'patch-package can print a success checkmark without the patch content actually\n' +
+    'landing in dist — do not trust that log line alone.\n' +
+    'Fix: rm -rf tools/yt-poller/node_modules && npm install --prefix tools/yt-poller\n'
   );
   process.exit(1);
 }

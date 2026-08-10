@@ -5,10 +5,11 @@
 // `export function`/`export class` below this line is fine as-is.
 import {
   PENDING_MOD_TTL_MS, PENDING_MOD_MAX, VALID_KINDS, TTS_LABELS, EMIT_TTL_MS, FINANCIAL_KINDS,
+  GIGANTIFY_SUPPRESS_WINDOW_MS,
   beginFetchSpan, endFetchSpan, snapshotOpenSpans, spannedFetch, cleanSpokenName,
 } from './lib.js';
 
-const RELEASE_VERSION = '2026.08.08.1'; // CalVer, human-facing
+const RELEASE_VERSION = '2026.08.10.1'; // CalVer, human-facing
 
 const ENC = new TextEncoder(); // module-level memo — avoid a throwaway TextEncoder per call on hot paths
 
@@ -322,12 +323,15 @@ export async function handleEventSubCallback(req, env, ctx) {
   }
   if (messageType === 'notification') {
     const stub = env.HUB.getByName('main');
-    // Only x-es-id is forwarded (dedupe key, already covered by the verified
-    // signature) — never a type/sub-type header. The DO reads
-    // subscription.type from this same verified body itself.
+    // x-es-id and x-es-ts are forwarded because neither is recoverable from
+    // the body itself (both are HMAC-covered inputs to verifySignature above,
+    // same as a redemption's userInput isn't recoverable from anywhere else)
+    // — never a type/sub-type header, since the DO reads subscription.type
+    // from this same verified body instead. x-es-ts backs
+    // ChatHub.handleGigantifyDedupe's candidate-timestamp comparison.
     ctx.waitUntil(stub.fetch('https://do/eventsub', {
       method: 'POST',
-      headers: { 'content-type': 'application/json', 'x-es-id': id },
+      headers: { 'content-type': 'application/json', 'x-es-id': id, 'x-es-ts': timestamp },
       body: rawBody,
     }));
     return new Response(null, { status: 204 });
@@ -387,6 +391,7 @@ export class ChatHub {
     this.recentYtIds = new Set();     // dedupe guard for yt-poller reconnect recovery, bounded to RING_SIZE
     this.pendingYtDeletes = new Map();     // ytId -> ts, mod deletes that raced ahead of their target message
     this.pendingAuthorDeletes = new Map(); // authorId -> ts, same race for author_delete
+    this.pendingGigantifies = [];          // [{login, emoteName, emoteId, ts}], EventSub-first gigantify golds awaiting their PRIVMSG — see handleGigantifyDedupe/consumePendingGigantify, GIGANTIFY_SUPPRESS_WINDOW_MS
     this.roomStateInit = false;       // true once the post-(re)connect full ROOMSTATE burst has been swallowed
     this.captureBuf = [];             // unclassified IRC lines pending flush to R2 — exhaust, not archive
     this.connId = null;               // current Twitch socket's per-connection log id
@@ -664,6 +669,19 @@ export class ChatHub {
     } else if (subType === 'channel.hype_train.end') {
       this.hypeLevel = 0;
     }
+    // Gigantify double-display suppression — see handleGigantifyDedupe. Runs
+    // before the gold row pushes, but never gates it: this only ever acts on
+    // the separate plain-chat ring entry, so a lookup miss/no-op here can
+    // never suppress or delay the gold row itself.
+    if (subType === 'channel.bits.use' && event.type === 'power_up' &&
+        event.power_up && event.power_up.type === 'gigantify_an_emote') {
+      // x-es-ts is the edge-verified Twitch-Eventsub-Message-Timestamp
+      // (ISO 8601, ms precision) — see handleEventSubCallback. Date.parse
+      // returns NaN for a missing/malformed header, which
+      // pickGigantifyCandidate treats as "no timestamp, pick newest".
+      const eventTs = Date.parse(req.headers.get('x-es-ts') || '');
+      this.handleGigantifyDedupe(event, eventTs);
+    }
     const row = mapEventToRow(subType, event);
     if (row) this.pushMessage('tw', row);
     return new Response('ok', { status: 200 });
@@ -801,6 +819,15 @@ export class ChatHub {
       ...(data.kind ? { kind: data.kind } : {}),
       ...(data.sys ? { sys: data.sys } : {}),
       ...(data.amount ? { amount: data.amount } : {}),
+      // Structured field, not parsed from text — 0 is a valid "hidden streak"
+      // value distinct from "no streak data at all" (undefined), so this
+      // checks presence, not truthiness.
+      ...(data.streakMonths !== undefined ? { streakMonths: data.streakMonths } : {}),
+      // false is a real "user hid their streak" signal distinct from
+      // "no signal at all" (undefined, tag absent) — presence check, not
+      // truthiness, same shape as streakMonths above. Consumed only by
+      // formatUtterance's leak gate; display path never reads this.
+      ...(data.shouldShareStreak !== undefined ? { shouldShareStreak: data.shouldShareStreak } : {}),
       // Channel-point redemption fields — already capped (REWARD_TITLE_MAX /
       // USER_INPUT_MAX) by mapEventToRow before ever reaching pushMessage;
       // viewer-controlled text must never enter the ring uncapped.
@@ -820,6 +847,10 @@ export class ChatHub {
     // for mod-action matching — they differ for most users, entirely for CJK names.
     if (platform === 'tw' && data.login) msg.login = data.login;
     if (platform === 'tw' && meta.id) msg.twId = meta.id;
+    // Twitch's own tmi-sent-ts (ms), distinct from msg.ts (our receipt clock)
+    // above — handleGigantifyDedupe's candidate selection compares this
+    // against the EventSub envelope timestamp, both Twitch-side clocks.
+    if (platform === 'tw' && meta.ts) msg.twTs = meta.ts;
     if (platform === 'yt' && data.ytId) msg.ytId = data.ytId;
     if (platform === 'yt' && data.authorId) msg.authorId = data.authorId;
     const lateMark = platform === 'yt' ? this.resolvePendingYtMod(msg) : null;
@@ -890,6 +921,95 @@ export class ChatHub {
       if (hit) entry.deleted = true;
     }
     this.broadcastEvent('mark', twId != null ? { action, targetId: twId } : { action, login });
+  }
+
+  // Mirrors markDeleted's in-place-ring-mutation + transient 'mark' broadcast
+  // shape, but for the gigantify double-display fix: a fully-hidden row
+  // (client never renders it at all), not a struck-through-but-visible one,
+  // and always exactly one already-found entry — never a bulk login match
+  // like markDeleted's ban/timeout path. Only ever called with a real ring
+  // entry (see handleGigantifyDedupe), so no hit-or-miss branching here.
+  // Skips the live broadcast (but still marks the ring entry, which is what
+  // a reconnecting client's replay actually reads) when the entry has no
+  // twId — real Twitch PRIVMSGs always carry one, but a login-wide fallback
+  // selector would risk hiding an unrelated live message from the same user,
+  // which the double-hide-risk side of this feature must never do.
+  markSuperseded(entry) {
+    entry.superseded = true;
+    if (entry.twId != null) {
+      this.broadcastEvent('mark', { action: 'supersede', targetId: entry.twId });
+    }
+  }
+
+  // Gigantify an Emote double-display suppression, IRC-first half (the
+  // common order — Twitch's IRC edge usually delivers the plain PRIVMSG
+  // before the channel.bits.use webhook lands). Called from handleEventSub
+  // only for a gigantify_an_emote power_up event, before/regardless of
+  // whether the gold row itself renders — the gold row is NEVER gated on
+  // this. Scans the ring for candidate rows (see selectGigantifyCandidates)
+  // and, if any exist, supersedes the one closest in time to the EventSub
+  // notification's own envelope timestamp (eventTs — see pickGigantifyCandidate;
+  // ties/missing eventTs resolve to the newest candidate). Picking "closest",
+  // not "first found" (was `ring.find`, oldest-match) matters because the
+  // gigantify's own PRIVMSG is usually the *newest* same-login match — a
+  // same-login spam-then-gigantify sequence ("Kappa … Kappa … *gigantifies
+  // Kappa*") would otherwise supersede the earlier, unrelated real message.
+  // No candidates: IRC hasn't delivered it yet — remember this gold for
+  // consumePendingGigantify to catch on arrival (EventSub-first order).
+  // Fails open (does nothing) if the event carries no login or no emote
+  // name — never touches the ring on incomplete data.
+  handleGigantifyDedupe(event, eventTs) {
+    const login = typeof event.user_login === 'string' ? event.user_login.toLowerCase() : '';
+    const emoteName = event.power_up && event.power_up.emote && typeof event.power_up.emote.name === 'string'
+      ? event.power_up.emote.name
+      : '';
+    const emoteId = event.power_up && event.power_up.emote && typeof event.power_up.emote.id === 'string'
+      ? event.power_up.emote.id
+      : '';
+    if (!login || !emoteName) return;
+    const now = Date.now();
+    const candidates = selectGigantifyCandidates(this.ring, { login, emoteName, emoteId, now });
+    const match = pickGigantifyCandidate(candidates, eventTs);
+    if (match) {
+      this.markSuperseded(match);
+      return;
+    }
+    this.pendingGigantifies.push({ login, emoteName, emoteId, ts: now });
+    while (this.pendingGigantifies.length > PENDING_MOD_MAX) this.pendingGigantifies.shift();
+  }
+
+  // Gigantify an Emote double-display suppression, EventSub-first half —
+  // the gold row already arrived (handleGigantifyDedupe above found no
+  // matching ring entry yet and buffered it here) before this PRIVMSG did.
+  // Called from handleIrcData for every plain-chat PRIVMSG, AFTER it has
+  // already been pushed normally (ring/recentTwitchIds/lastTwTmiSentTs/SSE
+  // all fire exactly as for any other message — see handleIrcData). A hit
+  // here means the caller must immediately call markSuperseded on the just-
+  // pushed row, reusing the exact same in-place-mutation + transient-
+  // broadcast path as the IRC-first branch above — one suppression
+  // mechanism, two triggers. Consumes (splices out) at most one matching
+  // pending entry so a single gigantify can only ever suppress one PRIVMSG,
+  // and opportunistically drops anything past GIGANTIFY_SUPPRESS_WINDOW_MS
+  // on every call so the buffer can't accumulate stale entries between
+  // gigantify events. Returns true iff the caller should supersede this row.
+  // Applies the SAME two-tier match rule selectGigantifyCandidates uses for
+  // the IRC-first order (see gigantifyRowMatches) — without it, a same-login
+  // row carrying non-matching emote ids could be wrongly superseded by a
+  // coincidental text-token match (PR41 review finding R1).
+  consumePendingGigantify(login, text, emotes) {
+    if (!this.pendingGigantifies.length) return false;
+    const now = Date.now();
+    const loginLc = typeof login === 'string' ? login.toLowerCase() : '';
+    let hit = false;
+    this.pendingGigantifies = this.pendingGigantifies.filter((p) => {
+      if (now - p.ts > GIGANTIFY_SUPPRESS_WINDOW_MS) return false; // expired — drop
+      if (!hit && p.login === loginLc && gigantifyRowMatches({ text, emotes }, { emoteId: p.emoteId, emoteName: p.emoteName })) {
+        hit = true;
+        return false; // consumed — never matches a second PRIVMSG
+      }
+      return true;
+    });
+    return hit;
   }
 
   applyClearmsg({ targetId, login }) {
@@ -1922,7 +2042,21 @@ export class ChatHub {
         console.log(JSON.stringify({ ev: 'shared_chat_notice_capture', innerMsgId: lineTags['source-msg-id'] || null }));
       }
       if (privmsg) {
-        this.pushMessage('tw', privmsg, ircMeta(line, lineTags));
+        // Every PRIVMSG pushes normally first — ring, recentTwitchIds,
+        // lastTwTmiSentTs, SSE broadcast all fire exactly as for any other
+        // message, gap-recovery-consistent by construction (a suppressed
+        // row's id is already in recentTwitchIds, so recoverGap can never
+        // resurrect it — see filterRecoveredMessages' seenIds check).
+        // Gigantify double-display suppression, EventSub-first order — see
+        // consumePendingGigantify/handleGigantifyDedupe. Only ever consumes
+        // a pending entry this PRIVMSG's own login+text actually matches; a
+        // hit supersedes the just-pushed row via the same markSuperseded
+        // path handleGigantifyDedupe's IRC-first branch uses — one
+        // suppression mechanism, two triggers.
+        const pushed = this.pushMessage('tw', privmsg, ircMeta(line, lineTags));
+        if (this.consumePendingGigantify(pushed.login, pushed.text, pushed.emotes)) {
+          this.markSuperseded(pushed);
+        }
         continue;
       }
       const usernotice = parseUsernotice(line, lineTags);
@@ -2154,8 +2288,39 @@ export function parseUsernotice(line, preParsedTags) {
     if (streakInfo) text += ` ${streakInfo}`;
   }
   const giftAmount = msgId === 'submysterygift' ? giftCountAmount(tags, text) : undefined;
-  const extra = giftAmount ? { amount: giftAmount } : {};
+  // streakMonths is structured (not parsed back out of `text`) so the TTS path
+  // (formatUtterance) never has to read msg.text — same tag, two independent
+  // consumers: display renders the formatted "(N months, M-month streak)"
+  // string, TTS speaks the raw number only when >= 2 (see formatUtterance).
+  const streakMonths = msgId === 'resub' ? parseStreakMonths(tags) : undefined;
+  const shouldShareStreak = msgId === 'resub' ? parseShouldShareStreak(tags) : undefined;
+  const extra = {
+    ...(giftAmount ? { amount: giftAmount } : {}),
+    ...(streakMonths !== undefined ? { streakMonths } : {}),
+    ...(shouldShareStreak !== undefined ? { shouldShareStreak } : {}),
+  };
   return { user, login, kind, text, ...extra, ...badgeFlags(tags) };
+}
+
+// Twitch zeroes/omits msg-param-streak-months when the user hides their
+// streak (msg-param-should-share-streak=0) — undefined here covers both
+// "tag absent" and "non-numeric", 0 covers "present but hidden". Callers
+// that only want the display sentence's segment already guard on > 0.
+function parseStreakMonths(tags) {
+  const streak = Number(tags['msg-param-streak-months']);
+  return Number.isFinite(streak) ? streak : undefined;
+}
+
+// msg-param-streak-months can still arrive nonzero even when the user hid
+// their streak (observed live — Twitch doesn't always zero the tag itself,
+// see PR #43 review), so formatUtterance can't trust streakMonths alone.
+// This tag is the actual hide signal: present-and-'0' means hidden — speak
+// nothing. Absent (older/rare clients) or any other value defaults to shown,
+// same fail-open posture as the rest of this parser.
+function parseShouldShareStreak(tags) {
+  const raw = tags['msg-param-should-share-streak'];
+  if (raw === undefined) return undefined;
+  return raw !== '0';
 }
 
 // Twitch sends msg-param-cumulative-months (always) and msg-param-streak-months
@@ -2167,10 +2332,10 @@ export function parseUsernotice(line, preParsedTags) {
 // the gold row.
 function formatResubStreakInfo(tags) {
   const cumulative = Number(tags['msg-param-cumulative-months']);
-  const streak = Number(tags['msg-param-streak-months']);
+  const streak = parseStreakMonths(tags);
   const parts = [];
   if (Number.isFinite(cumulative) && cumulative > 0) parts.push(`${cumulative} months`);
-  if (Number.isFinite(streak) && streak > 0) parts.push(`${streak}-month streak`);
+  if (streak > 0) parts.push(`${streak}-month streak`);
   return parts.length ? `(${parts.join(', ')})` : '';
 }
 
@@ -2350,18 +2515,25 @@ export function filterRecoveredMessages(lines, { cutoffTs, floorTs, seenIds }) {
   return recovered;
 }
 
-// Authoritative (worker-side) allowlist for YouTube custom-emoji image hosts —
-// the only two domains YT actually serves chat emoji images from. ytimg.com is
-// deliberately excluded: it's thumbnails, never chat emojis, in this field.
-// https only. A rejected host degrades (url blanked, alt/shortcode still
-// renders) rather than dropping the message — see normalizeYt below.
+// Authoritative (worker-side) allowlist for YouTube emoji image hosts.
+// ggpht.com/googleusercontent.com serve member-custom emoji; gstatic.com
+// serves YouTube's own globally-supported (non-member) emoji images — added
+// alongside the class (b) fix in normalize.mjs (YT_EMOTE_AUDIT_2026-08-08),
+// per the vendored lib's fixture shape. Unconfirmed against live traffic —
+// emoji_host_rejected logging (below) is the safety net if real gstatic
+// paths differ or YT serves class (b) from a host not yet seen here.
+// ytimg.com is deliberately excluded: it's thumbnails, never chat emojis, in
+// this field. https only. A rejected host degrades (url blanked, alt/
+// shortcode still renders) rather than dropping the message — see
+// normalizeYt below.
 function isAllowedEmojiHost(urlStr) {
   try {
     const u = new URL(urlStr);
     if (u.protocol !== 'https:') return false;
     const host = u.hostname;
     return host === 'ggpht.com' || host.endsWith('.ggpht.com')
-      || host === 'googleusercontent.com' || host.endsWith('.googleusercontent.com');
+      || host === 'googleusercontent.com' || host.endsWith('.googleusercontent.com')
+      || host === 'gstatic.com' || host.endsWith('.gstatic.com');
   } catch {
     return false;
   }
@@ -2519,6 +2691,89 @@ function formatDuration(seconds) {
   if (s < 60) return `${s}s`;
   if (s < 3600) return `${Math.round(s / 60)}m`;
   return `${Math.round(s / 3600)}h`;
+}
+
+// Gigantify an Emote double-display suppression — see docs/ARCHITECTURE.md
+// §3a and ChatHub.handleGigantifyDedupe/consumePendingGigantify. There is no
+// id correlating a channel.bits.use gigantify_an_emote event to the plain
+// IRC PRIVMSG it accompanies, so the match is heuristic: same login (checked
+// by the caller) + this text check + a tight time window. A real captured
+// channel.chat.message payload for this exact feature (twitchdev/issues#1047)
+// shows the message is NOT always just the emote — it can carry other text
+// and even other emotes alongside the gigantified one — so exact-equality
+// would miss real cases. A bare substring check would be too loose (e.g.
+// "Kappa" inside "KappaPride" or a sentence that happens to contain the
+// emote name as a word fragment) and risks eating an unrelated message from
+// the same user. Token match is the middle ground: the emote name must
+// appear as one whole whitespace-delimited word, exactly how Twitch emotes
+// are written in chat text.
+export function gigantifyTextMatches(text, emoteName) {
+  if (typeof text !== 'string' || !text || typeof emoteName !== 'string' || !emoteName) return false;
+  return text.split(/\s+/).includes(emoteName);
+}
+
+// Two-tier gigantify match rule for a single row (a ring entry, or the
+// {text, emotes} shape of a just-pushed-but-not-yet-in-the-ring row), shared
+// by selectGigantifyCandidates (IRC-first, scans the whole ring) and
+// consumePendingGigantify (EventSub-first, checks one just-pushed row against
+// one buffered pending entry) — one rule, two callers. Preference order: (1)
+// the row's own `emotes` tag data (copied verbatim from the PRIVMSG's
+// `emotes` tag) contains the gigantified emote's id — exact, can't collide on
+// emote-name text; (2) only when the row carries NO emote data at all, fall
+// back to gigantifyTextMatches on the emote name. A row that HAS emote data
+// but no id match never falls through to the text tier — its tagged emotes
+// are known and don't include this one, so a same-word text hit would be a
+// real collision (e.g. a channel emote sharing a name with a global one), not
+// the gigantified message (PR41 review finding R1).
+export function gigantifyRowMatches(row, { emoteId, emoteName }) {
+  if (Array.isArray(row.emotes) && row.emotes.length) {
+    return !!emoteId && row.emotes.some((em) => em.id === emoteId);
+  }
+  return gigantifyTextMatches(row.text, emoteName);
+}
+
+// Ring-scan candidate filter for handleGigantifyDedupe (IRC-first order).
+// Same-login, still-visible, in-window rows only, matched via
+// gigantifyRowMatches. When an id-tier hit exists, only id-tier rows are
+// returned (text-tier rows can never coexist with them — see
+// gigantifyRowMatches — but this keeps the id-preference explicit).
+export function selectGigantifyCandidates(ring, { login, emoteName, emoteId, now }) {
+  const inWindow = ring.filter((e) =>
+    e.platform === 'tw' && !e.kind && !e.sys && !e.deleted && !e.superseded &&
+    e.login === login && now - e.ts <= GIGANTIFY_SUPPRESS_WINDOW_MS);
+  if (emoteId) {
+    const idHits = inWindow.filter((e) => Array.isArray(e.emotes) && e.emotes.some((em) => em.id === emoteId));
+    if (idHits.length) return idHits;
+  }
+  return inWindow.filter((e) => gigantifyRowMatches(e, { emoteId, emoteName }) && !(e.emotes && e.emotes.length));
+}
+
+// Picks the candidate whose `twTs` (Twitch's own tmi-sent-ts, when known —
+// falls back to our receipt `ts` for a recovered row that somehow lacks it)
+// is closest to eventTs, the EventSub notification's own envelope timestamp
+// (Twitch-Eventsub-Message-Timestamp, forwarded edge->DO as the x-es-ts
+// header — see handleEventSubCallback/handleEventSub). Both are Twitch-side
+// clocks, so comparing them directly is meaningful in a way our own receipt
+// clock wouldn't be. `now` (DO receipt time) is deliberately NOT used here.
+// Missing/unparseable eventTs short-circuits straight to the newest
+// candidate (candidates is ring-ordered, oldest first). Otherwise,
+// candidates is walked oldest->newest with `<=` for the "better" comparison,
+// so an exact tie also resolves to the newest — both per the documented
+// tie-break rule.
+export function pickGigantifyCandidate(candidates, eventTs) {
+  if (!candidates.length) return null;
+  if (!Number.isFinite(eventTs)) return candidates[candidates.length - 1];
+  let best = null;
+  let bestDelta = Infinity;
+  for (const c of candidates) {
+    const rowTs = Number.isFinite(c.twTs) ? c.twTs : c.ts;
+    const delta = Math.abs(rowTs - eventTs);
+    if (delta <= bestDelta) {
+      best = c;
+      bestDelta = delta;
+    }
+  }
+  return best;
 }
 
 // Pure event -> row mapper, no DO instance state (the Hype Train level-gate
@@ -2691,14 +2946,31 @@ export function isEmittable(msg, { floor, spokenIds, now }) {
     && now - msg.ts < EMIT_TTL_MS;
 }
 
-// Never reads msg.text — only user/kind/amount reach the synthesizer, so raw
-// chat text structurally cannot be spoken. The name is run through
-// cleanSpokenName for speech only — msg.user itself is untouched, so the
-// on-screen row still shows the raw name; speaks-what-buzzes is intentionally
-// relaxed here (see docs/ARCHITECTURE.md).
+// Never reads msg.text — only user/kind/amount/streakMonths/shouldShareStreak
+// reach the synthesizer, so raw chat text structurally cannot be spoken. The name is
+// run through cleanSpokenName for speech only — msg.user itself is untouched,
+// so the on-screen row still shows the raw name; speaks-what-buzzes is
+// intentionally relaxed here (see docs/ARCHITECTURE.md).
+// streakMonths speaks only at 2+, AND only when shouldShareStreak isn't
+// explicitly false — Twitch can still send a nonzero streak-months tag
+// even when the user hid their streak (msg-param-should-share-streak=0),
+// so streakMonths alone isn't a safe hide signal (see parseShouldShareStreak).
+// shouldShareStreak undefined (tag absent, e.g. older/rare clients) defaults
+// to shown, same fail-open posture as the rest of this parser. Cumulative
+// months is display-only, never spoken. Sub-only: no other kind ever carries
+// streakMonths (see parseUsernotice), but the kind check stays explicit
+// rather than relying on that invariant silently.
 export function formatUtterance(msg) {
   const label = TTS_LABELS[msg.kind] || msg.kind;
   const parts = [cleanSpokenName(msg.user), label];
+  if (
+    msg.kind === 'sub'
+    && typeof msg.streakMonths === 'number'
+    && msg.streakMonths >= 2
+    && msg.shouldShareStreak !== false
+  ) {
+    parts.push(`${msg.streakMonths} month streak`);
+  }
   if (msg.amount) parts.push(msg.amount);
   return parts.join(', ');
 }
@@ -3163,7 +3435,7 @@ function pageHtml(myName) {
   // Client-side re-check of the worker's emoji-host allowlist (defense in
   // depth — the worker already blanks disallowed urls at ingest, so this is a
   // belt-and-suspenders check, not the authoritative gate).
-  const ALLOWED_EMOJI_HOST_RE = /(^|\.)(ggpht\.com|googleusercontent\.com)$/;
+  const ALLOWED_EMOJI_HOST_RE = /(^|\.)(ggpht\.com|googleusercontent\.com|gstatic\.com)$/;
   function isAllowedEmojiUrl(url) {
     try {
       const u = new URL(url);
@@ -3234,6 +3506,11 @@ function pageHtml(myName) {
   }
 
   function addRow(msg) {
+    // Gigantify double-display suppression — a row already superseded when
+    // it reaches the client (ring-replay on reconnect; a live row is instead
+    // hidden in place by the 'mark' listener below) is fully skipped, never
+    // inserted. See docs/ARCHITECTURE.md §3a / handleGigantifyDedupe.
+    if (msg.superseded) return;
     const row = document.createElement('div');
     if (msg.twId) row.dataset.twid = msg.twId;
     if (msg.login) row.dataset.login = msg.login;
@@ -3541,10 +3818,18 @@ function pageHtml(myName) {
             : (m.targetId ? '[data-twid="' + CSS.escape(m.targetId) + '"]' : null);
         } else if (m.action === 'author_delete') {
           sel = m.authorId ? '[data-ytauthor="' + CSS.escape(m.authorId) + '"]' : null;
+        } else if (m.action === 'supersede') {
+          // Gigantify double-display suppression (live, already-rendered
+          // row) — fully removed, not struck-through: see markSuperseded.
+          sel = m.targetId ? '[data-twid="' + CSS.escape(m.targetId) + '"]' : null;
         } else {
           sel = m.login ? '[data-login="' + CSS.escape(m.login) + '"]' : null;
         }
-        if (sel) feed.querySelectorAll(sel).forEach((r) => r.classList.add('deleted'));
+        if (sel) {
+          feed.querySelectorAll(sel).forEach((r) => {
+            if (m.action === 'supersede') r.remove(); else r.classList.add('deleted');
+          });
+        }
       } catch {}
     });
     socket.onerror = () => {

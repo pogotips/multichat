@@ -316,37 +316,74 @@ describe('parseUsernotice', () => {
       const parsed = parseUsernotice(line('msg-param-cumulative-months=12;msg-param-streak-months=5'));
       expect(parsed.text).toBe('ronni resubbed! (12 months, 5-month streak)');
       expect(parsed.kind).toBe('sub');
+      expect(parsed.streakMonths).toBe(5); // structured field, TTS reads this — not parsed back out of `text`
     });
 
     it('streak-months absent (share-streak off) appends cumulative only', () => {
       const parsed = parseUsernotice(line('msg-param-cumulative-months=12'));
       expect(parsed.text).toBe('ronni resubbed! (12 months)');
+      expect(parsed.streakMonths).toBeUndefined();
     });
 
-    it('streak-months=0 is treated the same as absent', () => {
+    it('streak-months=0 is treated the same as absent in display text, but the structured field stays 0 (not undefined) — TTS canary', () => {
       const parsed = parseUsernotice(line('msg-param-cumulative-months=12;msg-param-streak-months=0'));
       expect(parsed.text).toBe('ronni resubbed! (12 months)');
+      expect(parsed.streakMonths).toBe(0);
+    });
+
+    it('should-share-streak=0 alongside a nonzero streak tag — the leak case: streakMonths still carries the real value (display/other consumers unaffected), but shouldShareStreak surfaces false so formatUtterance can gate on it separately', () => {
+      const parsed = parseUsernotice(line('msg-param-cumulative-months=12;msg-param-streak-months=5;msg-param-should-share-streak=0'));
+      expect(parsed.streakMonths).toBe(5);
+      expect(parsed.shouldShareStreak).toBe(false);
+    });
+
+    it('should-share-streak=1 alongside a streak tag surfaces shouldShareStreak=true', () => {
+      const parsed = parseUsernotice(line('msg-param-cumulative-months=12;msg-param-streak-months=5;msg-param-should-share-streak=1'));
+      expect(parsed.shouldShareStreak).toBe(true);
+    });
+
+    it('should-share-streak tag absent leaves shouldShareStreak undefined (fail-open, same posture as streakMonths)', () => {
+      const parsed = parseUsernotice(line('msg-param-cumulative-months=12;msg-param-streak-months=5'));
+      expect(parsed.shouldShareStreak).toBeUndefined();
+    });
+
+    it('streak-months=1 is a real short streak — structured field carries it, TTS gates >=2 separately', () => {
+      const parsed = parseUsernotice(line('msg-param-cumulative-months=12;msg-param-streak-months=1'));
+      expect(parsed.text).toBe('ronni resubbed! (12 months, 1-month streak)');
+      expect(parsed.streakMonths).toBe(1);
     });
 
     it('cumulative-months only, no streak tag at all', () => {
       const parsed = parseUsernotice(line('msg-param-cumulative-months=3'));
       expect(parsed.text).toBe('ronni resubbed! (3 months)');
+      expect(parsed.streakMonths).toBeUndefined();
     });
 
     it('garbage/non-numeric values fail open — unchanged from current behavior', () => {
       const parsed = parseUsernotice(line('msg-param-cumulative-months=abc;msg-param-streak-months=xyz'));
       expect(parsed.text).toBe('ronni resubbed!');
+      expect(parsed.streakMonths).toBeUndefined();
     });
 
     it('both tags absent fails open — unchanged from current behavior', () => {
       const parsed = parseUsernotice(`${base} :tmi.twitch.tv USERNOTICE #dallas`);
       expect(parsed.text).toBe('ronni resubbed!');
+      expect(parsed.streakMonths).toBeUndefined();
     });
 
     it('does not apply to a plain sub (no cumulative/streak concept on a first sub)', () => {
       const subLine = '@display-name=ronni;login=ronni;msg-id=sub;msg-param-cumulative-months=12;system-msg=ronni\\ssubscribed! :tmi.twitch.tv USERNOTICE #dallas';
       const parsed = parseUsernotice(subLine);
       expect(parsed.text).toBe('ronni subscribed!');
+      expect(parsed.streakMonths).toBeUndefined();
+    });
+
+    it('does not apply to a gift sub, even if a streak-months tag is somehow present', () => {
+      const giftLine = '@display-name=ronni;login=ronni;msg-id=subgift;msg-param-streak-months=5;system-msg=ronni\\sgifted\\sa\\ssub :tmi.twitch.tv USERNOTICE #dallas';
+      const parsed = parseUsernotice(giftLine);
+      expect(parsed.kind).toBe('giftsub');
+      expect(parsed.streakMonths).toBeUndefined();
+      expect(parsed.shouldShareStreak).toBeUndefined();
     });
   });
 });
@@ -661,6 +698,20 @@ describe('normalizeYt', () => {
         emotes: [{ start: 3, end: 10, url: 'https://lh3.googleusercontent.com/abc.png', alt: ':_smile:' }],
       });
       expect(result.emotes[0].url).toBe('https://lh3.googleusercontent.com/abc.png');
+    });
+
+    it('accepts gstatic.com as an allowlisted host (global YouTube emoji images)', () => {
+      const result = normalizeYt({
+        user: 'Alice',
+        text: 'gg :_smile:',
+        emotes: [{
+          start: 3,
+          end: 10,
+          url: 'https://www.gstatic.com/youtube/img/emojis/emoji_u1f44b_pink.png',
+          alt: ':_smile:',
+        }],
+      });
+      expect(result.emotes[0].url).toBe('https://www.gstatic.com/youtube/img/emojis/emoji_u1f44b_pink.png');
     });
 
     it('degrades a disallowed host: url blanked, entry+alt kept, row never dropped', () => {
