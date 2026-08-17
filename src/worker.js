@@ -515,6 +515,14 @@ export class ChatHub {
           ev: 'yt_poller_health',
           fetched: Number.isFinite(body.fetched) ? body.fetched : null,
           lastMessageAgeSec: Number.isFinite(body.lastMessageAgeSec) ? body.lastMessageAgeSec : null,
+          // round-3 audit (ADD 4): additive fields from the poller's zombie-
+          // watchdog liveness gate — makes the next stall investigation
+          // answerable from this log line alone, no second YouTube API
+          // cross-check. Same null-when-absent handling as the two fields
+          // above, so an old poller build (pre-liveness-gate) logs a
+          // byte-compatible line here rather than an error.
+          liveness: typeof body.liveness === 'string' ? body.liveness : null,
+          watchdogThresholdMin: Number.isFinite(body.watchdogThresholdMin) ? body.watchdogThresholdMin : null,
         }));
         // Both fields optional and independent — the poller only sends them
         // while a live session holds a current video id (see its videoId

@@ -25,7 +25,16 @@ lost — never skip `npm install`.
 | `YT_CHANNEL_ID` | Your channel id (starts `UC...`), e.g. `UCxxxxxxxxxxxxxxxxxxxxxx` |
 | `MULTICHAT_URL` | Base URL of the `multichat` worker, e.g. `https://multichat.YOUR_DOMAIN` |
 | `MULTICHAT_INGEST_SECRET` | Same value as the Worker's `MULTICHAT_INGEST_SECRET` wrangler secret |
-| `YOUTUBE_API_KEY` | Optional (2026-07-22). YouTube Data API key for live-counts (`videos.list`, 1 quota unit/poll, only spent while a session is live — see `yt-counts.mjs`). Absent = counts feature is simply off; chat is unaffected. |
+| `YOUTUBE_API_KEY` | Optional (2026-07-22). YouTube Data API key for live-counts AND the zombie-watchdog liveness gate (`videos.list`, 1 quota unit/poll, only spent while a session is live — see `yt-counts.mjs`). Absent = live-counts is off, chat is unaffected; the watchdog's liveness stays `unknown` (not the same as `not_live`), so it takes the patient 15-minute threshold with the watchdog still armed — NOT the same as `WATCHDOG_LIVENESS_GATE=off` below, which is a separate, legacy 3-minute path. |
+| `WATCHDOG_LIVENESS_GATE` | Optional (round-3 audit). Default on. Set to `off` to instantly revert to the single fixed 3-minute threshold, ignoring liveness entirely — behavior-identical to the pre-audit code path (the one additive difference: the `poller_heartbeat` log line now also carries `liveness: 'gate_off'`) — without a rebuild: a Dockge env edit + container recreate, for recovering from a misbehaving gate mid-stream. |
+
+**`fetched` vs `posted` in the heartbeat/logs:** `fetched` counts raw
+`youtube-chat` library `chat` events, pre-dedupe — this includes the history
+re-burst a fresh reconnect's continuation re-serves, which is why it can be
+nonzero with nothing actually delivered. `posted` is the field that answers
+"was anything delivered". `fetched:0` is the normal, expected state for
+live-but-silent chat, not a sign anything is wrong — two rounds of a
+production audit (2026-08-17) misread it as such before this line existed.
 
 ## Run
 

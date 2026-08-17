@@ -49,10 +49,13 @@ describe('Dockerfile COPY vs poller.mjs import graph', () => {
   });
 
   it('the checker actually catches a missing module (sanity: fails against a stale COPY line)', () => {
+    // Deliberately outdated fixture (predates both capture.mjs and, as of
+    // round-3, rediscovery.mjs) — every module poller.mjs has grown since
+    // this COPY line was current must show up as missing.
     const staleDockerfile = 'COPY poller.mjs normalize.mjs recovery.mjs retry-queue.mjs yt-counts.mjs ./';
     const required = collectLocalModules('poller.mjs');
     const copied = collectDockerfileCopiedModules(staleDockerfile);
     const missing = [...required].filter((m) => !copied.has(m));
-    expect(missing).toEqual(['capture.mjs']);
+    expect(missing).toEqual(['rediscovery.mjs', 'capture.mjs']);
   });
 });

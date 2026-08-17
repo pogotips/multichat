@@ -15,7 +15,12 @@ import { fileURLToPath } from 'node:url';
 import path from 'node:path';
 
 const root = path.dirname(fileURLToPath(import.meta.url));
-const marker = path.join(root, '..', 'tools', 'yt-poller', 'node_modules', 'youtube-chat');
+// CHECK_POLLER_DEPS_ROOT overrides the tools/yt-poller path for testing
+// against fixture trees — unset in normal/CI use, defaults to the real path.
+const pollerRoot = process.env.CHECK_POLLER_DEPS_ROOT
+  ? path.resolve(process.env.CHECK_POLLER_DEPS_ROOT)
+  : path.join(root, '..', 'tools', 'yt-poller');
+const marker = path.join(pollerRoot, 'node_modules', 'youtube-chat');
 
 if (!existsSync(marker)) {
   console.error(

@@ -1002,7 +1002,12 @@ All client behavior lives in the inline `<script>` inside `PAGE_HTML`
    stack directory of your choosing. It is **rsync'd from this repo, never
    hand-edited on the host** — see `CLAUDE.md`. Rollout pattern:
    - `rsync` the `tools/yt-poller/` contents to the stack directory on your
-     compose host — e.g. `rsync -a tools/yt-poller/ user@YOUR_POLLER_HOST:/path/to/your/stack`.
+     compose host — e.g. `rsync -a --exclude=node_modules tools/yt-poller/ user@YOUR_POLLER_HOST:/path/to/your/stack`.
+     The exclude matters: a bare `rsync -a` also syncs your local (gitignored)
+     `node_modules` into the host's — cross-platform-built modules clobbering
+     the host's own, harmless to the Docker build (the Dockerfile's `COPY`
+     never touches it) but wrong for the host-level "local `node poller.mjs`"
+     debug path (2026-08-17 incident).
      This is the exclusive deployment path; no other route (manual SSH edits,
      `docker cp`, editing via a stack-management UI's own file editor) is
      valid.

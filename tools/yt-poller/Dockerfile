@@ -4,5 +4,5 @@ WORKDIR /app
 COPY package.json package-lock.json ./
 COPY patches ./patches
 RUN npm ci --omit=dev
-COPY poller.mjs normalize.mjs recovery.mjs retry-queue.mjs capture.mjs yt-counts.mjs ./
+COPY poller.mjs normalize.mjs recovery.mjs retry-queue.mjs capture.mjs yt-counts.mjs rediscovery.mjs ./
 CMD ["node", "poller.mjs"]

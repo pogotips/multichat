@@ -90,3 +90,183 @@ describe('zombie watchdog: no-false-fire (idle/no session)', () => {
     expect(fireCount).toBe(0);
   });
 });
+
+// --- round-3 audit: liveness selects the threshold, it never suppresses ---
+// (see the plan doc's BLOCKING section — suppressing the watchdog on
+// not_live was the first-pass design and was rejected: it's one of only two
+// paths back to a fresh fetchLivePage() call, and a rescheduled-but-
+// undeleted waiting room produces no errors, so suppression would strand the
+// poller on a dead continuation with no way out.)
+//
+// Reimplemented inline, quoted from poller.mjs's setInterval body (same
+// no-export rationale as above). Note REFINEMENT 3: reaching the not_live
+// threshold no longer fires 'yt_rediscovery' directly — it calls
+// runRediscoveryProbe(), which is itself gated/tested separately in
+// rediscovery.test.mjs (spacing, single-flight, conditional teardown). What
+// this file tests is strictly the threshold-selection layer: WHICH cadence
+// applies and WHICH path (probe-triggering vs the zombie backstop) gets
+// taken, not the probe's own internals.
+//
+//   const watchdogThresholdCycles = !WATCHDOG_LIVENESS_GATE
+//     ? LEGACY_ZOMBIE_WATCHDOG_CYCLES
+//     : liveness === 'not_live' ? REDISCOVERY_CYCLES : ZOMBIE_WATCHDOG_CYCLES;
+//   if (liveChatSessionActive) {
+//     if (cycleFetched === 0) {
+//       zeroStreak++;
+//       if (zeroStreak >= watchdogThresholdCycles) {
+//         zeroStreak = 0;
+//         if (WATCHDOG_LIVENESS_GATE && liveness === 'not_live') {
+//           onTriggered('yt_rediscovery'); // runRediscoveryProbe() in the real code
+//         } else {
+//           onTriggered('zombie_watchdog_reconnect');
+//         }
+//       }
+//     } else {
+//       zeroStreak = 0;
+//     }
+//   } else {
+//     zeroStreak = 0;
+//   }
+
+const HEARTBEAT_INTERVAL_MS = 15_000;
+const NEW_ZOMBIE_WATCHDOG_MIN = 15; // live/unknown/gate_off-legacy-exempt backstop
+const NEW_ZOMBIE_WATCHDOG_CYCLES = (NEW_ZOMBIE_WATCHDOG_MIN * 60_000) / HEARTBEAT_INTERVAL_MS; // 60
+const REDISCOVERY_MIN = 5; // not_live path — REFINEMENT 3: a check cadence, not a teardown cadence
+const REDISCOVERY_CYCLES = (REDISCOVERY_MIN * 60_000) / HEARTBEAT_INTERVAL_MS; // 20
+const LEGACY_ZOMBIE_WATCHDOG_MIN = 3; // WATCHDOG_LIVENESS_GATE=off (FIX 3)
+const LEGACY_ZOMBIE_WATCHDOG_CYCLES = (LEGACY_ZOMBIE_WATCHDOG_MIN * 60_000) / HEARTBEAT_INTERVAL_MS; // 12
+
+function watchdogTick(state, cycleFetched, liveness, gateOn, onTriggered) {
+  const watchdogThresholdCycles = !gateOn
+    ? LEGACY_ZOMBIE_WATCHDOG_CYCLES
+    : liveness === 'not_live'
+      ? REDISCOVERY_CYCLES
+      : NEW_ZOMBIE_WATCHDOG_CYCLES;
+  if (state.liveChatSessionActive) {
+    if (cycleFetched === 0) {
+      state.zeroStreak++;
+      if (state.zeroStreak >= watchdogThresholdCycles) {
+        state.zeroStreak = 0;
+        onTriggered(gateOn && liveness === 'not_live' ? 'yt_rediscovery' : 'zombie_watchdog_reconnect');
+      }
+    } else {
+      state.zeroStreak = 0;
+    }
+  } else {
+    state.zeroStreak = 0;
+  }
+}
+
+describe('round-3 audit: threshold selection by liveness (never suppression)', () => {
+  it('live + silent past 15 min ⇒ triggers the zombie_watchdog_reconnect path, not before', () => {
+    const state = { liveChatSessionActive: true, zeroStreak: 0 };
+    const triggered = [];
+    for (let i = 1; i <= NEW_ZOMBIE_WATCHDOG_CYCLES; i++) {
+      expect(triggered.length).toBe(0);
+      watchdogTick(state, 0, 'live', true, (ev) => triggered.push(ev));
+    }
+    expect(triggered).toEqual(['zombie_watchdog_reconnect']);
+  });
+
+  it('not_live + silent past REDISCOVERY_MIN (5 min) ⇒ triggers the yt_rediscovery path — this is a probe trigger, not an unconditional teardown or a suppression', () => {
+    const state = { liveChatSessionActive: true, zeroStreak: 0 };
+    const triggered = [];
+    for (let i = 1; i <= REDISCOVERY_CYCLES; i++) {
+      expect(triggered.length).toBe(0);
+      watchdogTick(state, 0, 'not_live', true, (ev) => triggered.push(ev));
+    }
+    expect(triggered).toEqual(['yt_rediscovery']);
+  });
+
+  it('not_live never reaches the 15-min threshold — it triggers at REDISCOVERY_MIN, proving a different cadence rather than a disabled gate', () => {
+    const state = { liveChatSessionActive: true, zeroStreak: 0 };
+    let triggerCount = 0;
+    for (let i = 1; i <= REDISCOVERY_CYCLES; i++) watchdogTick(state, 0, 'not_live', true, () => triggerCount++);
+    expect(triggerCount).toBe(1);
+    expect(NEW_ZOMBIE_WATCHDOG_CYCLES).toBeGreaterThan(REDISCOVERY_CYCLES); // sanity: cadences are genuinely different
+  });
+
+  it('liveness unknown takes the patient 15-min threshold — never fires early, never permanently disarmed (fail-open regression guard)', () => {
+    const state = { liveChatSessionActive: true, zeroStreak: 0 };
+    const fires = [];
+    for (let i = 1; i < NEW_ZOMBIE_WATCHDOG_CYCLES; i++) {
+      watchdogTick(state, 0, 'unknown', true, (ev) => fires.push(ev));
+    }
+    expect(fires).toEqual([]); // not yet at 60
+    watchdogTick(state, 0, 'unknown', true, (ev) => fires.push(ev));
+    expect(fires).toEqual(['zombie_watchdog_reconnect']); // fires at 60, same as 'live'
+  });
+
+  it('WATCHDOG_LIVENESS_GATE=off ⇒ single 3-min legacy threshold regardless of liveness (FIX 3 kill switch)', () => {
+    const state = { liveChatSessionActive: true, zeroStreak: 0 };
+    const fires = [];
+    for (let i = 1; i <= LEGACY_ZOMBIE_WATCHDOG_CYCLES; i++) {
+      expect(fires.length).toBe(0);
+      watchdogTick(state, 0, 'not_live', false, (ev) => fires.push(ev)); // liveness says not_live, gate is off
+    }
+    // Byte-identical to pre-audit behavior: always zombie_watchdog_reconnect,
+    // always at the legacy cadence, liveness value ignored entirely.
+    expect(fires).toEqual(['zombie_watchdog_reconnect']);
+  });
+
+  it('synthetic stuck continuation: live, fetched pinned 0 past 15 min ⇒ still fires with the gate in place (proves "correctly gated" ≠ "quietly disarmed")', () => {
+    const state = { liveChatSessionActive: true, zeroStreak: 0 };
+    let fireCount = 0;
+    for (let cycle = 1; cycle <= NEW_ZOMBIE_WATCHDOG_CYCLES * 3; cycle++) {
+      watchdogTick(state, 0, 'live', true, () => fireCount++);
+    }
+    // Fires once per full threshold period, never zero: 3 full periods ⇒ 3 fires.
+    expect(fireCount).toBe(3);
+  });
+
+  it('BLOCKING (b) regression: a stale never-started waiting room (repeated not_live, zero errors) still gets probed within REDISCOVERY_MIN, never strands the poller with no rediscovery path at all', () => {
+    const state = { liveChatSessionActive: true, zeroStreak: 0 };
+    let triggerCount = 0;
+    // Simulate the burst-5 shape: liveness reads not_live every cycle,
+    // nothing ever errors (MAX_CONSECUTIVE_ERRORS never trips per the
+    // BLOCKING analysis), fetched stays 0 the whole time. This layer only
+    // asserts the rediscovery PATH is reached on schedule — whether the
+    // probe then actually tears the session down is rediscovery.test.mjs's
+    // job (it won't, here: check-then-act only tears down on a changed
+    // videoId, which this scenario by definition never has).
+    for (let cycle = 1; cycle <= REDISCOVERY_CYCLES; cycle++) {
+      watchdogTick(state, 0, 'not_live', true, () => triggerCount++);
+    }
+    expect(triggerCount).toBe(1); // rediscovery path reached — the poller is never stuck with no way to notice a real change
+  });
+});
+
+// --- Change 2 / FIX 2: freshness bound ---
+// Reimplemented inline, quoted from poller.mjs's setInterval body:
+//
+//   const livenessFresh = Date.now() - lastLiveness.at <= LIVENESS_MAX_AGE_MS;
+//   const liveness = !WATCHDOG_LIVENESS_GATE ? 'gate_off' : livenessFresh ? lastLiveness.state : 'unknown';
+
+const LIVENESS_MAX_AGE_MS = 4 * HEARTBEAT_INTERVAL_MS; // 60_000
+
+function resolveLiveness(sampleState, sampleAt, now, gateOn) {
+  if (!gateOn) return 'gate_off';
+  const fresh = now - sampleAt <= LIVENESS_MAX_AGE_MS;
+  return fresh ? sampleState : 'unknown';
+}
+
+describe('round-3 audit: liveness freshness bound', () => {
+  it('a fresh not_live sample is trusted as-is', () => {
+    expect(resolveLiveness('not_live', 1_000_000, 1_000_000 + LIVENESS_MAX_AGE_MS, true)).toBe('not_live');
+  });
+
+  it('a stale sample reads unknown regardless of what it says — never trusted as a positive not_live signal', () => {
+    const now = 1_000_000 + LIVENESS_MAX_AGE_MS + 1; // 1ms past the boundary
+    expect(resolveLiveness('not_live', 1_000_000, now, true)).toBe('unknown');
+    expect(resolveLiveness('live', 1_000_000, now, true)).toBe('unknown');
+  });
+
+  it('a stale sample can only make the watchdog MORE patient, never hold it off (feeds into the 15-min path via unknown)', () => {
+    const now = 1_000_000 + LIVENESS_MAX_AGE_MS + 1;
+    const liveness = resolveLiveness('not_live', 1_000_000, now, true); // sample said not_live, but it's stale
+    const state = { liveChatSessionActive: true, zeroStreak: 0 };
+    const fires = [];
+    for (let i = 1; i < REDISCOVERY_CYCLES; i++) watchdogTick(state, 0, liveness, true, (ev) => fires.push(ev));
+    expect(fires).toEqual([]); // did NOT fire at the rediscovery cadence the stale sample would have implied
+  });
+});

@@ -46,4 +46,38 @@ describe('yt_poller_health log', () => {
     expect(logEvents(logSpy, 'yt_poller_health')).toHaveLength(2);
     logSpy.mockRestore();
   });
+
+  // ADD 4 (round-3 audit): additive fields from the poller's zombie-watchdog
+  // liveness gate — makes the next stall investigation answerable from this
+  // log line alone. Purely additive tests: the three cases above already use
+  // objectContaining, which tolerates the new keys without modification.
+  it('logs liveness/watchdogThresholdMin from a heartbeat body', async () => {
+    const { hub } = makeHub();
+    const logSpy = vi.spyOn(console, 'log').mockImplementation(() => {});
+    await hub.handleIngestYt(
+      heartbeatReq({ type: 'heartbeat', fetched: 3, lastMessageAgeSec: 42, liveness: 'not_live', watchdogThresholdMin: 2 }),
+    );
+    expect(logEvents(logSpy, 'yt_poller_health')).toEqual([
+      expect.objectContaining({ liveness: 'not_live', watchdogThresholdMin: 2 }),
+    ]);
+    logSpy.mockRestore();
+  });
+
+  it('logs null for liveness/watchdogThresholdMin when the poller omits them — the pre-poller-deploy state (ADD 4 sequencing: Worker ships first)', async () => {
+    const { hub } = makeHub();
+    const logSpy = vi.spyOn(console, 'log').mockImplementation(() => {});
+    await hub.handleIngestYt(heartbeatReq({ type: 'heartbeat', fetched: 3, lastMessageAgeSec: 42 }));
+    expect(logEvents(logSpy, 'yt_poller_health')).toEqual([
+      expect.objectContaining({ liveness: null, watchdogThresholdMin: null }),
+    ]);
+    logSpy.mockRestore();
+  });
+
+  it('rejects a non-string liveness value as null rather than logging garbage', async () => {
+    const { hub } = makeHub();
+    const logSpy = vi.spyOn(console, 'log').mockImplementation(() => {});
+    await hub.handleIngestYt(heartbeatReq({ type: 'heartbeat', liveness: 12345 }));
+    expect(logEvents(logSpy, 'yt_poller_health')).toEqual([expect.objectContaining({ liveness: null })]);
+    logSpy.mockRestore();
+  });
 });

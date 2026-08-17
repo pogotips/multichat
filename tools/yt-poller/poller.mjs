@@ -27,9 +27,19 @@ import { normalizeChatItem } from './normalize.mjs';
 import { classifyYtItem } from './recovery.mjs';
 import { enqueueRetry, drainBatch, isRetryable, RETRY_QUEUE_MAX, SEND_CONCURRENCY, nextAttempt } from './retry-queue.mjs';
 import { bumpCount, appendCapture, CAPTURE_DIR, CAPTURE_FILE } from './capture.mjs';
-import { createVideoIdTracker, fetchYtCounts } from './yt-counts.mjs';
+import { createVideoIdTracker, fetchYtVideoState } from './yt-counts.mjs';
+import { probeCurrentLiveId, createRediscoveryGate, resolveRediscoveryOutcome } from './rediscovery.mjs';
 
-const { YT_CHANNEL_ID, MULTICHAT_URL, MULTICHAT_INGEST_SECRET, YOUTUBE_API_KEY } = process.env;
+const { YT_CHANNEL_ID, MULTICHAT_URL, MULTICHAT_INGEST_SECRET, YOUTUBE_API_KEY, WATCHDOG_LIVENESS_GATE: WATCHDOG_LIVENESS_GATE_RAW } =
+  process.env;
+// round-3 audit kill switch (FIX 3): default on; set to the literal string
+// 'off' to fall back to the pre-liveness-gate behavior instantly via Dockge
+// (env edit + container recreate), no rebuild/rsync needed to recover from a
+// misbehaving gate mid-stream. Wired to the same "liveness unavailable" path
+// as no-API-key/no-videoId below — 'gate_off' is a fourth value alongside
+// 'live'/'not_live'/'unknown' so heartbeat consumers can tell "off on
+// purpose" from "couldn't determine liveness this cycle".
+const WATCHDOG_LIVENESS_GATE = WATCHDOG_LIVENESS_GATE_RAW !== 'off';
 
 if (!YT_CHANNEL_ID || !MULTICHAT_URL || !MULTICHAT_INGEST_SECRET) {
   console.error('Missing required env: YT_CHANNEL_ID, MULTICHAT_URL, MULTICHAT_INGEST_SECRET');
@@ -97,6 +107,17 @@ let retryBackoffMs = RETRY_BACKOFF_INITIAL_MS;
 // drainBatch), never back through post(), so they can't inflate this past
 // cycleFetched. cycleFailed counts sendOnce failures and does include retry
 // re-attempts, since a retry storm this cycle is itself useful signal.
+//
+// Change 3 (round-3 audit — do NOT rename `fetched`, it ships in the
+// /ingest/yt heartbeat body and is logged Worker-side as
+// ev:'yt_poller_health'; renaming breaks saved observability queries and
+// opens a poller/Worker version-skew window): cycleFetched counts raw
+// youtube-chat library 'chat' events PRE-DEDUPE, including the history
+// re-burst a fresh reconnect's continuation re-serves — it is not "messages
+// delivered". `cyclePosted`/`posted` is the field that answers that
+// question; two rounds of this audit misread fetched:0 as "chat is dead"
+// when it is also the expected steady state for live-but-silent chat. See
+// README.md for the same distinction.
 let cycleFetched = 0;
 let cyclePosted = 0;
 let cycleFailed = 0;
@@ -111,12 +132,89 @@ let lastChatAt = null;           // ms epoch of the last real chat item, across 
 let liveChatSessionActive = false; // true only between a session's 'start' and 'end'
 let currentLiveChat = null;        // current run()'s LiveChat instance, for the watchdog's forced-reconnect
 let zeroStreak = 0;                // consecutive ungated heartbeat cycles with cycleFetched===0 while a session is active
-// 3 min conservative: the 2026-08-05 quiet stretch had isolated zero-message
-// minutes (00:34, 00:36, 00:41) interspersed with 1-3 msg/min minutes, never
-// three *consecutive* zero minutes — this threshold would not have false-fired
-// that night.
-const ZOMBIE_WATCHDOG_MIN = 3;
-const ZOMBIE_WATCHDOG_CYCLES = (ZOMBIE_WATCHDOG_MIN * 60_000) / 15_000; // heartbeat cadence, 15s
+// Bumped on every 'start' — lets an in-flight rediscovery probe (up to 8s)
+// notice a session swap happened underneath it and discard its own result
+// instead of tearing down a session it was never actually measuring.
+let sessionGeneration = 0;
+// The heartbeat interval and the counts/liveness poll are the same tick —
+// see the setInterval below. Every other *_MS/*_CYCLES constant here is
+// derived from this one so they can never drift out of sync with the actual
+// cadence (FIX 2 of the round-3 audit: an assumed-but-unverified interval
+// would silently age out every liveness sample and turn the gate into a
+// no-op). Guarded by a source-text regression test
+// (test/heartbeat-interval.test.mjs) rather than a runtime assertion, since
+// poller.mjs isn't import-safe in a test process (see zombie-watchdog.test.mjs).
+const HEARTBEAT_INTERVAL_MS = 15_000;
+
+// Round-3 audit (YT "stall" burst re-audit): the original single 3-min
+// threshold false-fired on 254/279 observed watchdog events because
+// liveChatSessionActive only means "a chat session attached", which YouTube
+// grants for waiting rooms that never go live — see the plan doc. Liveness
+// (from fetchYtVideoState, below) now SELECTS which threshold zeroStreak is
+// compared against; it never suppresses the watchdog outright. Suppressing
+// on `not_live` was the first-pass design and was rejected: the watchdog and
+// MAX_CONSECUTIVE_ERRORS below are the *only* two paths back to a fresh
+// fetchLivePage() call, and a rescheduled-but-undeleted waiting room
+// produces no errors — suppression would leave the poller polling a dead
+// continuation with no way out, losing chat for an entire subsequent stream.
+//
+// ZOMBIE_WATCHDOG_MIN (15 min) — the live/unknown backstop, i.e. "a real
+// stuck continuation on a broadcast that might actually have chat to lose".
+// `unknown` deliberately takes this same patient threshold, never the
+// rediscovery one, so an ambiguous liveness read can only ever make the
+// watchdog *more* patient (fail open). Derived from a full week's measured
+// quiet-tail inside genuinely live chat: longest observed gap between
+// posted>0 heartbeat cycles was 540s (9m00s); 15 min is 1.67x that.
+const ZOMBIE_WATCHDOG_MIN = 15;
+const ZOMBIE_WATCHDOG_CYCLES = (ZOMBIE_WATCHDOG_MIN * 60_000) / HEARTBEAT_INTERVAL_MS;
+
+// REDISCOVERY_MIN (5 min) — the not_live path: liveness has positively
+// confirmed there's no broadcast to lose chat from. REFINEMENT 3: this is
+// now a CHECK cadence, not a teardown cadence — every REDISCOVERY_MIN, a
+// throwaway probe (rediscovery.mjs) re-resolves the channel's current live
+// videoId and compares it to the one this run() is holding; the real
+// session is only ever torn down if that id genuinely changed. First-pass
+// value went 12 -> 2 -> 5 across three revisions of this same audit: 12 was
+// too patient (a real new stream could lose 12 minutes of its opening
+// chat); 2 priced only the dedupe/reattach cost a full teardown-every-cycle
+// design carried and ignored the OTHER cost — the probe itself still
+// spends one fetchLivePage call every cycle regardless of outcome, and
+// sustained scraping is the one failure mode that could get discovery
+// throttled or blocked outright (which costs an entire stream, not a few
+// minutes of one). check-then-act (below) fully retires the dedupe cost;
+// it does nothing for the scrape-frequency cost, which is why this stayed
+// at 5 rather than returning to 2 once check-then-act became reachable.
+// Kept well below ZOMBIE_WATCHDOG_MIN so a stale waiting room is never more
+// patient than a confirmed-live session. Logged under its own event name,
+// yt_rediscovery, never zombie_watchdog_reconnect — this path is
+// expected/near-zero-cost in the common case, not a health signal, and
+// conflating the two was the original complaint this audit was chasing.
+const REDISCOVERY_MIN = 5;
+const REDISCOVERY_CYCLES = (REDISCOVERY_MIN * 60_000) / HEARTBEAT_INTERVAL_MS;
+// Independent cadence + single-flight gate for the probe itself (HIGH
+// finding, round-3 audit review round): the old design self-reset via a
+// full teardown on every fire ('end' -> fresh run() -> zeroStreak restart).
+// check-then-act removed that teardown in the common case, so nothing
+// else guaranteed probe spacing if the zeroStreak reset around the
+// no-teardown path were ever wrong in a future edit — this gate makes
+// spacing correct on its own, independent of that bookkeeping.
+const rediscoveryGate = createRediscoveryGate({ minIntervalMs: REDISCOVERY_MIN * 60_000 });
+
+// Legacy single threshold, used only when WATCHDOG_LIVENESS_GATE=off (FIX 3)
+// — byte-for-byte the pre-round-3-audit behavior, so flipping the kill
+// switch is a true rollback, not a different design at a different number.
+const LEGACY_ZOMBIE_WATCHDOG_MIN = 3;
+const LEGACY_ZOMBIE_WATCHDOG_CYCLES = (LEGACY_ZOMBIE_WATCHDOG_MIN * 60_000) / HEARTBEAT_INTERVAL_MS;
+
+// Change 2 / FIX 2: a liveness sample older than this reads as 'unknown'
+// rather than being trusted — since 'unknown' always takes the patient
+// 15-min path (never a suppression), a frozen or cached sample can only ever
+// make the watchdog MORE patient, never hold it off indefinitely. In the
+// current wiring the sample is always produced and consumed in the same
+// setInterval tick (age ~0), so this is defense-in-depth against a future
+// refactor that decouples the two, not a control that fires today.
+const LIVENESS_MAX_AGE_MS = 4 * HEARTBEAT_INTERVAL_MS;
+let lastLiveness = { state: 'unknown', at: 0 };
 
 // Ingest-tail RTT tracking (Phase 3) — RTT is
 // measured entirely on this process's own clock (performance.now(), never
@@ -273,7 +371,14 @@ async function run() {
   let lastErrorMsg = null; // last error seen this session — routes the reconnect cadence
 
   liveChat.on('start', (liveId) => {
+    sessionGeneration++; // new session — any in-flight probe from the PREVIOUS one is now stale
     videoIdTracker.onStart(liveId); // youtube-chat resolves this itself — never a search.list call
+    // ADD 3 (round-3 audit): the resolved videoId was never logged anywhere,
+    // which is why the burst-5 investigation couldn't identify which video
+    // the poller had been stuck on for 4 hours — this has now blocked two
+    // rounds of investigation. One line per session (not per cycle), so it
+    // stays bounded.
+    console.log(JSON.stringify({ ev: 'yt_session_start', videoId: liveId || null }));
     if (isReconnect) ephemeral = { ...ephemeral, armedAt: Date.now() };
     liveChatSessionActive = true;
     zeroStreak = 0; // clean slate for the new session
@@ -344,9 +449,16 @@ async function run() {
     }
   });
 
-  liveChat.on('end', () => {
+  liveChat.on('end', (reason) => {
+    // ADD 3: capture the videoId before onEnd() clears it, and log the
+    // actual `reason` stop() was called with (library passes it straight
+    // through as the 'end' payload) rather than re-deriving it from
+    // lastErrorMsg, which wouldn't carry a forced-stop reason like "zombie
+    // watchdog: sustained fetched=0" or "too many consecutive errors".
+    const endedVideoId = videoIdTracker.get();
     videoIdTracker.onEnd(); // session's gone — stop spending quota on an ended stream's stats
     liveChatSessionActive = false; // idle until the next 'start' — zombie watchdog must not count offline silence
+    console.log(JSON.stringify({ ev: 'yt_session_end', videoId: endedVideoId, reason: reason || null }));
     console.error('live chat ended (stream offline, or forced reconnect after errors) — retrying');
     scheduleReconnect(isStreamNotFound(lastErrorMsg) ? NOT_FOUND_BACKOFF_MS : undefined);
   });
@@ -364,31 +476,116 @@ async function run() {
   }
 }
 
+// REFINEMENT 3: check-then-act for the not_live watchdog path. Fire-and-
+// forget from the heartbeat tick (never awaited there) — the probe can take
+// up to DEFAULT_PROBE_TIMEOUT_MS (8s), and blocking the 15s heartbeat cycle
+// on it would risk running into the next tick; the probe's own outcome is
+// logged independently whenever it actually resolves. Uses a throwaway
+// LiveChat instance (rediscovery.mjs) — it emits ONLY its own 'start'/
+// 'error' events, never touches videoIdTracker or currentLiveChat directly,
+// and so can never itself produce a yt_session_start/yt_session_end line;
+// those remain bound exclusively to the real session's own handlers in
+// run(), above.
+async function runRediscoveryProbe() {
+  const gate = rediscoveryGate.tryStart();
+  if (!gate.allowed) {
+    console.log(JSON.stringify({ ev: 'yt_rediscovery', liveness: 'not_live', changed: false, outcome: `skipped_${gate.reason}` }));
+    return;
+  }
+  try {
+    const generationAtStart = sessionGeneration;
+    const probedVideoId = await probeCurrentLiveId(LiveChat, YT_CHANNEL_ID);
+    // Re-read AFTER the await, not a pre-probe snapshot — see
+    // resolveRediscoveryOutcome's comment in rediscovery.mjs for why: the
+    // real session can swap (end + new start) during this up-to-8s wait, and
+    // a stale comparison would tear down the NEW, healthy session instead of
+    // the one the probe actually started against.
+    const heldVideoId = videoIdTracker.get();
+    const outcome = resolveRediscoveryOutcome({
+      generationAtStart,
+      currentGeneration: sessionGeneration,
+      heldVideoId,
+      probedVideoId,
+    });
+    if (outcome.action === 'discarded') {
+      console.log(JSON.stringify({ ev: 'yt_rediscovery', liveness: 'not_live', changed: false, discarded: true, probedVideoId: probedVideoId || null }));
+      return;
+    }
+    if (outcome.action === 'no_session') {
+      console.log(JSON.stringify({ ev: 'yt_rediscovery', liveness: 'not_live', changed: false, outcome: 'skipped_no_session', probedVideoId: probedVideoId || null }));
+      return;
+    }
+    const changed = outcome.action === 'changed';
+    console.log(JSON.stringify({ ev: 'yt_rediscovery', liveness: 'not_live', changed, probedVideoId: probedVideoId || null }));
+    if (changed) {
+      currentLiveChat?.stop('liveness rediscovery: videoId changed, sustained fetched=0');
+    }
+  } finally {
+    gate.release();
+  }
+}
+
 // Proves the poller container itself is alive, independent of whether a
 // live chat session is currently attached — multichat's status chip uses this.
 // Counts ride the same payload when a live session holds a current video id;
-// fetchYtCounts resolves to null (no fields added) whenever it doesn't, so a
-// heartbeat during an offline stretch is byte-for-byte what it was before
-// this feature existed. This interval is NOT live-gated — it runs on this
-// same 15s cadence whether a stream is live or not, so silence in the
-// poller_heartbeat log below always means the poller process itself died,
-// never just "stream is offline".
+// fetchYtVideoState's counts field resolves to null (no fields added)
+// whenever it doesn't, so a heartbeat during an offline stretch is
+// byte-for-byte what it was before this feature existed. This interval is
+// NOT live-gated — it runs on this same 15s cadence whether a stream is live
+// or not, so silence in the poller_heartbeat log below always means the
+// poller process itself died, never just "stream is offline".
 setInterval(async () => {
   const videoId = videoIdTracker.get();
-  const counts = await fetchYtCounts(videoId, YOUTUBE_API_KEY);
-  // Classified here, not inside fetchYtCounts, so its heartbeat payload
-  // contract (null = zero fields, never a special case) stays untouched —
-  // zero ingest surface change. skip = feature not configured/not live (both
-  // fetchYtCounts no-op on the same check); err = key+videoId present but the
-  // call still came back empty (quota death, revoked key, malformed
-  // response) — previously indistinguishable from "not live" and silent.
+  // Change 1: single videos.list call feeds both the topbar counts (below,
+  // unchanged output — see ADD 5 in the plan doc) and the watchdog's
+  // liveness gate. Never call fetchYtCounts here too — that would spend a
+  // second quota unit for data this call already carries.
+  const videoState = await fetchYtVideoState(videoId, YOUTUBE_API_KEY);
+  const counts = videoState.counts;
+  lastLiveness = videoState.liveness;
+  // Classified here, not inside fetchYtVideoState, so its heartbeat payload
+  // contract (counts: null = zero fields, never a special case) stays
+  // untouched — zero ingest surface change vs. before this feature existed.
+  // skip = feature not configured/not live; err = key+videoId present but
+  // the call still came back with no usable counts (quota death, revoked
+  // key, malformed response) — previously indistinguishable from "not live"
+  // and silent.
   const countsOutcome = (!YOUTUBE_API_KEY || !videoId) ? 'skip' : (counts ? 'ok' : 'err');
   const lastMessageAgeSec = lastChatAt ? Math.round((Date.now() - lastChatAt) / 1000) : null;
+
+  // FIX 2 / Change 2: a stale sample is never trusted as a positive not_live
+  // read — it can only make the watchdog MORE patient (route to 'unknown'),
+  // never hold it off. FIX 3: the kill switch reports its own 'gate_off'
+  // value distinct from 'unknown', so heartbeat consumers can tell "off on
+  // purpose" from "couldn't classify this cycle".
+  const livenessFresh = Date.now() - lastLiveness.at <= LIVENESS_MAX_AGE_MS;
+  const liveness = !WATCHDOG_LIVENESS_GATE ? 'gate_off' : livenessFresh ? lastLiveness.state : 'unknown';
+
+  // BLOCKING (round-3 audit): liveness SELECTS a threshold, it never
+  // suppresses — see the constants block above for why. not_live gets the
+  // cheap rediscovery cadence; live/unknown/gate_off all get the patient
+  // backstop (gate_off uses the pre-audit legacy constant so the kill switch
+  // is a true rollback).
+  const watchdogThresholdMin = !WATCHDOG_LIVENESS_GATE
+    ? LEGACY_ZOMBIE_WATCHDOG_MIN
+    : liveness === 'not_live'
+      ? REDISCOVERY_MIN
+      : ZOMBIE_WATCHDOG_MIN;
+  const watchdogThresholdCycles = !WATCHDOG_LIVENESS_GATE
+    ? LEGACY_ZOMBIE_WATCHDOG_CYCLES
+    : liveness === 'not_live'
+      ? REDISCOVERY_CYCLES
+      : ZOMBIE_WATCHDOG_CYCLES;
+
   const status = await post({
     type: 'heartbeat',
     unknownRenderers: { ...unknownRendererCounts },
     fetched: cycleFetched,
     lastMessageAgeSec,
+    // ADD 4: additive only, no renames — makes the next audit answerable
+    // from the heartbeat alone instead of a second YouTube API cross-check.
+    liveness,
+    watchdogThresholdMin,
     ...(counts || {}),
   });
   console.log(JSON.stringify({
@@ -398,26 +595,38 @@ setInterval(async () => {
     failed: cycleFailed,
     status,
     counts: countsOutcome,
+    liveness,
+    watchdogThresholdMin,
     rtt_buckets: cycleRttBuckets,
     rtt_max_ms: Math.round(cycleRttMaxMs),
     rtt_count: cycleRttCount,
   }));
-  // forensics rec 4: empty-200 zombie watchdog. Gated on liveChatSessionActive
-  // — this heartbeat interval is deliberately NOT live-gated (see comment
-  // above), so cycleFetched===0 is the normal, permanent state whenever
-  // there's no stream at all; ungated, this would force a "reconnect" every
-  // ZOMBIE_WATCHDOG_MIN minutes all night, every night, with no stream up.
-  // Both a real stuck-continuation zombie and genuinely dead-quiet chat look
-  // identical from fetched=0 alone — forcing a continuation refresh is
-  // cheap/safe either way (same path real errors already use), so this
-  // doesn't need to (and can't) tell them apart.
+  // forensics rec 4 + round-3 audit: empty-200 zombie watchdog, threshold
+  // now liveness-selected (see constants block). Gated on
+  // liveChatSessionActive — this heartbeat interval is deliberately NOT
+  // live-gated (see comment above), so cycleFetched===0 is the normal,
+  // permanent state whenever there's no stream at all; ungated, this would
+  // force a "reconnect" on a fixed cadence all night, every night, with no
+  // stream up.
   if (liveChatSessionActive) {
     if (cycleFetched === 0) {
       zeroStreak++;
-      if (zeroStreak >= ZOMBIE_WATCHDOG_CYCLES) {
-        console.log(JSON.stringify({ ev: 'zombie_watchdog_reconnect', zeroStreakMin: ZOMBIE_WATCHDOG_MIN }));
-        zeroStreak = 0; // avoid a second immediate fire before 'end' flips liveChatSessionActive
-        currentLiveChat?.stop('zombie watchdog: sustained fetched=0');
+      if (zeroStreak >= watchdogThresholdCycles) {
+        zeroStreak = 0; // avoid re-checking every tick — see rediscoveryGate below for the independent, authoritative spacing guarantee
+        // REFINEMENT 1: not_live rediscovery is expected, near-zero-cost in
+        // the common case, not a health problem — it gets its own event so
+        // it never pollutes zombie_watchdog_reconnect, which stays reserved
+        // for "something might actually be wrong".
+        if (WATCHDOG_LIVENESS_GATE && liveness === 'not_live') {
+          // fire-and-forget: logs its own outcome, tears down currentLiveChat
+          // itself only if the videoId genuinely changed. runRediscoveryProbe
+          // is not expected to ever reject (probeCurrentLiveId never does),
+          // but this must never surface as an unhandled rejection regardless.
+          runRediscoveryProbe().catch((err) => console.error(`rediscovery probe failed: ${err.message}`));
+        } else {
+          console.log(JSON.stringify({ ev: 'zombie_watchdog_reconnect', zeroStreakMin: watchdogThresholdMin, liveness }));
+          currentLiveChat?.stop('zombie watchdog: sustained fetched=0');
+        }
       }
     } else {
       zeroStreak = 0;
@@ -431,7 +640,7 @@ setInterval(async () => {
   cycleRttBuckets = freshRttBuckets();
   cycleRttMaxMs = 0;
   cycleRttCount = 0;
-}, 15_000);
+}, HEARTBEAT_INTERVAL_MS);
 
 process.on('SIGTERM', () => process.exit(0));
 process.on('SIGINT', () => process.exit(0));
