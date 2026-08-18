@@ -125,7 +125,7 @@ let cycleFetched = 0;
 let cyclePosted = 0;
 let cycleFailed = 0;
 
-// forensics rec 4 (YT_FEED_LOSS_FORENSICS_2026-08-05.md): heartbeat-payload
+// forensics rec 4 (internal doc, 2026-08-05): heartbeat-payload
 // health fields + the empty-200 zombie watchdog. lastChatAt/liveChatSessionActive/
 // currentLiveChat are module-level (not run()-scoped) because the heartbeat
 // setInterval below is itself module-level and outlives any single run()

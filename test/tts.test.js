@@ -198,8 +198,8 @@ describe('enqueueCapped', () => {
 
 // ── cleanSpokenName — Step1 only (trailing digits, absorbing one preceding
 // separator). Step2 (full trailing separator-segment strip, e.g. darc-ttv ->
-// darc) is deferred and deliberately NOT implemented here — see
-// TTS_NAME_CLEANUP_DRYRUN_2026-08-05.md.
+// darc) is deferred and deliberately NOT implemented here — see the
+// internal dry-run notes (2026-08-05).
 describe('cleanSpokenName', () => {
   it('strips trailing digits stuck directly to the name', () => {
     expect(cleanSpokenName('PikachuFan2012')).toBe('PikachuFan');

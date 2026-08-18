@@ -1,4 +1,4 @@
-// YT_FEED_LOSS_FORENSICS_2026-08-05.md rec 1: a periodic client stale-watchdog,
+// Internal forensics doc (2026-08-05), rec 1: a periodic client stale-watchdog,
 // gated on isClientStale — the same predicate the visibilitychange check
 // already used. The forensics doc's central risk here is quiet-but-live YT
 // chat being mistaken for a stale connection and forcing needless

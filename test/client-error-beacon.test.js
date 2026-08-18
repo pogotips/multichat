@@ -1,4 +1,4 @@
-// YT_FEED_LOSS_FORENSICS_2026-08-05.md rec 5: a minimal client error beacon,
+// Internal forensics doc (2026-08-05), rec 5: a minimal client error beacon,
 // gated on the same view token /events already uses (never an open
 // endpoint), with server-side size/field caps and no echo of the token
 // itself into the log line.

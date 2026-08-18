@@ -367,8 +367,8 @@ chat "Power-ups" (Gigantify an Emote, Message Effect, On-Screen Celebration)
 and broadcaster-defined Custom Power-ups (still Twitch BETA) don't set any
 documented IRC tag carrying a price — `channel.bits.use` v1, Twitch's
 all-purpose "any Bits use" event, is the only documented way to get gold-row
-treatment (a real bits amount) for any of them. Full investigation trail:
-`GIGANTIFY_INVESTIGATION_2026-08-01.md` in the worker root. The event's
+treatment (a real bits amount) for any of them. Full investigation trail in
+an internal doc (2026-08-01). The event's
 `type` field is `cheer` | `power_up` | `custom_power_up`; only `cheer` is
 dropped before mapping — IRC's own `bits` tag already owns cheer rows, and
 this event would otherwise double-render every one. `power_up` (all 3
@@ -446,7 +446,7 @@ This replaced an earlier `ring.find()` (oldest-match) selector: picking
 "first found" rather than "closest in time" meant a same-login
 spam-then-gigantify sequence ("Kappa … Kappa … *gigantifies Kappa*") could
 supersede the earlier, unrelated real message instead of the actual
-gigantify PRIVMSG (see `PR41_GIGANTIFY_REVIEW_2026-08-08.md` finding F1). Zero
+gigantify PRIVMSG (see PR #41's own review finding F1, 2026-08-08). Zero
 candidates in the window: IRC hasn't delivered the PRIVMSG yet (or never
 will) — buffer `{login, emoteName, emoteId, ts}` in
 `ChatHub.pendingGigantifies` (bounded to `PENDING_MOD_MAX`) for
@@ -619,7 +619,7 @@ is why the flag defaults conservatively and why this window is accepted
 rather than engineered away.
 
 *YouTube stays out of scope* — the anonymous YT feed carries no actor field
-(`CAPTURE_AUDIT_2026-08-05.md`), and existing YT deletion handling is already
+(per an internal audit, 2026-08-05), and existing YT deletion handling is already
 classified; this is a Twitch-only feature end to end.
 
 **No rate limit on `/eventsub/callback` (accepted).** It's the only public
@@ -736,8 +736,8 @@ retries rather than an attacker. Accepted as-is rather than adding a
     the spoken name may differ from the displayed one (`msg.user` itself is
     never touched). Exists solely to accumulate real separator-name cases for
     evaluating Step2 (a full trailing separator-segment strip, e.g.
-    `darc-ttv` -> `darc`), which stays deferred/unimplemented — see
-    `TTS_NAME_CLEANUP_DRYRUN_2026-08-05.md`.
+    `darc-ttv` -> `darc`), which stays deferred/unimplemented — see the
+    internal dry-run notes (2026-08-05).
   - Cross-referencing `tw_close`/`tw_open` against `sse_close`/`sse_open` by
     timestamp resolves "Twitch disconnects often" reports: IRC staying up
     while SSE drops points at the viewer's phone/LTE; both dropping together
@@ -1060,8 +1060,47 @@ All client behavior lives in the inline `<script>` inside `PAGE_HTML`
      (`deployed/multichat-yt-poller`, moved forward on every successful
      rollout) so a bad rollout can be rolled back by re-rsyncing that tagged
      commit and rebuilding, rather than by hand-reconstructing what was
-     running.
-4. **Rotating `MULTICHAT_INGEST_SECRET`** — same value must land on both the
+     running. This is the durable fallback (works even if the Docker image
+     tag below has since been pruned) — for the fast path actually used in
+     practice (retag + recreate, no rebuild), see step 4.
+4. **Rollback** — both stages have a same-day tag pair (`rollback-YYYY-MM-DD`,
+   pointing at the PREVIOUS deploy's commit/image, cut *before* the new
+   deploy per the tag law in step 2/3 above). Literal commands, not just the
+   tag convention:
+   - **Worker, fast path** (traffic-split rollback, no redeploy needed): find
+     the prior Version ID — `wrangler versions list --config wrangler.jsonc`
+     (the one just before today's, timestamp-ordered) — then
+     `wrangler versions deploy <prior-version-id>@100 --config wrangler.jsonc`
+     to send 100% of traffic back to it. This is the CLI's actual rollback
+     primitive (there is no `wrangler rollback`/`wrangler versions rollback`
+     subcommand as of wrangler 4.x — confirmed via `--help`, don't guess the
+     name under pressure).
+   - **Worker, full path** (if the fast path's version has since aged out of
+     the 10-most-recent list `wrangler versions list` shows): from a scratch
+     worktree pinned to the `rollback-YYYY-MM-DD` git tag, copy in
+     `wrangler.jsonc` (gitignored, copy from any existing checkout — see the
+     deploy-from-scratch-worktree pattern in step 2), then
+     `wrangler deploy --config wrangler.jsonc`.
+   - **Poller**: `ssh <user>@<poller-host>`, then —
+     1. `docker tag multichat-yt-poller:rollback-YYYY-MM-DD multichat-yt-poller-multichat-yt-poller:latest`
+        (compose builds locally with no explicit `image:` line, so the
+        rollback is a retag onto compose's own computed image name, not a
+        registry pull).
+     2. `cd` to the stack directory, `docker compose up -d --force-recreate`
+        (recreates the container from the retagged image — does NOT
+        rebuild, since `up` without `--build` trusts whatever's already
+        tagged).
+     3. Verify before declaring it done: `docker exec <container>
+        grep -c <sentinel-or-field> node_modules/youtube-chat/dist/parser.js`
+        for whatever patch state the rollback target should have, plus a
+        smoke ingest POST from inside the container (§8-style, secret read
+        from the container's own env, never typed by hand).
+   - **After either rollback**: move `deployed/<worker>` back —
+     `git tag -f deployed/multichat rollback-YYYY-MM-DD^{}` (or the literal
+     commit SHA) `&& git push -f origin deployed/multichat` — so the next
+     session's diff-review baseline (step 1) reflects what's actually
+     running, not the deploy that got rolled back.
+5. **Rotating `MULTICHAT_INGEST_SECRET`** — same value must land on both the
    Worker and the poller; unlike `EVENTSUB_SECRET` this is an operational
    secret swap, not a code deploy, so the diff-review step above doesn't gate it.
    **Rotate off-stream only**: `wrangler secret put` publishes a new Worker
@@ -1186,5 +1225,5 @@ All client behavior lives in the inline `<script>` inside `PAGE_HTML`
   for its entire lifetime — not refreshed until the DO itself is evicted and
   recreated. Didn't cause a visible problem in the observed incident only
   because zero subscription creates happened to 403 during the affected
-  DOs' lifetimes. See `POST_STREAM_AUDIT_2026-08-01.md` for the full
+  DOs' lifetimes. See the internal post-stream audit (2026-08-01) for the full
   incident writeup.

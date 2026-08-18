@@ -310,8 +310,8 @@ describe.each([
 
 // dropClient() is the sole `this.clients.delete` site (verified structurally
 // below) — every removal path funnels through it and always logs sse_close
-// w/ reason. Closes the STREAM_AUDIT_2026-07-26 vanished-session question:
-// the gap there was DO-instance eviction (no controller left to log
+// w/ reason. Closes an internal audit's (2026-07-26) vanished-session
+// question: the gap there was DO-instance eviction (no controller left to log
 // against), not a missing log call on any of these four paths.
 describe('sse_close reason coverage per removal path', () => {
   it.each([
@@ -362,7 +362,7 @@ describe('sse_close reason coverage per removal path', () => {
   });
 });
 
-// YT_FEED_LOSS_FORENSICS_2026-08-05.md rec 0: nothing logged what a reaped
+// Internal forensics doc (2026-08-05), rec 0: nothing logged what a reaped
 // connection's backlog looked like, or what a replay actually resurrected vs.
 // what it was asked for. These close that gap.
 describe('sse_reap_backlog / sse_replay_result (forensics rec 0)', () => {

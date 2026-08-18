@@ -73,8 +73,8 @@ export const TTS_LABELS = {
 // recent can still fire. Shared by the client predicate and its test.
 export const EMIT_TTL_MS = 30 * 60_000;
 
-// Spoken-name cleanup for TTS only — see TTS_NAME_CLEANUP_DRYRUN_2026-08-05.md
-// for the approved regex and the deferred Step2 (separator-segment strip,
+// Spoken-name cleanup for TTS only — see the internal dry-run notes
+// (2026-08-05) for the approved regex and the deferred Step2 (separator-segment strip,
 // e.g. darc-ttv -> darc) this deliberately does NOT implement yet. Strips a
 // trailing digit run, absorbing one immediately-preceding `_`/`-` in the same
 // match so `cool_guy_99` -> `cool_guy` rather than leaving a dangling

@@ -1488,7 +1488,7 @@ describe('ChatHub gigantify double-display suppression', () => {
   });
 
   // ── F1 regression: multi-candidate wrong-victim selection ─────────────────
-  // See PR41_GIGANTIFY_REVIEW_2026-08-08.md finding F1 — the original
+  // See PR #41's own review finding F1 (2026-08-08) — the original
   // ring.find() picked the OLDEST same-login token match, which eats an
   // unrelated earlier message whenever a spam-then-gigantify sequence
   // ("Kappa … Kappa … *gigantifies Kappa*") puts more than one candidate in

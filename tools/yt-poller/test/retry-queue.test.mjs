@@ -36,7 +36,7 @@ describe('nextAttempt', () => {
   });
 });
 
-// SHIP_REPORT_2026-08-09_combo.md: "attempt=N retry logging never observed"
+// Internal ship report (2026-08-09): "attempt=N retry logging never observed"
 // — nextAttempt (above) was already wired into both of sendOnce's failure
 // log lines in poller.mjs, but nothing pinned the log string's actual shape,
 // so a silent regression there would only ever have surfaced on a live

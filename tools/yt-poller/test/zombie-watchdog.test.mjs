@@ -1,4 +1,4 @@
-// YT_FEED_LOSS_FORENSICS_2026-08-05.md rec 4: the empty-200 zombie watchdog.
+// Internal forensics doc (2026-08-05), rec 4: the empty-200 zombie watchdog.
 // parser.js can return an empty actions array on a valid 200 with no 'chat'/
 // 'error' event, so consecutiveErrors (poller.mjs) never trips and a stuck
 // continuation can poll forever with fetched=0. This exercises the

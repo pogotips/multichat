@@ -1,4 +1,4 @@
-// YT_FEED_LOSS_FORENSICS_2026-08-05.md rec 4: the poller's heartbeat now
+// Internal forensics doc (2026-08-05), rec 4: the poller's heartbeat now
 // carries fetched/lastMessageAgeSec so CF Observability can see poller fetch
 // health directly, without needing vid docker logs. This is unconditional
 // on every heartbeat (health telemetry), distinct from the gated

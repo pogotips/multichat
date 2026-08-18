@@ -82,6 +82,17 @@ if [ -n "$brand_violations" ]; then
   exit 1
 fi
 
+# --- Filename-leak gate: .oss-exclude keeps internal docs (SHIP_REPORT_*,
+# *_AUDIT_*, *_REVIEW_*, *_PREMORTEM_*, etc) out of the publish, but a code
+# comment can still leak one's existence by naming it directly (2026-08-18
+# incident: 3 such references shipped via a merged PR before this gate
+# existed). Scans STAGE content for the same naming-convention tokens
+# .oss-exclude's own wildcard globs define — see tools/oss-filename-leak-check.mjs.
+if ! node "${SCRIPT_DIR}/oss-filename-leak-check.mjs" "$STAGE"; then
+  echo "abort: fix the leak(s) above before publishing ($DST untouched)" >&2
+  exit 1
+fi
+
 # --- Gate cleared — now, and only now, sync into $DST ---
 
 # --exclude-from is REQUIRED here, not just on the SRC->STAGE pass above.

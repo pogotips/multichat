@@ -52,8 +52,8 @@ export function nextAttempt(msg) {
 
 // Log-line formatters for sendOnce's two failure paths (poller.mjs) — pulled
 // out as pure functions so the attempt=N field's presence/shape is unit-
-// tested directly, rather than only the counter it's built from. Ship report
-// SHIP_REPORT_2026-08-09_combo.md flagged "attempt=N retry logging never
+// tested directly, rather than only the counter it's built from. An internal
+// ship report (2026-08-09) flagged "attempt=N retry logging never
 // observed" — the counter (nextAttempt above) already existed and was
 // already wired into both log lines, but nothing pinned the actual log
 // string shape, so a live stream was the only way anyone would ever have

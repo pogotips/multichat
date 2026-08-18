@@ -2176,8 +2176,8 @@ function badgeFlags(tags) {
 // optional "@tags " prefix, then either a ":<source> COMMAND params" line
 // or (Twitch's own PING) a bare "COMMAND params" line with no source
 // prefix. Was duplicated ×7 (parsePrivmsg/parseUsernotice/parseClearmsg/
-// parseClearchat/parseRoomstate/isReconnectCommand/isProtocolNoise) — see
-// CODE_REVIEW_2026-07-31.md B1-full. Returns null only when the line
+// parseClearchat/parseRoomstate/isReconnectCommand/isProtocolNoise) — per an
+// internal code review (2026-07-31), finding B1-full. Returns null only when the line
 // doesn't parse far enough to identify a command; each call site applies
 // its own further requirements (hasPrefix, a specific command, tags
 // presence) on top. preParsedTags lets a caller that already parsed this
@@ -2562,8 +2562,8 @@ export function filterRecoveredMessages(lines, { cutoffTs, floorTs, seenIds }) {
 // Authoritative (worker-side) allowlist for YouTube emoji image hosts.
 // ggpht.com/googleusercontent.com serve member-custom emoji; gstatic.com
 // serves YouTube's own globally-supported (non-member) emoji images — added
-// alongside the class (b) fix in normalize.mjs (YT_EMOTE_AUDIT_2026-08-08),
-// per the vendored lib's fixture shape. Unconfirmed against live traffic —
+// alongside the class (b) fix in normalize.mjs (PR #40, internal audit
+// 2026-08-08), per the vendored lib's fixture shape. Unconfirmed against live traffic —
 // emoji_host_rejected logging (below) is the safety net if real gstatic
 // paths differ or YT serves class (b) from a host not yet seen here.
 // ytimg.com is deliberately excluded: it's thumbnails, never chat emojis, in
@@ -3090,7 +3090,7 @@ export function versionMismatch(clientVersion, serverVersion) {
 // whichever trigger noticed it. lastActivityTs is bumped by every SSE
 // signal (open/message/ping/status/mark), not just chat messages, so a
 // quiet-but-live YT feed riding on Twitch/heartbeat traffic never trips
-// this on its own — see YT_FEED_LOSS_FORENSICS_2026-08-05.md rec 1.
+// this on its own — see internal forensics doc (2026-08-05), rec 1.
 export function isClientStale(lastActivityTs, now, staleAfterMs) {
   return now - lastActivityTs > staleAfterMs;
 }

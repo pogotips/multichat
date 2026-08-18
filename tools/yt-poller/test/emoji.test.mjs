@@ -58,7 +58,7 @@ describe('normalizeChatItem: global (non-member) YouTube emoji -> emotes', () =>
     expect(msg.emotes).toBeUndefined();
   });
 
-  // Pre-flagged MEDIUM (SHIP_REPORT_2026-08-09_combo.md): a global emoji
+  // Pre-flagged MEDIUM (internal ship report, 2026-08-09): a global emoji
   // with an empty/missing shortcut (alt) used to fall back to its raw
   // emojiText — the unrenderable PUA codepoint — reintroducing the exact
   // tofu bug PR #42 fixed, specifically visible on the disallowed-host
