@@ -942,8 +942,27 @@ export class ChatHub {
   // twId — real Twitch PRIVMSGs always carry one, but a login-wide fallback
   // selector would risk hiding an unrelated live message from the same user,
   // which the double-hide-risk side of this feature must never do.
-  markSuperseded(entry) {
+  // reason carries whichever match details the caller has on hand (order,
+  // the gigantifying emote name/id, and either eventTs — IRC-first, the
+  // EventSub envelope timestamp pickGigantifyCandidate matched against — or
+  // pendingTs — EventSub-first, when the gold was buffered) so a supersede
+  // decision is debuggable after the fact without re-deriving it from the
+  // ring. Every supersede goes through here (both call sites), so this is
+  // the single log point for the whole dedupe feature.
+  markSuperseded(entry, reason = {}) {
     entry.superseded = true;
+    console.log(JSON.stringify({
+      ev: 'gigantify_superseded',
+      order: reason.order || null,
+      login: entry.login || null,
+      twId: entry.twId != null ? entry.twId : null,
+      entryTs: Number.isFinite(entry.twTs) ? entry.twTs : (entry.ts != null ? entry.ts : null),
+      emoteName: reason.emoteName || null,
+      emoteId: reason.emoteId || null,
+      eventTs: Number.isFinite(reason.eventTs) ? reason.eventTs : null,
+      pendingTs: Number.isFinite(reason.pendingTs) ? reason.pendingTs : null,
+      windowMs: GIGANTIFY_SUPPRESS_WINDOW_MS,
+    }));
     if (entry.twId != null) {
       this.broadcastEvent('mark', { action: 'supersede', targetId: entry.twId });
     }
@@ -979,7 +998,7 @@ export class ChatHub {
     const candidates = selectGigantifyCandidates(this.ring, { login, emoteName, emoteId, now });
     const match = pickGigantifyCandidate(candidates, eventTs);
     if (match) {
-      this.markSuperseded(match);
+      this.markSuperseded(match, { order: 'irc_first', emoteName, emoteId, eventTs });
       return;
     }
     this.pendingGigantifies.push({ login, emoteName, emoteId, ts: now });
@@ -999,25 +1018,29 @@ export class ChatHub {
   // pending entry so a single gigantify can only ever suppress one PRIVMSG,
   // and opportunistically drops anything past GIGANTIFY_SUPPRESS_WINDOW_MS
   // on every call so the buffer can't accumulate stale entries between
-  // gigantify events. Returns true iff the caller should supersede this row.
-  // Applies the SAME two-tier match rule selectGigantifyCandidates uses for
-  // the IRC-first order (see gigantifyRowMatches) — without it, a same-login
-  // row carrying non-matching emote ids could be wrongly superseded by a
-  // coincidental text-token match (PR41 review finding R1).
+  // gigantify events. Returns the consumed pending entry (truthy — {login,
+  // emoteName, emoteId, ts}) iff the caller should supersede this row, else
+  // null; the caller forwards emoteName/emoteId/ts into markSuperseded's log
+  // line, since this function is the only place that still has them once a
+  // match is found. Applies the SAME two-tier match rule
+  // selectGigantifyCandidates uses for the IRC-first order (see
+  // gigantifyRowMatches) — without it, a same-login row carrying
+  // non-matching emote ids could be wrongly superseded by a coincidental
+  // text-token match (PR41 review finding R1).
   consumePendingGigantify(login, text, emotes) {
-    if (!this.pendingGigantifies.length) return false;
+    if (!this.pendingGigantifies.length) return null;
     const now = Date.now();
     const loginLc = typeof login === 'string' ? login.toLowerCase() : '';
-    let hit = false;
+    let hitEntry = null;
     this.pendingGigantifies = this.pendingGigantifies.filter((p) => {
       if (now - p.ts > GIGANTIFY_SUPPRESS_WINDOW_MS) return false; // expired — drop
-      if (!hit && p.login === loginLc && gigantifyRowMatches({ text, emotes }, { emoteId: p.emoteId, emoteName: p.emoteName })) {
-        hit = true;
+      if (!hitEntry && p.login === loginLc && gigantifyRowMatches({ text, emotes }, { emoteId: p.emoteId, emoteName: p.emoteName })) {
+        hitEntry = p;
         return false; // consumed — never matches a second PRIVMSG
       }
       return true;
     });
-    return hit;
+    return hitEntry;
   }
 
   applyClearmsg({ targetId, login }) {
@@ -2033,12 +2056,6 @@ export class ChatHub {
       const tagsSpaceIdx = line.startsWith('@') ? line.indexOf(' ') : -1;
       const lineTags = tagsSpaceIdx > 0 ? parseIrcTags(line.slice(0, tagsSpaceIdx)) : {};
       const privmsg = parsePrivmsg(line, lineTags);
-      // Rider: undocumented Twitch power-up marker (Gigantify an Emote /
-      // Message Effect) apparently sets an `animation-id` tag on PRIVMSG per
-      // third-party research — capture raw ground truth alongside normal
-      // classification so a real occurrence finally has a captured fixture.
-      // Additive only; never blocks or replaces normal delivery below.
-      if (lineTags['animation-id']) this.pushCapture(line);
       // Rider: sharedchatnotice (Twitch Shared Chat) wraps another USERNOTICE
       // msg-id — parseUsernotice below never claims it (not in
       // USERNOTICE_KIND/USERNOTICE_SYS), so it already falls through to the
@@ -2062,8 +2079,14 @@ export class ChatHub {
         // path handleGigantifyDedupe's IRC-first branch uses — one
         // suppression mechanism, two triggers.
         const pushed = this.pushMessage('tw', privmsg, ircMeta(line, lineTags));
-        if (this.consumePendingGigantify(pushed.login, pushed.text, pushed.emotes)) {
-          this.markSuperseded(pushed);
+        const pendingHit = this.consumePendingGigantify(pushed.login, pushed.text, pushed.emotes);
+        if (pendingHit) {
+          this.markSuperseded(pushed, {
+            order: 'eventsub_first',
+            emoteName: pendingHit.emoteName,
+            emoteId: pendingHit.emoteId,
+            pendingTs: pendingHit.ts,
+          });
         }
         continue;
       }
@@ -2292,6 +2315,19 @@ export function parseUsernotice(line, preParsedTags) {
   let text = tags['system-msg'] || '';
   if (msgId === 'resub' && trailingText) text += ` — ${trailingText}`;
   if (msgId === 'resub') {
+    // Raw ground truth, logged BEFORE parseStreakMonths/parseShouldShareStreak
+    // below do any interpretation — catches Twitch sending an unexpected raw
+    // value (non-numeric streak-months, an unfamiliar should-share-streak
+    // string, etc.) that the parsed fields would otherwise silently absorb
+    // into undefined/fail-open. Not sampled: resub USERNOTICEs are rare
+    // relative to chat volume, unlike the per-message paths elsewhere in
+    // this file that do need sampling.
+    console.log(JSON.stringify({
+      ev: 'tw_resub_streak_raw',
+      login: login || null,
+      rawStreakMonths: tags['msg-param-streak-months'] ?? null,
+      rawShouldShareStreak: tags['msg-param-should-share-streak'] ?? null,
+    }));
     const streakInfo = formatResubStreakInfo(tags);
     if (streakInfo) text += ` ${streakInfo}`;
   }

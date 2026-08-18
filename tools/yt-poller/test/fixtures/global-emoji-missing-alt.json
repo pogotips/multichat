@@ -1,0 +1,54 @@
+{
+  "liveChatTextMessageRenderer": {
+    "id": "Chz-global-emoji-missing-alt-id",
+    "timestampUsec": "1752570270000000",
+    "authorExternalChannelId": "UCglobalnoaltfan000000000",
+    "authorName": {
+      "simpleText": "GlobalNoAltFan"
+    },
+    "authorPhoto": {
+      "thumbnails": [
+        {
+          "url": "https://yt4.ggpht.com/globalfan=s32",
+          "width": 32,
+          "height": 32
+        }
+      ]
+    },
+    "message": {
+      "runs": [
+        {
+          "text": "hey "
+        },
+        {
+          "emoji": {
+            "emojiId": "",
+            "shortcuts": [],
+            "searchTerms": [
+              "wave",
+              "hand"
+            ],
+            "isCustomEmoji": false,
+            "image": {
+              "thumbnails": [
+                {
+                  "url": "https://www.gstatic.com/youtube/img/emojis/emoji_u1f44b_pink.png",
+                  "width": 24,
+                  "height": 24
+                }
+              ],
+              "accessibility": {
+                "accessibilityData": {
+                  "label": "waving hand"
+                }
+              }
+            }
+          }
+        },
+        {
+          "text": " team"
+        }
+      ]
+    }
+  }
+}

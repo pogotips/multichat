@@ -4,10 +4,26 @@
 //
 // Runs under the multichat root's vitest (`npm test` in multichat/); imports
 // resolve against tools/yt-poller/node_modules, so `npm install` here first.
-import { describe, it, expect } from 'vitest';
+import { describe, it, expect, vi } from 'vitest';
 import { parseChatData } from 'youtube-chat/dist/parser.js';
 import { normalizeChatItem, KIND_FALLBACK_TEXT } from '../normalize.mjs';
 import { actionData, actionDataWithTracking, chatDataWith, chatDataWithTracking, parseOne } from './helpers/envelope.mjs';
+
+// Filters a console.log spy's calls down to structured-log events matching
+// `ev` — mirrors the multichat root's test/helpers/logEvents.js; poller
+// tests are self-contained (see rediscovery.test.mjs) rather than reaching
+// across into the root test/ directory.
+function logEvents(spy, ev) {
+  return spy.mock.calls
+    .map((c) => {
+      try {
+        return JSON.parse(c[0]);
+      } catch {
+        return null;
+      }
+    })
+    .filter((e) => e && e.ev === ev);
+}
 
 import membershipNew from './fixtures/membership-new.json';
 import membershipMilestone from './fixtures/membership-milestone.json';
@@ -73,7 +89,10 @@ describe('patched parser: giftMessageViewModel (paid Jewels/animated-gift)', () 
     // Gift name classified off structure (text.content minus the "sent "
     // verb), not off the literal tier string — a different tier would parse
     // the same way without a new fixture.
-    expect(item.giftMessage).toEqual({ giftName: 'Gold coin' });
+    expect(item.giftMessage).toEqual({
+      giftName: 'Gold coin',
+      giftImageA11yLabel: '@Jaydengames017 sent a gift, Gold coin',
+    });
   });
 
   it('does not carry a real send timestamp (ViewModel has no timestampUsec)', () => {
@@ -237,6 +256,14 @@ describe('patched parser: mod actions (deletion/author-removal)', () => {
 // same shape family as the deletion/authorDeletion items above — never a
 // real ChatItem (no author/id/timestamp), short-circuited before the classic
 // extraction in parseActionToChatItem.
+//
+// Note: 'liveChatModeChangeMessageRenderer' below is just a descriptive test
+// title, not a comparison value — it isn't read by any check. It names the
+// same underlying invariant as the SENTINEL constant in
+// multichat/scripts/poller-patch-sentinel.mjs (that module's dist/parser.js
+// build-verification sentinel), which is the actual source of truth for the
+// patch-guard check. Keep these two literals in sync if the renderer name
+// ever changes.
 describe('patched parser: liveChatModeChangeMessageRenderer (ROOMSTATE parity)', () => {
   it('surfaces a modeChange control item with the rendered text (slow mode, with subtext present but unused)', () => {
     const data = chatDataWith(modeChangeSlowmode);
@@ -376,5 +403,41 @@ describe('normalizeChatItem: yt_gift (paid Jewels/animated-gift, distinct from m
     });
     expect(msg.text).toBe(KIND_FALLBACK_TEXT.yt_gift);
     expect(msg.kind).toBe('yt_gift');
+  });
+
+  // yt_gift_raw: raw giftName/giftImageA11yLabel visibility ahead of any
+  // classification, added to chase a "Hiding" anomaly seen in production
+  // values for these two fields — see normalize.mjs.
+  it('logs yt_gift_raw with the raw giftName and giftImageA11yLabel from the ViewModel', () => {
+    const logSpy = vi.spyOn(console, 'log').mockImplementation(() => {});
+    normalizeChatItem(parseOne(giftMessage));
+    expect(logEvents(logSpy, 'yt_gift_raw')).toEqual([{
+      ev: 'yt_gift_raw',
+      giftName: 'Gold coin',
+      giftImageA11yLabel: '@Jaydengames017 sent a gift, Gold coin',
+    }]);
+    logSpy.mockRestore();
+  });
+
+  it('yt_gift_raw still fires with giftImageA11yLabel null when the patched parser omits it', () => {
+    const logSpy = vi.spyOn(console, 'log').mockImplementation(() => {});
+    normalizeChatItem({
+      author: { name: 'AnotherGifter' },
+      message: [{ text: 'sent 5 Roses' }],
+      giftMessage: { giftName: '5 Roses' },
+    });
+    expect(logEvents(logSpy, 'yt_gift_raw')).toEqual([{
+      ev: 'yt_gift_raw',
+      giftName: '5 Roses',
+      giftImageA11yLabel: null,
+    }]);
+    logSpy.mockRestore();
+  });
+
+  it('a non-gift normalize call never logs yt_gift_raw', () => {
+    const logSpy = vi.spyOn(console, 'log').mockImplementation(() => {});
+    normalizeChatItem(parseOne(membershipNew));
+    expect(logEvents(logSpy, 'yt_gift_raw')).toEqual([]);
+    logSpy.mockRestore();
   });
 });

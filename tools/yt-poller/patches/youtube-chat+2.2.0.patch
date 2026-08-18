@@ -1,5 +1,5 @@
 diff --git a/node_modules/youtube-chat/dist/parser.js b/node_modules/youtube-chat/dist/parser.js
-index 2245f50..d3dc43a 100644
+index 2245f50..79ad530 100644
 --- a/node_modules/youtube-chat/dist/parser.js
 +++ b/node_modules/youtube-chat/dist/parser.js
 @@ -104,6 +104,23 @@ function parseMessages(runs) {
@@ -26,7 +26,7 @@ index 2245f50..d3dc43a 100644
  /** actionの種類を判別してRendererを返す */
  function rendererFromAction(action) {
      if (!action.addChatItemAction) {
-@@ -120,14 +137,157 @@ function rendererFromAction(action) {
+@@ -120,14 +137,162 @@ function rendererFromAction(action) {
          return item.liveChatPaidStickerRenderer;
      }
      else if (item.liveChatMembershipItemRenderer) {
@@ -179,13 +179,18 @@ index 2245f50..d3dc43a 100644
 +            // this by trying to derive a real timestamp from the ViewModel —
 +            // it doesn't carry one.
 +            timestamp: new Date(),
-+            giftMessage: { giftName: giftName },
++            // giftImageA11yLabel passed through raw (not just parsed for
++            // giftName above) so normalize.mjs can log both fields verbatim
++            // ahead of any classification — see the "Hiding" anomaly note
++            // there. null (never undefined) when YouTube omits the label so
++            // JSON.stringify always surfaces the key.
++            giftMessage: { giftName: giftName, giftImageA11yLabel: messageRenderer.giftImageA11yLabel || null },
 +        };
 +    }
      if (messageRenderer === null) {
          return null;
      }
-@@ -136,7 +296,8 @@ function parseActionToChatItem(data) {
+@@ -136,7 +301,8 @@ function parseActionToChatItem(data) {
          message = messageRenderer.message.runs;
      }
      else if ("headerSubtext" in messageRenderer) {
@@ -195,7 +200,7 @@ index 2245f50..d3dc43a 100644
      }
      const authorNameText = (_b = (_a = messageRenderer.authorName) === null || _a === void 0 ? void 0 : _a.simpleText) !== null && _b !== void 0 ? _b : "";
      const ret = {
-@@ -191,6 +352,31 @@ function parseActionToChatItem(data) {
+@@ -191,6 +357,31 @@ function parseActionToChatItem(data) {
              color: convertColorToHex6(messageRenderer.bodyBackgroundColor),
          };
      }

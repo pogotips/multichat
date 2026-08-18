@@ -25,7 +25,10 @@ import path from 'node:path';
 import { LiveChat } from 'youtube-chat';
 import { normalizeChatItem } from './normalize.mjs';
 import { classifyYtItem } from './recovery.mjs';
-import { enqueueRetry, drainBatch, isRetryable, RETRY_QUEUE_MAX, SEND_CONCURRENCY, nextAttempt } from './retry-queue.mjs';
+import {
+  enqueueRetry, drainBatch, isRetryable, RETRY_QUEUE_MAX, SEND_CONCURRENCY, nextAttempt,
+  formatIngestFailureLog, formatIngestErrorLog,
+} from './retry-queue.mjs';
 import { bumpCount, appendCapture, CAPTURE_DIR, CAPTURE_FILE } from './capture.mjs';
 import { createVideoIdTracker, fetchYtVideoState } from './yt-counts.mjs';
 import { probeCurrentLiveId, createRediscoveryGate, resolveRediscoveryOutcome } from './rediscovery.mjs';
@@ -273,13 +276,13 @@ async function sendOnce(msg) {
     });
     recordRtt(performance.now() - rttStart);
     if (!res.ok) {
-      console.error(`ingest failed: ${res.status} ${await res.text()} attempt=${attempt}`);
+      console.error(formatIngestFailureLog(res.status, await res.text(), attempt));
       if (msg.type !== 'heartbeat') cycleFailed++;
     }
     return res.ok;
   } catch (err) {
     recordRtt(performance.now() - rttStart);
-    console.error(`ingest error: ${err.message} attempt=${attempt}`);
+    console.error(formatIngestErrorLog(err.message, attempt));
     if (msg.type !== 'heartbeat') cycleFailed++;
     return false;
   }

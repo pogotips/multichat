@@ -371,6 +371,54 @@ describe('parseUsernotice', () => {
       expect(parsed.streakMonths).toBeUndefined();
     });
 
+    // tw_resub_streak_raw: raw tag visibility BEFORE parseStreakMonths/
+    // parseShouldShareStreak interpret them — added to catch Twitch sending
+    // an unexpected raw value the parsed fields would otherwise silently
+    // absorb into undefined/fail-open.
+    it('logs tw_resub_streak_raw with the untouched raw tag strings on every resub', () => {
+      const logSpy = vi.spyOn(console, 'log').mockImplementation(() => {});
+      parseUsernotice(line('msg-param-cumulative-months=12;msg-param-streak-months=5;msg-param-should-share-streak=1'));
+      expect(logEvents(logSpy, 'tw_resub_streak_raw')).toEqual([{
+        ev: 'tw_resub_streak_raw',
+        login: 'ronni',
+        rawStreakMonths: '5',
+        rawShouldShareStreak: '1',
+      }]);
+      logSpy.mockRestore();
+    });
+
+    it('tw_resub_streak_raw surfaces an unexpected non-numeric raw value verbatim (not coerced/dropped)', () => {
+      const logSpy = vi.spyOn(console, 'log').mockImplementation(() => {});
+      parseUsernotice(line('msg-param-cumulative-months=12;msg-param-streak-months=xyz'));
+      expect(logEvents(logSpy, 'tw_resub_streak_raw')).toEqual([{
+        ev: 'tw_resub_streak_raw',
+        login: 'ronni',
+        rawStreakMonths: 'xyz',
+        rawShouldShareStreak: null,
+      }]);
+      logSpy.mockRestore();
+    });
+
+    it('tw_resub_streak_raw fires with both raw fields null when neither tag is present', () => {
+      const logSpy = vi.spyOn(console, 'log').mockImplementation(() => {});
+      parseUsernotice(`${base} :tmi.twitch.tv USERNOTICE #dallas`);
+      expect(logEvents(logSpy, 'tw_resub_streak_raw')).toEqual([{
+        ev: 'tw_resub_streak_raw',
+        login: 'ronni',
+        rawStreakMonths: null,
+        rawShouldShareStreak: null,
+      }]);
+      logSpy.mockRestore();
+    });
+
+    it('a plain sub (not resub) never logs tw_resub_streak_raw', () => {
+      const logSpy = vi.spyOn(console, 'log').mockImplementation(() => {});
+      const subLine = '@display-name=ronni;login=ronni;msg-id=sub;msg-param-cumulative-months=12;system-msg=ronni\\ssubscribed! :tmi.twitch.tv USERNOTICE #dallas';
+      parseUsernotice(subLine);
+      expect(logEvents(logSpy, 'tw_resub_streak_raw')).toEqual([]);
+      logSpy.mockRestore();
+    });
+
     it('does not apply to a plain sub (no cumulative/streak concept on a first sub)', () => {
       const subLine = '@display-name=ronni;login=ronni;msg-id=sub;msg-param-cumulative-months=12;system-msg=ronni\\ssubscribed! :tmi.twitch.tv USERNOTICE #dallas';
       const parsed = parseUsernotice(subLine);

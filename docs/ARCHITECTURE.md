@@ -742,6 +742,46 @@ retries rather than an attacker. Accepted as-is rather than adding a
     timestamp resolves "Twitch disconnects often" reports: IRC staying up
     while SSE drops points at the viewer's phone/LTE; both dropping together
     points upstream.
+- **Overnight "Hiding" anomaly debug logging** (2026-08-18, `obs-debug-logs`):
+  four gaps closed while chasing an overnight anomaly, each logged at
+  ingest/decision time rather than reconstructed after the fact:
+  - `gigantify_superseded {order, login, twId, entryTs, emoteName, emoteId,
+    eventTs, pendingTs, windowMs}` — the single log point for the whole
+    gigantify double-display dedupe feature (`ChatHub.markSuperseded`, called
+    from both `handleGigantifyDedupe`'s IRC-first order and
+    `handleIrcData`'s EventSub-first order via `consumePendingGigantify`).
+    `order` is `'irc_first'` or `'eventsub_first'`; `eventTs` (IRC-first — the
+    EventSub envelope timestamp `pickGigantifyCandidate` matched against) and
+    `pendingTs` (EventSub-first — when the gold row was buffered) are
+    mutually exclusive, whichever doesn't apply logs `null`. Previously zero
+    server-side visibility into a supersede decision at all.
+  - `yt_global_emoji_render {emojiText, alt, url}` — sampled
+    (`GLOBAL_EMOJI_LOG_SAMPLE_RATE = 0.02`, `tools/yt-poller/normalize.mjs`)
+    positive-path visibility for a successfully-rendered global/PUA YouTube
+    emoji (the `isGlobalEmoji`/`PRIVATE_USE_EMOJI_RE` path from PR #42).
+    Fires per global-emoji render at a 2% rate — this path is high-volume
+    during an active stream (once per global emoji in every message), so
+    full logging was rejected on cost/noise grounds; 2% is enough to catch a
+    recurring bad `emojiText`/`alt` pair within a few dozen occurrences
+    without meaningfully inflating log volume.
+  - `tw_resub_streak_raw {login, rawStreakMonths, rawShouldShareStreak}` —
+    logged in `parseUsernotice` for every `resub` USERNOTICE, before
+    `parseStreakMonths`/`parseShouldShareStreak` (§2's streak-coverage logic,
+    PR #38) interpret the tags at all. Not sampled — resub is rare relative
+    to chat volume — added so an unexpected raw Twitch value (non-numeric
+    `msg-param-streak-months`, an unfamiliar `msg-param-should-share-streak`
+    string) is visible instead of silently absorbed into
+    `undefined`/fail-open by the parsed fields.
+  - `yt_gift_raw {giftName, giftImageA11yLabel}` — logged in `normalize.mjs`'s
+    `item.giftMessage` branch, ahead of `yt_gift` classification.
+    `giftImageA11yLabel` required threading a new field through the vendored
+    parser patch (`tools/yt-poller/patches/youtube-chat+2.2.0.patch` — the
+    `giftMessageViewModel` branch previously discarded the label after using
+    it only as a `giftName` fallback source when the ViewModel's own text was
+    empty); regenerated via the normal patch-package edit-then-
+    `npx patch-package youtube-chat` flow and verified by reinstalling from a
+    clean `node_modules`. Not sampled — `yt_gift` (paid Jewels/animated-gift)
+    is a rare, human-triggered event, nowhere near per-message volume.
 - **Zombie-client reaping** (2026.07.20.3): a half-open SSE controller whose
   `enqueue()` never throws (so the old enqueue-catch path never deleted it)
   and whose stream `cancel()` never fires can pin `this.clients.size > 0`

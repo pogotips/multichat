@@ -30,19 +30,41 @@ const MAX_EMOTES = 20;
 // PUA range is the fail-safe signal to route through the image path instead.
 const PRIVATE_USE_EMOJI_RE = /^[\u{E000}-\u{F8FF}\u{F0000}-\u{FFFFD}\u{100000}-\u{10FFFD}]$/u;
 
+// Sampling rate for the yt_global_emoji_render debug line below. This path
+// fires once per global/PUA emoji in every chat message during an active
+// stream — full logging would be high-volume (cost + noise) for a debug
+// signal whose only job is "is this codepoint/alt-text pair still rendering
+// correctly". 2% is high enough to catch a recurring bad emojiText/alt value
+// within a few dozen occurrences, low enough to keep the steady-state volume
+// negligible.
+const GLOBAL_EMOJI_LOG_SAMPLE_RATE = 0.02;
+
 function isGlobalEmoji(part) {
   return !part.isCustomEmoji && typeof part.emojiText === 'string'
     && PRIVATE_USE_EMOJI_RE.test(part.emojiText);
 }
 
+// Render-safe stand-in for a global emoji whose shortcut (alt) is
+// empty/missing. MUST NOT be the raw emojiText itself — that's the
+// unrenderable Private-Use-Area codepoint (see isGlobalEmoji above), the
+// exact tofu/invisible-text bug PR #42 fixed for the image path. This text
+// is normally hidden behind the <img> the client renders at this offset
+// (see renderText in src/worker.js), but it's also the one thing a viewer
+// actually sees if that image never shows: the worker's ingest gate blanks
+// the url on a disallowed host (degrade, not drop — see sanitizeYtEmotes)
+// and the client falls back to rendering this exact span as plain text. A
+// raw PUA codepoint there reintroduces tofu specifically on that degrade
+// path; this placeholder keeps it readable instead.
+const GLOBAL_EMOJI_PLACEHOLDER = '[emoji]';
+
 // Global emoji's own emojiText is the unrenderable PUA codepoint (see
 // isGlobalEmoji above) — prefer the human-readable shortcut (part.alt,
 // already extracted by the lib regardless of isCustomEmoji) for both the
-// in-text fallback and the eventual client display. Fail open to emojiText
-// if the shortcut itself is missing rather than emit an empty chunk.
+// in-text fallback and the eventual client display. Fail open to the safe
+// placeholder (never the raw emojiText) if the shortcut itself is missing.
 function chunkText(part, global) {
   if (part.text !== undefined) return part.text;
-  if (global) return (part.alt && part.alt.length ? part.alt : part.emojiText) ?? '';
+  if (global) return part.alt && part.alt.length ? part.alt : GLOBAL_EMOJI_PLACEHOLDER;
   return part.emojiText ?? '';
 }
 
@@ -72,6 +94,18 @@ function buildTextAndEmotes(parts) {
     if ((part.isCustomEmoji || global) && part.url && rawEmotes.length < MAX_EMOTES) {
       const len = [...chunk].length;
       rawEmotes.push({ start: cpOffset, end: cpOffset + len - 1, url: part.url, alt: part.alt });
+      // Sampled positive-path visibility for global/PUA emoji specifically
+      // (not member-custom emoji, which already have a name/id worth
+      // grepping for elsewhere) — see GLOBAL_EMOJI_LOG_SAMPLE_RATE above for
+      // the volume/cost reasoning.
+      if (global && Math.random() < GLOBAL_EMOJI_LOG_SAMPLE_RATE) {
+        console.log(JSON.stringify({
+          ev: 'yt_global_emoji_render',
+          emojiText: part.emojiText ?? null,
+          alt: part.alt ?? null,
+          url: part.url,
+        }));
+      }
     }
     rawText += chunk;
     cpOffset += [...chunk].length;
@@ -114,6 +148,17 @@ export function normalizeChatItem(item) {
   } else if (item.giftMessage) {
     kind = 'yt_gift';
     amount = item.giftMessage.giftName;
+    // Raw ground truth ahead of any classification — chasing a "Hiding"
+    // anomaly seen in production giftName/giftImageA11yLabel values. Not
+    // sampled: yt_gift is a rare, human-triggered event (paid Jewels/gift),
+    // nowhere near the per-message volume that needs sampling elsewhere.
+    // giftImageA11yLabel is passed through from the patched youtube-chat
+    // parser (patches/youtube-chat+2.2.0.patch) — see item.giftMessage there.
+    console.log(JSON.stringify({
+      ev: 'yt_gift_raw',
+      giftName: item.giftMessage.giftName ?? null,
+      giftImageA11yLabel: item.giftMessage.giftImageA11yLabel ?? null,
+    }));
   } else if (item.membershipGift) {
     kind = 'member_gift';
     const n = item.membershipGift.count;

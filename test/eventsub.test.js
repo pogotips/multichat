@@ -14,6 +14,7 @@ import {
 import { GIGANTIFY_SUPPRESS_WINDOW_MS, PENDING_MOD_MAX } from '../src/lib.js';
 import { makeEventSubHub, makeStorage } from './helpers/makeHub.js';
 import { withFakeTimers } from './helpers/withFakeTimers.js';
+import { logEvents } from './helpers/logEvents.js';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 
@@ -1345,6 +1346,26 @@ describe('ChatHub gigantify double-display suppression', () => {
     expect(markCall[1]).toEqual({ action: 'supersede', targetId: 'irc-msg-1' });
   });
 
+  it('IRC-first: logs gigantify_superseded with the match heuristic details (login, emote id/name, eventTs, window)', async () => {
+    const logSpy = vi.spyOn(console, 'log').mockImplementation(() => {});
+    const hub = makeEventSubHub();
+    hub.pushMessage('tw', { user: 'Cool_User', login: 'cool_user', text: 'PogChamp' }, { id: 'irc-msg-log-1' });
+
+    await hub.handleEventSub(eventSubDoRequest('gig-order-log-1', 'channel.bits.use', GIGANTIFY_EVENT));
+
+    const events = logEvents(logSpy, 'gigantify_superseded');
+    expect(events).toHaveLength(1);
+    expect(events[0]).toMatchObject({
+      ev: 'gigantify_superseded',
+      order: 'irc_first',
+      login: 'cool_user',
+      twId: 'irc-msg-log-1',
+      emoteName: 'PogChamp',
+      windowMs: GIGANTIFY_SUPPRESS_WINDOW_MS,
+    });
+    logSpy.mockRestore();
+  });
+
   it('EventSub-first: buffers the pending gigantify, then push-then-supersedes the matching PRIVMSG on arrival; gold row already rendered', async () => {
     const hub = makeEventSubHub();
     const broadcastSpy = vi.spyOn(hub, 'broadcastEvent');
@@ -1367,6 +1388,26 @@ describe('ChatHub gigantify double-display suppression', () => {
 
     const markCall = broadcastSpy.mock.calls.find(([event]) => event === 'mark');
     expect(markCall[1]).toEqual({ action: 'supersede', targetId: 'irc-msg-2' });
+  });
+
+  it('EventSub-first: logs gigantify_superseded with order eventsub_first and the buffered match details', async () => {
+    const logSpy = vi.spyOn(console, 'log').mockImplementation(() => {});
+    const hub = makeEventSubHub();
+    await hub.handleEventSub(eventSubDoRequest('gig-order-log-2', 'channel.bits.use', GIGANTIFY_EVENT));
+    hub.handleIrcData(ircLine('irc-msg-log-2', 'cool_user', 'PogChamp'));
+
+    const events = logEvents(logSpy, 'gigantify_superseded');
+    expect(events).toHaveLength(1);
+    expect(events[0]).toMatchObject({
+      ev: 'gigantify_superseded',
+      order: 'eventsub_first',
+      login: 'cool_user',
+      twId: 'irc-msg-log-2',
+      emoteName: 'PogChamp',
+      windowMs: GIGANTIFY_SUPPRESS_WINDOW_MS,
+    });
+    expect(typeof events[0].pendingTs).toBe('number');
+    logSpy.mockRestore();
   });
 
   it('non-matching text from the SAME login is never eaten, either order — a same-login unrelated message must survive', async () => {

@@ -1,5 +1,8 @@
 import { describe, it, expect } from 'vitest';
-import { enqueueRetry, drainBatch, isRetryable, RETRY_QUEUE_MAX, SEND_CONCURRENCY, nextAttempt } from '../retry-queue.mjs';
+import {
+  enqueueRetry, drainBatch, isRetryable, RETRY_QUEUE_MAX, SEND_CONCURRENCY, nextAttempt,
+  formatIngestFailureLog, formatIngestErrorLog,
+} from '../retry-queue.mjs';
 
 describe('nextAttempt', () => {
   it('starts at 1 and increments per call for the same message identity', () => {
@@ -30,6 +33,38 @@ describe('nextAttempt', () => {
     expect(nextAttempt('msgA')).toBe(1);
     expect(nextAttempt(null)).toBe(1);
     expect(nextAttempt(undefined)).toBe(1);
+  });
+});
+
+// SHIP_REPORT_2026-08-09_combo.md: "attempt=N retry logging never observed"
+// — nextAttempt (above) was already wired into both of sendOnce's failure
+// log lines in poller.mjs, but nothing pinned the log string's actual shape,
+// so a silent regression there would only ever have surfaced on a live
+// stream. Pulling the two formatters out as pure functions makes the
+// attempt=N field's presence provable without one.
+describe('formatIngestFailureLog', () => {
+  it('includes status, body text, and attempt=N', () => {
+    expect(formatIngestFailureLog(500, 'server error', 1)).toBe('ingest failed: 500 server error attempt=1');
+  });
+
+  it('reflects a later attempt number on a retried send', () => {
+    const msg = { user: 'Alice', text: 'hi' };
+    nextAttempt(msg); // attempt 1, consumed
+    const attempt = nextAttempt(msg); // attempt 2 — mirrors a real retry
+    expect(formatIngestFailureLog(429, 'rate limited', attempt)).toBe('ingest failed: 429 rate limited attempt=2');
+  });
+});
+
+describe('formatIngestErrorLog', () => {
+  it('includes the error message and attempt=N', () => {
+    expect(formatIngestErrorLog('fetch failed', 1)).toBe('ingest error: fetch failed attempt=1');
+  });
+
+  it('reflects a later attempt number on a retried send', () => {
+    const msg = { user: 'Bob', text: 'yo' };
+    nextAttempt(msg); // attempt 1, consumed
+    const attempt = nextAttempt(msg); // attempt 2
+    expect(formatIngestErrorLog('timeout', attempt)).toBe('ingest error: timeout attempt=2');
   });
 });
 

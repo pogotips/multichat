@@ -40,27 +40,6 @@ describe('capture liveness (2.4): which IRC lines reach R2', () => {
       captured: false,
     },
     {
-      // Rider: undocumented Twitch power-up marker (Gigantify an Emote /
-      // Message Effects) apparently sets an `animation-id` tag on PRIVMSG
-      // per third-party research, but this repo has never captured a real
-      // example. This asserts the raw line still reaches the same
-      // untrusted-data sink so a genuine occurrence finally leaves a
-      // ground-truth fixture.
-      label: 'a PRIVMSG carrying animation-id is captured in addition to being classified normally',
-      line: '@display-name=Alice;animation-id=simmer :alice!alice@alice.tmi.twitch.tv PRIVMSG #testchannel :hi',
-      captured: true,
-      bodyContains: 'animation-id=simmer',
-      extraCheck: (hub) => {
-        expect(hub.ring).toHaveLength(1);
-        expect(hub.ring[0].text).toBe('hi');
-      },
-    },
-    {
-      label: 'a PRIVMSG without animation-id is NOT captured by the rider',
-      line: '@display-name=Alice :alice!alice@alice.tmi.twitch.tv PRIVMSG #testchannel :no power-up here',
-      captured: false,
-    },
-    {
       label: 'a PONG reply to our own keepalive PING is not captured to R2',
       line: ':tmi.twitch.tv PONG tmi.twitch.tv :ka1',
       captured: false,

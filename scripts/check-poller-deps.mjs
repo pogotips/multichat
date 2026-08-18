@@ -13,6 +13,7 @@
 import { existsSync, readFileSync } from 'node:fs';
 import { fileURLToPath } from 'node:url';
 import path from 'node:path';
+import { SENTINEL as sentinel, PARSER_DIST_RELATIVE_PATH } from './poller-patch-sentinel.mjs';
 
 const root = path.dirname(fileURLToPath(import.meta.url));
 // CHECK_POLLER_DEPS_ROOT overrides the tools/yt-poller path for testing
@@ -31,8 +32,7 @@ if (!existsSync(marker)) {
   process.exit(1);
 }
 
-const parserDist = path.join(marker, 'dist', 'parser.js');
-const sentinel = 'liveChatModeChangeMessageRenderer';
+const parserDist = path.join(pollerRoot, PARSER_DIST_RELATIVE_PATH);
 
 if (!existsSync(parserDist) || !readFileSync(parserDist, 'utf8').includes(sentinel)) {
   console.error(
