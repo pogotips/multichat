@@ -421,3 +421,49 @@ describe('sse_reap_backlog / sse_replay_result (forensics rec 0)', () => {
     logSpy.mockRestore();
   });
 });
+
+// OBS-overlay Phase 1 (item 8): sendToController (the replay writer,
+// confirmed sole caller is the ring-replay loop above) tags every replayed
+// frame `replay: true`, for the overlay's entry-animation suppression only —
+// TTS suppression stays governed by the overlay's own floor+spokenIds+TTL
+// predicate, never by this flag (a message replayed after a transient
+// reconnect may be genuinely unheard and should still speak). broadcast()
+// (the live writer) must never carry it, or a live donation would silently
+// skip its entry animation too.
+describe('sendToController replay tagging (OBS overlay item 8)', () => {
+  it('a replayed frame carries replay:true; the underlying ring entry itself is not mutated', async () => {
+    const { hub } = makeHub();
+    hub.ring = [{ id: 10, kind: 'x' }];
+    const sseRes = hub.handleEvents(new Request('https://do/events', { headers: { 'Last-Event-ID': '9' } }));
+    const reader = sseRes.body.getReader();
+    const decoder = new TextDecoder();
+    await reader.read(); // frame 0: status (sendEventTo, unaffected by this change)
+    const { value } = await reader.read(); // frame 1: the replayed row (sendToController)
+    const dataMatch = decoder.decode(value).match(/^data: (.+)$/m);
+    const replayed = JSON.parse(dataMatch[1]);
+    expect(replayed.replay).toBe(true);
+    expect(replayed.id).toBe(10);
+    // sendToController spreads into a new object rather than mutating msg in
+    // place -- the ring's own stored entry must never pick up a stale
+    // replay:true that a LATER live broadcast of the same entry would then
+    // incorrectly carry.
+    expect(hub.ring[0].replay).toBeUndefined();
+    await reader.cancel();
+  });
+
+  it('a live broadcast frame never carries replay:true', () => {
+    const { hub } = makeHub();
+    const enqueued = [];
+    const controller = { desiredSize: 1, closed: false, close() {}, enqueue: (bytes) => enqueued.push(bytes) };
+    hub.clients.add(controller);
+    hub.clientMeta.set(controller, { sseId: 'live-1', openedAt: Date.now(), strikes: 0 });
+    hub.broadcast({ id: 20, kind: 'x' });
+    const decoder = new TextDecoder();
+    const frames = enqueued.map((bytes) => {
+      const m = decoder.decode(bytes).match(/^data: (.+)$/m);
+      return m ? JSON.parse(m[1]) : null;
+    });
+    expect(frames.some((f) => f && f.id === 20)).toBe(true);
+    for (const f of frames) if (f) expect(f.replay).toBeUndefined();
+  });
+});

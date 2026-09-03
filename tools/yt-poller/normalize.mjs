@@ -39,6 +39,21 @@ const PRIVATE_USE_EMOJI_RE = /^[\u{E000}-\u{F8FF}\u{F0000}-\u{FFFFD}\u{100000}-\
 // negligible.
 const GLOBAL_EMOJI_LOG_SAMPLE_RATE = 0.02;
 
+// Non-sampled counter, alongside the 2%-sampled log above — audit round
+// 2026-08-20 found zero yt_global_emoji_render lines in an otherwise-active
+// 24h window and couldn't tell "genuinely zero global emoji this stream"
+// from "sampling just never caught one". Cardinality-safe (single integer,
+// no per-emoji fields): poller.mjs drains this every heartbeat cycle via
+// takeGlobalEmojiRenderCount() and folds it into the poller_heartbeat log,
+// the same pattern already used for cycleFetched/cyclePosted there.
+let globalEmojiRenderCount = 0;
+
+export function takeGlobalEmojiRenderCount() {
+  const n = globalEmojiRenderCount;
+  globalEmojiRenderCount = 0;
+  return n;
+}
+
 function isGlobalEmoji(part) {
   return !part.isCustomEmoji && typeof part.emojiText === 'string'
     && PRIVATE_USE_EMOJI_RE.test(part.emojiText);
@@ -94,6 +109,7 @@ function buildTextAndEmotes(parts) {
     if ((part.isCustomEmoji || global) && part.url && rawEmotes.length < MAX_EMOTES) {
       const len = [...chunk].length;
       rawEmotes.push({ start: cpOffset, end: cpOffset + len - 1, url: part.url, alt: part.alt });
+      if (global) globalEmojiRenderCount++;
       // Sampled positive-path visibility for global/PUA emoji specifically
       // (not member-custom emoji, which already have a name/id worth
       // grepping for elsewhere) — see GLOBAL_EMOJI_LOG_SAMPLE_RATE above for

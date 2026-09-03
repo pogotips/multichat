@@ -2,7 +2,7 @@ import { describe, it, expect, vi } from 'vitest';
 import { emitCategory, isEmittable, formatUtterance, enqueueCapped } from '../src/worker.js';
 // Plain-value constants live in lib.js, not the entry module — see lib.js's
 // header comment (workerd rejects a non-function/class entry-module export).
-import { VALID_KINDS, TTS_LABELS, EMIT_TTL_MS, FINANCIAL_KINDS, cleanSpokenName } from '../src/lib.js';
+import { VALID_KINDS, TTS_LABELS, EMIT_TTL_MS, FINANCIAL_KINDS, cleanSpokenName, normalizeSpokenMentions } from '../src/lib.js';
 import { makeHub } from './helpers/makeHub.js';
 
 describe('emitCategory', () => {
@@ -231,6 +231,55 @@ describe('cleanSpokenName', () => {
   it('never touches mid-name digits — only a trailing run', () => {
     expect(cleanSpokenName('2pac')).toBe('2pac');
     expect(cleanSpokenName('l33thax0r')).toBe('l33thax0r');
+  });
+});
+
+// ── cleanSpokenName — leading-@ strip (OBS-overlay TTS "@" fix). Runs BEFORE
+// the digit strip and the <2-char guard above, so a raw "@Jon_123" ends up
+// "Jon" (not "at Jon underscore one two three"), and never returns empty.
+describe('cleanSpokenName: leading-@ strip', () => {
+  it('strips a bare leading @ with no other cleanup needed', () => {
+    expect(cleanSpokenName('@Jon')).toBe('Jon');
+  });
+
+  it('strips leading @ AND trailing digits together', () => {
+    expect(cleanSpokenName('@Jon_123')).toBe('Jon');
+  });
+
+  it('a 1-char de-@ remainder returns the de-@ name, not the truncated stub or the raw @-name', () => {
+    expect(cleanSpokenName('@x')).toBe('x');
+  });
+
+  it('a bare @ alone never produces an empty string', () => {
+    const out = cleanSpokenName('@');
+    expect(out.length).toBeGreaterThan(0);
+  });
+
+  it('leaves a name with no leading @ behaving exactly as before', () => {
+    expect(cleanSpokenName('PikachuFan2012')).toBe('PikachuFan');
+    expect(cleanSpokenName('darc-ttv')).toBe('darc-ttv');
+  });
+});
+
+describe('normalizeSpokenMentions', () => {
+  it('strips the @ off a mention at the start of a string', () => {
+    expect(normalizeSpokenMentions('@Jon thanks for the stream')).toBe('Jon thanks for the stream');
+  });
+
+  it('strips the @ off a mid-string mention, leaving the rest of the name intact', () => {
+    expect(normalizeSpokenMentions('hey @Jon check this out')).toBe('hey Jon check this out');
+  });
+
+  it('handles multiple mentions in the same body', () => {
+    expect(normalizeSpokenMentions('@Jon and @Sara both rock')).toBe('Jon and Sara both rock');
+  });
+
+  it('leaves an email address untouched — @ not preceded by whitespace/start is not a mention', () => {
+    expect(normalizeSpokenMentions('contact me at a@b.com please')).toBe('contact me at a@b.com please');
+  });
+
+  it('leaves text with no @ untouched', () => {
+    expect(normalizeSpokenMentions('no mentions here')).toBe('no mentions here');
   });
 });
 

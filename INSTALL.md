@@ -86,6 +86,23 @@ wrangler secret put TWITCH_USER_REFRESH_TOKEN
 
 > Both `wrangler.jsonc` and `.dev.vars` are gitignored — only the `.example` copies are committed, so your real values never land in git.
 
+> **Protected host-only files** — gitignored, example-only in this repo,
+> and unrecoverable if deleted since this repo holds no other copy:
+>
+> | File | Lives only | This repo has |
+> |---|---|---|
+> | `wrangler.jsonc` | your local checkout | `wrangler.jsonc.example` |
+> | `.dev.vars` | your local checkout | `.dev.vars.example` |
+> | `docker-compose.yml` (poller stack dir on the poller host) | the poller host | `tools/yt-poller/docker-compose.yml.example` |
+>
+> None of these are reachable by `rsync`, `git checkout`, or any rollback
+> tag — the poller host's `docker-compose.yml` in particular is never
+> touched by the poller's rsync rollout (see `docs/ARCHITECTURE.md` §6
+> step 3), only hand-edited in place. A tool or command that could delete
+> or overwrite one of these (`rsync --delete`, a compose "recreate from
+> scratch," etc.) needs a fresh backup first, every time — see the
+> step-zero tar rule in `docs/ARCHITECTURE.md` §6 step 3.
+
 ### 4. Deploy
 
 ```bash

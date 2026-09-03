@@ -21,12 +21,17 @@ Merges Twitch + YouTube live chat into a single dark, mobile SSE feed for viewin
 | Route | Auth | Purpose |
 |---|---|---|
 | `GET /` | none | Static HTML page. Secret resolved client-side (`resolveToken`): URL fragment `#t=` seeds `localStorage` (fragment always wins over stale storage) so an installed PWA launch — no fragment at all — still reconnects; a ⚿ control reopens the connect prompt for manual re-entry. Never sent to the server via `GET /` itself. |
-| `GET /events` | `?t=<MULTICHAT_VIEW_SECRET>` | SSE feed, honors `Last-Event-ID` for replay. Query-string auth is unavoidable here — `EventSource` can't set headers — so this secret does appear in account-private CF logs. Accepted risk; kept separate from the ingest secret so a leaked viewer link can't be used to forge chat. |
+| `GET /events` | `?t=<MULTICHAT_VIEW_SECRET>` **or** `<MULTICHAT_OVERLAY_SECRET>` | SSE feed, honors `Last-Event-ID` for replay. Query-string auth is unavoidable here — `EventSource` can't set headers — so this secret does appear in account-private CF logs. Accepted risk; kept separate from the ingest secret so a leaked viewer link can't be used to forge chat. |
+| `GET /overlay` | none (unauthenticated — Jon's call) | OBS browser-source overlay — transparent, read-only, shares `buildRow` with the PWA. Page load itself carries no chat data; it forwards whatever `t` it was given to `/events`/`/tts`, both still gated. See `docs/ARCHITECTURE.md` §3b. |
+| `GET /overlay/config` | `?t=<MULTICHAT_OVERLAY_SECRET>` | Builder page for the `/overlay` URL — never added to an OBS scene itself. |
+| `POST /tts` | `?t=<MULTICHAT_OVERLAY_SECRET>` only | Server TTS (Workers AI) for the overlay — real-money endpoint, DO-gated (kill switch, 20/min, 25k chars/day). |
+| `POST /overlay/admin` | `?t=<MULTICHAT_OVERLAY_SECRET>` only | TTS kill-switch toggle. Briefly unauthenticated (2026-08-27), gate restored the same day — shares the overlay secret with `/tts`/`/overlay/config` rather than a separate `MULTICHAT_ADMIN_SECRET` (retired, not checked anywhere). See §3b. |
 | `POST /ingest/yt` | `X-Multichat-Secret: <MULTICHAT_INGEST_SECRET>` **or** `<MULTICHAT_RAIDQ_INGEST_SECRET>` header | YouTube poller ingest, or an optional external membership-renewal cron |
 | `POST /eventsub/callback` | `Twitch-Eventsub-Message-Signature` (HMAC-SHA256 vs `EVENTSUB_SECRET`) | Twitch EventSub webhook — redemptions, hype train, ad break, mod-action attribution. **First public unauthenticated route** in this Worker; see `docs/ARCHITECTURE.md` §3a for the full verification spec. |
 | `GET /api/version` | none | `{ releaseVersion }`, `no-store` |
 | `GET /manifest.webmanifest` | none | PWA manifest, `application/manifest+json`, `no-store` |
 | `GET /icon-180.png` / `/icon-192.png` / `/icon-512.png` | none | PWA icons, embedded base64, `public, max-age=31536000, immutable` |
+| `GET /favicon.ico` | none | 32x32 PNG (browsers accept PNG bytes at a `.ico` path, no real `.ico` container), embedded base64, resized offline from `ICON_180_B64` — `public, max-age=86400` (shorter than the PWA icons above: every tab/bookmark/history entry fetches this, not just an installed PWA). Linked from all 3 served pages (`<link rel="icon" href="/favicon.ico">`), never touches the DO. |
 
 ## Full architecture & operations doc
 
@@ -130,6 +135,10 @@ Any IRC line the parser doesn't classify (and isn't known connection/membership 
 
 Setup: `wrangler r2 bucket create multichat-capture`, then add a 30-day lifecycle rule scoped to the `capture/` prefix (dashboard or `wrangler r2 bucket lifecycle` — self-cleans, this is exhaust, not archive).
 
+## Twitch GIF chat images (Twitch only, worker-only change, no poller)
+
+Twitch's `gifs` IRC tag (`<start>-<end>|<gifID>|<gifURL>[,...]`, docs dated 2026-07-31, zero-based body indices like `emotes`) renders inline the same way native emotes do — spliced into the shared `renderText()` walker (`mergeAnnotations`, `src/lib.js`) as a default-on `<img class="gif">` (max-height 96px, rounded). Server-side host allowlist (`https:` + `/^media\d*\.giphy\.com$/`, `sanitizeGifs`/`isAllowedGifHost` in `src/worker.js`) mirrors the YouTube emoji allowlist's degrade-not-drop shape: a rejected host drops the url and renders the bracketed alt text as plain gray `.gif-alt` text instead, never the whole row. The client's `#gifsToggle` (default on, `localStorage` key `multichat-gifs`) is the PWA-only bandwidth toggle — off shows a tappable `[GIF]` chip that loads the image only on tap, since Twitch forbids picking a smaller GIF rendition and IRL cellular data isn't free. GIF rows carry no `kind`, so they're excluded from TTS/buzz exactly like a plain chat message. The overlay has its own `gifAlt` config param (`OVERLAY_PARAM_SPEC`, default **on**, set via `/overlay/config`) that forces GIF rows to render as alt text only until a scene operator explicitly sets `gifAlt=off` per scene — separate from `#gifsToggle`; the PWA default (eager image, on) is unaffected either way. Full spec (wire format, malformed-entry skip reasons, structured logging shape) in `docs/ARCHITECTURE.md` §2c/§3.
+
 ## YouTube parity (custom emojis, mod actions)
 
 YouTube custom (channel) emojis render inline via the same `renderText()`/`emotes` mechanism as Twitch — entries carry `{url, alt, start, end}` (vs Twitch's `{id, start, end}`), `start`/`end` are Unicode **code-point** offsets on both the poller and client side (never UTF-16 code units — this is the one hard correctness invariant, see `docs/ARCHITECTURE.md` §2c). Standard unicode emoji stay plain text. Emote image URLs are worker-side host-allowlisted (`ggpht.com`/`googleusercontent.com` for member-custom emoji, `gstatic.com` for YouTube's own global non-member emoji — added 2026-08-08, per an internal audit — https only) at ingest — a disallowed host degrades to alt text, a structurally invalid entry (bad offsets/overlap) is dropped outright, never reaching the client. YouTube mod actions (single-message delete, author-level removal) mirror Twitch's CLEARMSG/CLEARCHAT handling exactly: mark-in-place (`deleted: true`) + a gray info row naming the author when still in the ring, plus a transient live-only `mark` SSE event. See `docs/ARCHITECTURE.md` §3/§4 for the full wire shape and trust boundary.
@@ -161,7 +170,7 @@ render mapping, the mod-attribution ownership rule — in
 |---|---|
 | `wrangler dev` | Local development server |
 | `wrangler deploy` | Deploy to Cloudflare |
-| `npm test` | Run vitest — worker's IRC tag parsing/normalization (pure functions) plus the yt-poller's own test suite |
+| `npm test` | Run vitest — worker's IRC tag parsing/normalization (pure functions) plus the yt-poller's own test suite. Includes `test/bundle-gif-render.test.js`, which shells out to `wrangler deploy --dry-run` — needs `wrangler.jsonc` present (gitignored, see Setup below) |
 | `npm run test:gate` | Real-workerd ingest-gate harness (`@cloudflare/vitest-pool-workers`) — DO input-gate dispatch probe, not part of `npm test` |
 
 ## Setup
@@ -174,6 +183,20 @@ wrangler secret put MULTICHAT_RAIDQ_INGEST_SECRET
 Three independent secrets — the view secret gates the phone-bookmarked viewer link (low trust, shown on stream, appears in CF's `/events` access logs since `EventSource` can't send a header); `MULTICHAT_INGEST_SECRET` gates the YouTube poller's POST; `MULTICHAT_RAIDQ_INGEST_SECRET` gates an optional external membership-renewal cron's POST (entirely optional — leave unset if you have no such cron). `handleIngestYt` accepts either ingest secret, but they're distinct values so neither caller can impersonate the other. Never reuse one value across secrets — that's the privilege-confusion bug this split fixes. If you do run such a cron, it must be set to the identical value: `wrangler secret put MULTICHAT_RAIDQ_INGEST_SECRET`, same string on both sides.
 
 **Rotating `MULTICHAT_INGEST_SECRET`:** off-stream only (a `secret put` cycles the DO — in-memory state resets, SSE clients reconnect); update the Worker secret and the poller's `docker-compose.yml` `environment:` block on the poller host to the identical new value. Full step-by-step, including the guards (verify the edit landed, validate YAML before recreating, confirm the old value now 401s) and the aliasing check against `MULTICHAT_RAIDQ_INGEST_SECRET`, is in `docs/ARCHITECTURE.md` §6 "Deploy Runbook" item 4.
+
+**OBS overlay (optional):**
+```
+wrangler secret put MULTICHAT_OVERLAY_SECRET
+```
+`MULTICHAT_OVERLAY_SECRET` gates `/overlay/config`, `/tts`, and `/overlay/admin` — deliberately **not** the view secret, so the OBS scene URL is independently rotatable without touching the phone-bookmarked `/events` link (it leaks far more readily — screen shares, scene-collection exports). `/events` itself accepts either the view or overlay secret. `GET /overlay` is unauthenticated (Jon's call — see the route table above); the page load carries no chat data. One secret, deliberately — `MULTICHAT_ADMIN_SECRET` was tried as a separate fourth secret for `/overlay/admin`, then dropped; it is retired and not checked anywhere, do not set it. Server TTS additionally needs the `ai` binding added to `wrangler.jsonc`:
+```jsonc
+"ai": {
+	"binding": "AI"
+},
+```
+`MULTICHAT_OVERLAY_SECRET` unset (or no `ai` binding) degrades the same way as every other optional feature here — `/overlay/config`, `/tts`, and `/overlay/admin` 401/204 rather than 500, chat is unaffected. Full design (the Worker/DO TTS split, ceilings, mod-action queue drop, replay-tag semantics) in `docs/ARCHITECTURE.md` §3b.
+
+**OBS Browser Source settings** for the overlay: *Shutdown source when not visible* **OFF** (the SSE connection and TTS speak-once ledger need to stay alive across scene switches — turning this on would silently re-speak the backlog on every switch back), *Control audio via OBS* **ON** (so the TTS audio routes through OBS's own mixer instead of the system's).
 
 `TWITCH_CHANNEL` is set in `wrangler.jsonc` `vars`.
 `TWITCH_BROADCASTER_ID` is also a `wrangler.jsonc` var (configured in `wrangler.jsonc`,

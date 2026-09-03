@@ -23,7 +23,7 @@
 
 import path from 'node:path';
 import { LiveChat } from 'youtube-chat';
-import { normalizeChatItem } from './normalize.mjs';
+import { normalizeChatItem, takeGlobalEmojiRenderCount } from './normalize.mjs';
 import { classifyYtItem } from './recovery.mjs';
 import {
   enqueueRetry, drainBatch, isRetryable, RETRY_QUEUE_MAX, SEND_CONCURRENCY, nextAttempt,
@@ -124,6 +124,10 @@ let retryBackoffMs = RETRY_BACKOFF_INITIAL_MS;
 let cycleFetched = 0;
 let cyclePosted = 0;
 let cycleFailed = 0;
+// Drained from normalize.mjs's non-sampled counter each cycle — see
+// takeGlobalEmojiRenderCount there for why this exists alongside the
+// existing 2%-sampled yt_global_emoji_render log.
+let cycleGlobalEmojiRenders = 0;
 
 // forensics rec 4 (internal doc, 2026-08-05): heartbeat-payload
 // health fields + the empty-200 zombie watchdog. lastChatAt/liveChatSessionActive/
@@ -343,6 +347,24 @@ function scheduleReconnect(delayMs) {
   if (delayMs == null) backoffMs = Math.min(backoffMs * 2, MAX_BACKOFF_MS);
 }
 
+// Defensive stringify for errorHistory entries (yt_session_end's lastErrors,
+// below) — this is the poller's own error path, which must never itself
+// throw. err.message is normally a string, but nothing guarantees it (a
+// library could set a non-string/circular .message); String() never throws
+// on those the way JSON.stringify would, but wrap anyway in case a custom
+// toString() does. Capped separately from ERROR_HISTORY_MAX (entry count)
+// so one pathological message can't blow out the log line.
+const ERROR_HISTORY_ENTRY_MAX_LEN = 300;
+function safeErrorText(value) {
+  let s;
+  try {
+    s = typeof value === 'string' ? value : String(value);
+  } catch {
+    s = '[unstringifiable error]';
+  }
+  return s.length > ERROR_HISTORY_ENTRY_MAX_LEN ? s.slice(0, ERROR_HISTORY_ENTRY_MAX_LEN) : s;
+}
+
 // youtube-chat's poll loop doesn't self-heal from a broken chat session (a
 // stale/invalid continuation token from its unofficial page-scraping) — on
 // error it just logs and keeps polling the same session forever. Seen live:
@@ -367,6 +389,13 @@ async function run() {
   const liveChat = new LiveChat({ channelId: YT_CHANNEL_ID });
   currentLiveChat = liveChat;
   let consecutiveErrors = 0;
+  // Last N error messages that drove consecutiveErrors, surfaced on
+  // yt_session_end below — audit round 2026-08-20 had to cross-reference
+  // poller_heartbeat against Worker-side logs by hand to tell a quiet
+  // end-of-broadcast from a genuine stall; this + classification puts that
+  // evidence directly on the one log line that already marks the boundary.
+  let errorHistory = [];
+  const ERROR_HISTORY_MAX = 5;
   // armedAt is set from the 'start' event, not here — that's the moment this
   // session actually establishes, before any chat items can arrive (the
   // library's first poll tick fires `interval` ms later).
@@ -437,6 +466,7 @@ async function run() {
     ephemeral = result.ephemeral;
     if (!result.send) return;
     const msg = normalizeChatItem(item);
+    cycleGlobalEmojiRenders += takeGlobalEmojiRenderCount();
     if (!msg) return;
     if (result.recovered) msg.recovered = true;
     post(msg);
@@ -445,6 +475,8 @@ async function run() {
   liveChat.on('error', (err) => {
     lastErrorMsg = err?.message ?? String(err);
     console.error(`live chat error: ${lastErrorMsg}`);
+    errorHistory.push(safeErrorText(lastErrorMsg));
+    if (errorHistory.length > ERROR_HISTORY_MAX) errorHistory.shift();
     consecutiveErrors++;
     if (consecutiveErrors >= MAX_CONSECUTIVE_ERRORS) {
       console.error(`${consecutiveErrors} consecutive errors — forcing reconnect`);
@@ -461,7 +493,31 @@ async function run() {
     const endedVideoId = videoIdTracker.get();
     videoIdTracker.onEnd(); // session's gone — stop spending quota on an ended stream's stats
     liveChatSessionActive = false; // idle until the next 'start' — zombie watchdog must not count offline silence
-    console.log(JSON.stringify({ ev: 'yt_session_end', videoId: endedVideoId, reason: reason || null }));
+    // classification is a best-effort read of the same liveness signal the
+    // zombie-watchdog threshold selection already trusts (see
+    // WATCHDOG_LIVENESS_GATE above) — 'not_live' at close time means YouTube
+    // itself confirms nothing's live (quiet end-of-broadcast, the expected
+    // MAX_CONSECUTIVE_ERRORS death path); 'live' means the close happened
+    // while YouTube still says the stream is up (a genuine stall worth
+    // investigating); 'unknown'/'gate_off' means the signal wasn't available
+    // this cycle — not a claim either way. Applies the identical
+    // livenessFresh/LIVENESS_MAX_AGE_MS guard the heartbeat interval uses for
+    // this same lastLiveness variable (FIX 2 above) — a stale sample must
+    // only ever read as 'unknown' here too, never a stale positive/negative.
+    const livenessFreshAtEnd = Date.now() - lastLiveness.at <= LIVENESS_MAX_AGE_MS;
+    const effectiveLivenessAtEnd = !WATCHDOG_LIVENESS_GATE
+      ? 'gate_off'
+      : livenessFreshAtEnd ? lastLiveness.state : 'unknown';
+    const classification = effectiveLivenessAtEnd === 'not_live' ? 'stream_ended'
+      : effectiveLivenessAtEnd === 'live' ? 'stall'
+      : 'unknown';
+    console.log(JSON.stringify({
+      ev: 'yt_session_end',
+      videoId: endedVideoId,
+      reason: reason || null,
+      lastErrors: errorHistory.slice(),
+      classification,
+    }));
     console.error('live chat ended (stream offline, or forced reconnect after errors) — retrying');
     scheduleReconnect(isStreamNotFound(lastErrorMsg) ? NOT_FOUND_BACKOFF_MS : undefined);
   });
@@ -603,6 +659,7 @@ setInterval(async () => {
     rtt_buckets: cycleRttBuckets,
     rtt_max_ms: Math.round(cycleRttMaxMs),
     rtt_count: cycleRttCount,
+    globalEmojiRenders: cycleGlobalEmojiRenders,
   }));
   // forensics rec 4 + round-3 audit: empty-200 zombie watchdog, threshold
   // now liveness-selected (see constants block). Gated on
@@ -643,6 +700,7 @@ setInterval(async () => {
   cycleRttBuckets = freshRttBuckets();
   cycleRttMaxMs = 0;
   cycleRttCount = 0;
+  cycleGlobalEmojiRenders = 0;
 }, HEARTBEAT_INTERVAL_MS);
 
 process.on('SIGTERM', () => process.exit(0));

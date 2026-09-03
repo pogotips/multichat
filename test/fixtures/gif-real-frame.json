@@ -1,0 +1,23 @@
+{
+  "_provenance": "Real Twitch PRIVMSG SSE frame captured from a live desktop Chrome repro, 2026-09-03. Server-side gif_host_accepted logged this exact url as accepted, but the PWA rendered zero <img class=\"gif\">, no console error. Root cause: esbuild's production bundle (wrangler deploy, minified — unlike wrangler dev / plain vitest imports) wraps a locally-scoped named closure (renderGifToken's old `buildImg` helper) in its `__name()` runtime helper; that call is baked into the closure's Function.prototype.toString() text, which is then re-embedded client-side via ${renderGifToken} template interpolation into a script where __name is never defined -- ReferenceError, silently swallowed by socket.onmessage's empty catch. See test/bundle-gif-render.test.js.",
+  "frame": {
+    "id": 1788412481845,
+    "platform": "tw",
+    "user": "StreamerName",
+    "isMod": true,
+    "isMember": true,
+    "gifs": [
+      {
+        "start": 0,
+        "end": 35,
+        "id": "3jVBfK0tmFvdIE1hPh",
+        "url": "https://media2.giphy.com/media/3jVBfK0tmFvdIE1hPh/giphy.gif?cid=095d7a5dl05s84681078wo13g5oaprtknnvjf0ajbmakmfgh&ep=v1_gifs_trending&rid=giphy.gif&ct=g"
+      }
+    ],
+    "text": "[Social Media Reaction GIF by Heels]",
+    "ts": 1788414600435,
+    "login": "streamername",
+    "twId": "efe67e6a-2a58-4a73-84c5-842315a56844",
+    "twTs": 1788414600341
+  }
+}

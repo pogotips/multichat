@@ -5,6 +5,7 @@ import {
   parsePrivmsg,
   parseUsernotice,
   parseEmotes,
+  parseGifs,
   parseClearmsg,
   parseClearchat,
   parseRoomstate,
@@ -196,6 +197,140 @@ describe('parseEmotes', () => {
     expect(cps[2]).toBe('K');
     const [emote] = parseEmotes('25:2-6');
     expect(cps.slice(emote.start, emote.end + 1).join('')).toBe('Kappa');
+  });
+});
+
+// Twitch gifs tag (docs dated 2026-07-31): "start-end|gifID|gifURL[,...]",
+// zero-based body indices like emotes, range covers the bracketed alt-text
+// body. Host allowlist (media<N>.giphy.com, https-only) is exercised through
+// parsePrivmsg end-to-end since sanitizeGifs isn't exported (same shape as
+// the YT emoji-host tests going through normalizeYt, not sanitizeYtEmotes
+// directly).
+describe('parsePrivmsg: gifs tag', () => {
+  // Docs example, used verbatim.
+  const DOCS_LINE = '@badge-info=subscriber/30;badges=broadcaster/1,subscriber/0;color=#033700;display-name=TwitchDev;emotes=;first-msg=0;flags=;gifs=0-33|joSNxeswxuc74Juo8X|https://media4.giphy.com/media/joSNxeswxuc74Juo8X/giphy.gif?cid=095d7a5dzizsiwgabonagkmigggv8v1spfai91ac3x0dsiy0&ep=v1_gifs_trending&rid=giphy.gif&ct=g;id=401abf17-7e99-45d6-9bdf-43934e839327;mod=0;returning-chatter=0;room-id=12826;subscriber=1;tmi-sent-ts=1783632907018;turbo=0;user-id=141981764;user-type= :twitchdev!twitchdev@twitchdev.tmi.twitch.tv PRIVMSG #twitch :[Y A Y Yes GIF by Djemilah Birnie]';
+  const DOCS_BODY = '[Y A Y Yes GIF by Djemilah Birnie]';
+  const DOCS_URL = 'https://media4.giphy.com/media/joSNxeswxuc74Juo8X/giphy.gif?cid=095d7a5dzizsiwgabonagkmigggv8v1spfai91ac3x0dsiy0&ep=v1_gifs_trending&rid=giphy.gif&ct=g';
+
+  it('parses the docs fixture verbatim', () => {
+    expect([...DOCS_BODY].length - 1).toBe(33); // sanity: the docs example's range matches its own body length
+    const parsed = parsePrivmsg(DOCS_LINE);
+    expect(parsed.text).toBe(DOCS_BODY);
+    expect(parsed.gifs).toEqual([{ start: 0, end: 33, id: 'joSNxeswxuc74Juo8X', url: DOCS_URL }]);
+  });
+
+  it('logs gif_host_accepted {host} unsampled, never the full url', () => {
+    const logSpy = vi.spyOn(console, 'log').mockImplementation(() => {});
+    parsePrivmsg(DOCS_LINE);
+    const accepted = logEvents(logSpy, 'gif_host_accepted');
+    expect(accepted).toEqual([{ ev: 'gif_host_accepted', host: 'media4.giphy.com' }]);
+    logSpy.mockRestore();
+  });
+
+  it('parses two gifs in one message', () => {
+    const bodyA = '[A]';
+    const bodyB = '[BB]';
+    const text = bodyA + ' ' + bodyB; // "[A] [BB]"
+    const startB = bodyA.length + 1;
+    const tag = `0-${bodyA.length - 1}|idA|https://media.giphy.com/a.gif,${startB}-${startB + bodyB.length - 1}|idC|https://media9.giphy.com/c.gif`;
+    const line = `@gifs=${tag};display-name=Foo :foo!foo@foo.tmi.twitch.tv PRIVMSG #chan :${text}`;
+    expect(parsePrivmsg(line).gifs).toEqual([
+      { start: 0, end: 2, id: 'idA', url: 'https://media.giphy.com/a.gif' },
+      { start: 4, end: 7, id: 'idC', url: 'https://media9.giphy.com/c.gif' },
+    ]);
+  });
+
+  it('unescapes \\: to a literal ; inside a gif url before splitting on , and |', () => {
+    // Wire form carries a literal backslash+colon (not a real ';') so the
+    // top-level parseIrcTags split on ';' doesn't cut the tag short; after
+    // per-value unescaping it becomes a real semicolon inside the URL.
+    const line = `@gifs=0-33|joSNxeswxuc74Juo8X|https://media4.giphy.com/x\\:y.gif;display-name=Foo :foo!foo@foo.tmi.twitch.tv PRIVMSG #chan :${DOCS_BODY}`;
+    const parsed = parsePrivmsg(line);
+    expect(parsed.gifs).toEqual([{ start: 0, end: 33, id: 'joSNxeswxuc74Juo8X', url: 'https://media4.giphy.com/x;y.gif' }]);
+  });
+
+  it('skips a malformed entry while a good sibling survives, logging gif_parse_skip once', () => {
+    const bodyA = '[A]';
+    const bodyC = '[CCC]';
+    const text = bodyA + ' ' + bodyC; // "[A] [CCC]"
+    const startC = bodyA.length + 1;
+    const tag = `0-${bodyA.length - 1}|idA|https://media.giphy.com/a.gif,bogus,${startC}-${startC + bodyC.length - 1}|idC|https://media9.giphy.com/c.gif`;
+    const line = `@gifs=${tag};display-name=Foo :foo!foo@foo.tmi.twitch.tv PRIVMSG #chan :${text}`;
+    const logSpy = vi.spyOn(console, 'log').mockImplementation(() => {});
+    const parsed = parsePrivmsg(line);
+    expect(parsed.gifs).toEqual([
+      { start: 0, end: 2, id: 'idA', url: 'https://media.giphy.com/a.gif' },
+      { start: 4, end: 8, id: 'idC', url: 'https://media9.giphy.com/c.gif' },
+    ]);
+    const skips = logEvents(logSpy, 'gif_parse_skip');
+    expect(skips).toEqual([{ ev: 'gif_parse_skip', reason: 'missing_parts' }]);
+    logSpy.mockRestore();
+  });
+
+  it('rejects http (non-https) — entry kept as alt text, url dropped, gif_host_rejected logged with host only', () => {
+    const line = `@gifs=0-33|joSNxeswxuc74Juo8X|http://media.giphy.com/g.gif;display-name=Foo :foo!foo@foo.tmi.twitch.tv PRIVMSG #chan :${DOCS_BODY}`;
+    const logSpy = vi.spyOn(console, 'log').mockImplementation(() => {});
+    const parsed = parsePrivmsg(line);
+    expect(parsed.gifs).toEqual([{ start: 0, end: 33, id: 'joSNxeswxuc74Juo8X' }]);
+    expect(logEvents(logSpy, 'gif_host_rejected')).toEqual([{ ev: 'gif_host_rejected', host: 'media.giphy.com' }]);
+    logSpy.mockRestore();
+  });
+
+  it('accepts media.giphy.com (zero-digit host variant)', () => {
+    const line = `@gifs=0-33|joSNxeswxuc74Juo8X|https://media.giphy.com/g.gif;display-name=Foo :foo!foo@foo.tmi.twitch.tv PRIVMSG #chan :${DOCS_BODY}`;
+    const parsed = parsePrivmsg(line);
+    expect(parsed.gifs).toEqual([{ start: 0, end: 33, id: 'joSNxeswxuc74Juo8X', url: 'https://media.giphy.com/g.gif' }]);
+  });
+
+  it('rejects evil.giphy.com.attacker.example — a suffix trick must never pass the host allowlist', () => {
+    const line = `@gifs=0-33|joSNxeswxuc74Juo8X|https://evil.giphy.com.attacker.example/g.gif;display-name=Foo :foo!foo@foo.tmi.twitch.tv PRIVMSG #chan :${DOCS_BODY}`;
+    const logSpy = vi.spyOn(console, 'log').mockImplementation(() => {});
+    const parsed = parsePrivmsg(line);
+    expect(parsed.gifs).toEqual([{ start: 0, end: 33, id: 'joSNxeswxuc74Juo8X' }]);
+    expect(logEvents(logSpy, 'gif_host_rejected')).toEqual([{ ev: 'gif_host_rejected', host: 'evil.giphy.com.attacker.example' }]);
+    logSpy.mockRestore();
+  });
+
+  it('skips a range past the body length, logging gif_parse_skip with reason range_out_of_bounds', () => {
+    const text = 'hi'; // 2 code points — max valid end is 1
+    const line = `@gifs=0-5|abc|https://media.giphy.com/g.gif;display-name=Foo :foo!foo@foo.tmi.twitch.tv PRIVMSG #chan :${text}`;
+    const logSpy = vi.spyOn(console, 'log').mockImplementation(() => {});
+    const parsed = parsePrivmsg(line);
+    expect(parsed.gifs).toBeUndefined();
+    expect(logEvents(logSpy, 'gif_parse_skip')).toEqual([{ ev: 'gif_parse_skip', reason: 'range_out_of_bounds' }]);
+    logSpy.mockRestore();
+  });
+
+  it('has no gifs key when the tag is absent', () => {
+    const line = ':foo!foo@foo.tmi.twitch.tv PRIVMSG #chan :hi';
+    expect(parsePrivmsg(line).gifs).toBeUndefined();
+  });
+});
+
+describe('parseGifs', () => {
+  it('parses a single entry', () => {
+    expect(parseGifs('0-4|abc123|https://media.giphy.com/g.gif', 5)).toEqual([
+      { start: 0, end: 4, id: 'abc123', url: 'https://media.giphy.com/g.gif' },
+    ]);
+  });
+
+  it('returns [] for empty/absent input', () => {
+    expect(parseGifs('', 10)).toEqual([]);
+    expect(parseGifs(undefined, 10)).toEqual([]);
+  });
+
+  it('skips a non-numeric range', () => {
+    const logSpy = vi.spyOn(console, 'log').mockImplementation(() => {});
+    expect(parseGifs('x-y|abc|https://media.giphy.com/g.gif', 10)).toEqual([]);
+    expect(logEvents(logSpy, 'gif_parse_skip')).toEqual([{ ev: 'gif_parse_skip', reason: 'non_numeric_range' }]);
+    logSpy.mockRestore();
+  });
+
+  it('skips end < start', () => {
+    const logSpy = vi.spyOn(console, 'log').mockImplementation(() => {});
+    expect(parseGifs('5-2|abc|https://media.giphy.com/g.gif', 10)).toEqual([]);
+    expect(logEvents(logSpy, 'gif_parse_skip')).toEqual([{ ev: 'gif_parse_skip', reason: 'end_before_start' }]);
+    logSpy.mockRestore();
   });
 });
 
@@ -987,5 +1122,17 @@ describe('filterRecoveredMessages', () => {
     const result = filterRecoveredMessages([emotesLine], { cutoffTs: 0, floorTs: 0, seenIds: new Set() });
     expect(result).toHaveLength(1);
     expect(result[0].data.emotes).toHaveLength(64);
+  });
+
+  it('clamps a recovered message gifs array to 8 (9 entries in, 8 out)', () => {
+    const text = 'x'.repeat(90);
+    const gifsTag = Array.from({ length: 9 }, (_, i) => `${i * 10}-${i * 10 + 9}|id${i}|https://media.giphy.com/g${i}.gif`).join(',');
+    const gifsLine = line('a', 1000, text).replace(
+      'tmi-sent-ts=1000',
+      `tmi-sent-ts=1000;gifs=${gifsTag}`
+    );
+    const result = filterRecoveredMessages([gifsLine], { cutoffTs: 0, floorTs: 0, seenIds: new Set() });
+    expect(result).toHaveLength(1);
+    expect(result[0].data.gifs).toHaveLength(8);
   });
 });

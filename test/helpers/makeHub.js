@@ -20,9 +20,20 @@ export function makeStorage(initial = {}) {
 // promise on the ctx object itself (`ctx.pendingBlockConcurrencyWhile`),
 // reachable from a hub as `hub.ctx.pendingBlockConcurrencyWhile` (ChatHub's
 // constructor stores `this.ctx = ctx`).
+//
+// Chained (not just invoked) so concurrent callers actually serialize, same
+// as the real primitive: a second blockConcurrencyWhile call queued while
+// the first's callback is still running must not start until the first
+// resolves. A naive `fn()`-and-return stub would let overlapping callers'
+// internal awaits interleave freely — exactly the race handleTtsAllow's
+// daily-budget block relies on this call to prevent — so a concurrency test
+// against that shape would pass or fail without ever exercising the
+// serialization it's meant to prove.
 function attachBlockConcurrencyWhile(ctx) {
-  ctx.blockConcurrencyWhile = async (fn) => {
-    const p = fn();
+  let chain = Promise.resolve();
+  ctx.blockConcurrencyWhile = (fn) => {
+    const p = chain.then(() => fn());
+    chain = p.catch(() => {}); // one rejecting callback must not wedge later callers
     ctx.pendingBlockConcurrencyWhile = p;
     return p;
   };

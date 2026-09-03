@@ -3,9 +3,17 @@
 // walker exactly (see renderText in src/worker.js). Standard (non-custom)
 // emoji must stay text-only; a plain message must be byte-identical to
 // pre-emoji-support behavior (regression guard).
-import { describe, it, expect, vi } from 'vitest';
-import { normalizeChatItem } from '../normalize.mjs';
+import { describe, it, expect, vi, beforeEach } from 'vitest';
+import { normalizeChatItem, takeGlobalEmojiRenderCount } from '../normalize.mjs';
 import { parseOne } from './helpers/envelope.mjs';
+
+// globalEmojiRenderCount (normalize.mjs) is module-level state, shared by
+// every it() in this file under Vitest's per-file (not per-test) isolation —
+// drain it before each test so one test's global-emoji renders can't leak
+// into another's count assertion.
+beforeEach(() => {
+  takeGlobalEmojiRenderCount();
+});
 
 import customEmojiMessage from './fixtures/custom-emoji-message.json';
 import standardEmojiMessage from './fixtures/standard-emoji-message.json';
@@ -283,6 +291,17 @@ describe('normalizeChatItem: yt_global_emoji_render sampled debug log', () => {
     }]);
     randSpy.mockRestore();
     logSpy.mockRestore();
+  });
+
+  it('takeGlobalEmojiRenderCount: non-sampled counter increments once per global-emoji render, drains to 0 on read, and ignores member-custom emoji', () => {
+    const item = parseOne(freshGlobalEmojiRenderer());
+    normalizeChatItem(item);
+    expect(takeGlobalEmojiRenderCount()).toBe(1);
+    expect(takeGlobalEmojiRenderCount()).toBe(0); // drained by the read above
+
+    const customItem = parseOne(freshCustomEmojiRenderer());
+    normalizeChatItem(customItem);
+    expect(takeGlobalEmojiRenderCount()).toBe(0); // member-custom emoji never counted here
   });
 });
 

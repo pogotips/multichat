@@ -1,0 +1,535 @@
+{
+  "_provenance": {
+    "generatedFrom": "git show HEAD:src/worker.js (origin/main snapshot, pre-extraction)",
+    "headSha": "7d1d7c829c4ba7039e9072c92dd9bb983ecc9cbf",
+    "generatedAt": "2026-08-25T03:02:05.827Z",
+    "note": "Do not hand-edit. Regenerate via the same throwaway script if main's render output legitimately changes."
+  },
+  "plain": {
+    "input": {
+      "platform": "twitch",
+      "user": "viewer1",
+      "text": "hello chat"
+    },
+    "myName": "",
+    "output": {
+      "tag": "div",
+      "className": "msg",
+      "children": [
+        {
+          "tag": "span",
+          "className": "badge twitch",
+          "children": [
+            {
+              "text": "twitch"
+            }
+          ]
+        },
+        {
+          "tag": "span",
+          "className": "user",
+          "children": [
+            {
+              "text": "viewer1:"
+            }
+          ]
+        },
+        {
+          "tag": "span",
+          "children": [
+            {
+              "text": "hello chat"
+            }
+          ]
+        }
+      ]
+    }
+  },
+  "mod": {
+    "input": {
+      "platform": "twitch",
+      "user": "modperson",
+      "text": "settle down",
+      "isMod": true
+    },
+    "myName": "",
+    "output": {
+      "tag": "div",
+      "className": "msg",
+      "children": [
+        {
+          "tag": "span",
+          "className": "badge twitch",
+          "children": [
+            {
+              "text": "twitch"
+            }
+          ]
+        },
+        {
+          "tag": "span",
+          "className": "user mod",
+          "children": [
+            {
+              "text": "modperson:"
+            }
+          ]
+        },
+        {
+          "tag": "span",
+          "children": [
+            {
+              "text": "settle down"
+            }
+          ]
+        }
+      ]
+    }
+  },
+  "sub": {
+    "input": {
+      "platform": "twitch",
+      "user": "memberperson",
+      "text": "hyped for this",
+      "isMember": true
+    },
+    "myName": "",
+    "output": {
+      "tag": "div",
+      "className": "msg",
+      "children": [
+        {
+          "tag": "span",
+          "className": "badge twitch",
+          "children": [
+            {
+              "text": "twitch"
+            }
+          ]
+        },
+        {
+          "tag": "span",
+          "className": "user member",
+          "children": [
+            {
+              "text": "memberperson:"
+            }
+          ]
+        },
+        {
+          "tag": "span",
+          "children": [
+            {
+              "text": "hyped for this"
+            }
+          ]
+        }
+      ]
+    }
+  },
+  "gold_financial": {
+    "input": {
+      "platform": "twitch",
+      "user": "baller",
+      "text": "take my bits",
+      "kind": "cheer",
+      "amount": "500 bits"
+    },
+    "myName": "",
+    "output": {
+      "tag": "div",
+      "className": "msg paid",
+      "children": [
+        {
+          "tag": "span",
+          "className": "badge twitch",
+          "children": [
+            {
+              "text": "twitch"
+            }
+          ]
+        },
+        {
+          "tag": "span",
+          "className": "user paid",
+          "children": [
+            {
+              "text": "baller:"
+            }
+          ]
+        },
+        {
+          "tag": "span",
+          "className": "amount",
+          "children": [
+            {
+              "text": "500 bits"
+            }
+          ]
+        },
+        {
+          "tag": "span",
+          "children": [
+            {
+              "text": "take my bits"
+            }
+          ]
+        }
+      ]
+    }
+  },
+  "twitch_emote": {
+    "input": {
+      "platform": "twitch",
+      "user": "viewer2",
+      "text": "Kappa",
+      "emotes": [
+        {
+          "id": "25",
+          "start": 0,
+          "end": 4
+        }
+      ]
+    },
+    "myName": "",
+    "output": {
+      "tag": "div",
+      "className": "msg",
+      "children": [
+        {
+          "tag": "span",
+          "className": "badge twitch",
+          "children": [
+            {
+              "text": "twitch"
+            }
+          ]
+        },
+        {
+          "tag": "span",
+          "className": "user",
+          "children": [
+            {
+              "text": "viewer2:"
+            }
+          ]
+        },
+        {
+          "tag": "span",
+          "children": [
+            {
+              "tag": "img",
+              "className": "emote",
+              "src": "https://static-cdn.jtvnw.net/emoticons/v2/25/default/dark/1.0",
+              "alt": "Kappa"
+            }
+          ]
+        }
+      ]
+    }
+  },
+  "youtube_emote": {
+    "input": {
+      "platform": "youtube",
+      "user": "ytviewer",
+      "text": ":wave:",
+      "emotes": [
+        {
+          "url": "https://yt3.ggpht.com/fake-emoji.png",
+          "alt": ":wave:",
+          "start": 0,
+          "end": 5
+        }
+      ]
+    },
+    "myName": "",
+    "output": {
+      "tag": "div",
+      "className": "msg",
+      "children": [
+        {
+          "tag": "span",
+          "className": "badge youtube",
+          "children": [
+            {
+              "text": "youtube"
+            }
+          ]
+        },
+        {
+          "tag": "span",
+          "className": "user",
+          "children": [
+            {
+              "text": "ytviewer:"
+            }
+          ]
+        },
+        {
+          "tag": "span",
+          "children": [
+            {
+              "tag": "img",
+              "className": "emote",
+              "src": "https://yt3.ggpht.com/fake-emoji.png",
+              "alt": ":wave:",
+              "loading": "lazy"
+            }
+          ]
+        }
+      ]
+    }
+  },
+  "gigantify": {
+    "input": {
+      "platform": "twitch",
+      "user": "baller2",
+      "text": "GIGANTIFIED",
+      "kind": "cheer",
+      "amount": "1000 bits",
+      "emote": {
+        "id": "25",
+        "name": "Kappa"
+      }
+    },
+    "myName": "",
+    "output": {
+      "tag": "div",
+      "className": "msg paid",
+      "children": [
+        {
+          "tag": "span",
+          "className": "badge twitch",
+          "children": [
+            {
+              "text": "twitch"
+            }
+          ]
+        },
+        {
+          "tag": "span",
+          "className": "user paid",
+          "children": [
+            {
+              "text": "baller2:"
+            }
+          ]
+        },
+        {
+          "tag": "span",
+          "className": "amount",
+          "children": [
+            {
+              "text": "1000 bits"
+            }
+          ]
+        },
+        {
+          "tag": "span",
+          "children": [
+            {
+              "text": "GIGANTIFIED"
+            }
+          ]
+        },
+        {
+          "tag": "img",
+          "className": "emote gigantify",
+          "src": "https://static-cdn.jtvnw.net/emoticons/v2/25/default/dark/3.0",
+          "alt": "Kappa",
+          "loading": "lazy"
+        }
+      ]
+    }
+  },
+  "mention": {
+    "input": {
+      "platform": "twitch",
+      "user": "friend",
+      "text": "hey streamer check this out"
+    },
+    "myName": "streamer",
+    "output": {
+      "tag": "div",
+      "className": "msg",
+      "children": [
+        {
+          "tag": "span",
+          "className": "badge twitch",
+          "children": [
+            {
+              "text": "twitch"
+            }
+          ]
+        },
+        {
+          "tag": "span",
+          "className": "user",
+          "children": [
+            {
+              "text": "friend:"
+            }
+          ]
+        },
+        {
+          "tag": "span",
+          "children": [
+            {
+              "text": "hey "
+            },
+            {
+              "tag": "span",
+              "className": "mention",
+              "children": [
+                {
+                  "text": "streamer"
+                }
+              ]
+            },
+            {
+              "text": " check this out"
+            }
+          ]
+        }
+      ]
+    }
+  },
+  "strike_marked": {
+    "input": {
+      "platform": "twitch",
+      "user": "deletedguy",
+      "text": "this got removed",
+      "deleted": true
+    },
+    "myName": "",
+    "output": {
+      "tag": "div",
+      "className": "msg deleted",
+      "children": [
+        {
+          "tag": "span",
+          "className": "badge twitch",
+          "children": [
+            {
+              "text": "twitch"
+            }
+          ]
+        },
+        {
+          "tag": "span",
+          "className": "user",
+          "children": [
+            {
+              "text": "deletedguy:"
+            }
+          ]
+        },
+        {
+          "tag": "span",
+          "children": [
+            {
+              "text": "this got removed"
+            }
+          ]
+        }
+      ]
+    }
+  },
+  "sys_info": {
+    "input": {
+      "sys": "info",
+      "text": "ROOMSTATE update"
+    },
+    "myName": "",
+    "output": {
+      "tag": "div",
+      "className": "msg info",
+      "children": [
+        {
+          "tag": "span",
+          "children": [
+            {
+              "text": "ROOMSTATE update"
+            }
+          ]
+        }
+      ]
+    }
+  },
+  "sys_raid": {
+    "input": {
+      "sys": "raid",
+      "text": "raider is raiding with 12 viewers"
+    },
+    "myName": "",
+    "output": {
+      "tag": "div",
+      "className": "msg raid",
+      "children": [
+        {
+          "tag": "span",
+          "children": [
+            {
+              "text": "🎉 raider is raiding with 12 viewers"
+            }
+          ]
+        }
+      ]
+    }
+  },
+  "sys_redeem": {
+    "input": {
+      "sys": "redeem",
+      "user": "redeemer",
+      "rewardTitle": "Hydrate!",
+      "userInput": "drinking now"
+    },
+    "myName": "",
+    "output": {
+      "tag": "div",
+      "className": "msg redeem",
+      "children": [
+        {
+          "tag": "span",
+          "children": [
+            {
+              "text": "redeemer redeemed Hydrate!: drinking now"
+            }
+          ]
+        }
+      ]
+    }
+  },
+  "sys_announce": {
+    "input": {
+      "sys": "announce",
+      "user": "modperson",
+      "text": "raffle starts in 5 min"
+    },
+    "myName": "",
+    "output": {
+      "tag": "div",
+      "className": "msg info",
+      "children": [
+        {
+          "tag": "span",
+          "children": [
+            {
+              "text": "modperson: raffle starts in 5 min"
+            }
+          ]
+        }
+      ]
+    }
+  },
+  "superseded_gigantify": {
+    "input": {
+      "platform": "twitch",
+      "user": "baller3",
+      "text": "x",
+      "superseded": true
+    },
+    "myName": "",
+    "output": null
+  }
+}

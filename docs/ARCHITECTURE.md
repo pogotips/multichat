@@ -184,6 +184,7 @@ string if unmapped).
 
 Role color precedence (`roleClass()`, shared by both platforms): `isMod` > financial `kind` (gold) > `isMember` > default text color. Twitch's per-user `tags.color` is parsed nowhere and never applied — role color only, everyone else (including VIPs and founders with no independent subscription) renders in the page's default text color.
 | `emotes` | Twitch `emotes` tag (`parseEmotes`) — entries `{id,start,end}`. YouTube custom emojis (poller `normalize.mjs`, worker `sanitizeYtEmotes`) — entries `{url,alt,start,end}` | Shared `renderText()` walker, one array, two entry shapes: Twitch derives the CDN URL from `id` (`EMOTE_ID_RE`-anchored before touching `img.src`); YouTube uses `url` directly (worker-side host-allowlisted at ingest, client re-checks as defense in depth — see §3). Both: inline `<img class="emote">` at text height, `onerror` falls back to the original text/shortcode. **`start`/`end` are Unicode code-point offsets (`[...str]` semantics), end inclusive, on both the Twitch and YouTube paths** — the poller computes YT offsets the same way the client walks them, verified by a multibyte fixture (astral + CJK + ZWJ-sequence emoji before a custom emoji). Standard unicode emoji never get an entry — they're plain text. |
+| `gifs` | Twitch `gifs` tag (`parsePrivmsg` -> `parseGifs` -> `sanitizeGifs`, `src/worker.js`, docs dated 2026-07-31) — entries `{start,end,id,url?}`, `url` present only if the host allowlist accepted it | Merged into the same `renderText()` walker as `emotes` (`mergeAnnotations`, `src/lib.js`) via a shared start-sorted annotation list — one code-point walk handles both. `start`/`end` are Unicode code-point offsets, end inclusive, same convention as `emotes`; the docs' wire format covers the whole bracketed alt-text body (`"[Y A Y Yes GIF by Djemilah Birnie]"`) in one range. Default-on eager `<img class="gif" loading="lazy" decoding="async">` (max-height 96px, rounded); the client's `gifs` localStorage toggle (off, mirrors `multichat-speak`'s pattern) instead renders a tappable `.gif-chip` that builds the `<img>` only on tap — IRL cellular bandwidth, GIFs are multi-MB and Twitch forbids picking a smaller rendition. Absent/rejected `url` (host disallowed, or a structurally-dropped entry) renders the bracketed alt text as plain gray `.gif-alt` text instead of an image — the row is never dropped. YouTube has no gif ingest path (Twitch-only feature; the poller sends no `gifs` field). GIF rows carry no `kind`, so they're structurally excluded from TTS/buzz (`emitCategory`) exactly like a plain chat message — never spoken. The overlay's `gifAlt` config param (`OVERLAY_PARAM_SPEC`, default **on** — same opt-in-not-opt-out posture as `ttsBody`, §3b) forces the `.gif-alt` text branch unconditionally regardless of url/host validity — a scene operator must explicitly set `gifAlt=off` per scene to see images at all. The PWA never reads this param and stays on its own default-on `gifsEnabled` eager `<img>` render regardless. |
 | `recovered` | Gap-recovery paths (both platforms, §4) | `.msg.recovered { opacity: .55 }`. **No longer TTS-suppressed by the `recovered` flag** (2026.07.20.3): a financial row that landed during a connection blip and is replayed as `recovered` now buzzes/speaks **once** via the `isEmittable` id-set gate, because it carries a fresh monotonic id above the floor. Re-replays and already-heard ids are deduped by `spokenIds`; rows older than `EMIT_TTL_MS` (30 min) never fire. |
 | *(uncaptured, unclassified)* | Any Twitch IRC line the parser doesn't recognize and isn't known connection/membership scaffolding (`isProtocolNoise`) | Never rendered — written to R2 capture (§4) as untrusted data, never dropped silently |
 
@@ -211,11 +212,35 @@ An emote entry's `url` must be `https:` and hostname-suffix-match `ggpht.com` or
 shortcode text still renders — the message row is never dropped) and logs
 `{ev:'emoji_host_rejected', host}` (host only, never the full URL), so a future
 YouTube CDN move surfaces as a log pattern rather than emoji silently degrading
-forever. Structurally invalid entries (bad types, out-of-range/overlapping/
+forever. The accept path logs the same shape, 2%-sampled,
+`{ev:'emoji_host_accepted', host}` — added in the 2026-08-20 log-only audit
+follow-up so the allowed-host positive path (e.g. `gstatic.com` for
+`/youtube/img/emojis/`) can be confirmed live instead of only inferred from
+zero rejections. Structurally invalid entries (bad types, out-of-range/overlapping/
 unsorted offsets against the message text) are **dropped outright**, not
 degraded — a buggy or compromised poller must never hand the client's
 `[...text]` walker an offset it can't trust. The client (`isAllowedEmojiUrl`)
 re-checks the same two-domain allowlist as defense in depth.
+
+**Twitch GIF image host allowlist** — same shape as the YouTube emoji
+allowlist above. Authoritative in `parsePrivmsg` (`sanitizeGifs`/
+`isAllowedGifHost`, `src/worker.js`): a gif entry's `url` must be `https:`
+and hostname must exactly match `/^media\d*\.giphy\.com$/` (a suffix/prefix
+trick like `evil.giphy.com.attacker.example` must never pass). A disallowed
+host **degrades** (url dropped, the bracketed alt text still renders as
+`.gif-alt` gray text — the row is never dropped) and logs
+`{ev:'gif_host_rejected', host}` (host only, never the full URL); the accept
+path logs `{ev:'gif_host_accepted', host}`, **unsampled** (unlike the YT
+emoji accept-log's 2% sample — GIF volume is expected to be far lower).
+Structurally invalid entries (missing parts, non-numeric range, `end < start`,
+or a range past the message body length) are **dropped outright** by
+`parseGifs`, one `{ev:'gif_parse_skip', reason}` log per message regardless
+of how many entries in that message were malformed (reason only, never the
+URL) — same "never trust the wire" posture as `sanitizeYtEmotes`. The client
+(`isAllowedGifUrl`, `src/lib.js`) re-checks the same host regex as defense in
+depth. The docs' URL-rendering contract ("must be rendered exactly as given,
+never modified") is honored throughout — accept/reject only ever decides
+whether `url` is kept, nothing ever rewrites it.
 
 **Capture files are untrusted chat-derived data.** Anything written to R2 via
 `flushCapture` (raw unclassified IRC lines) or the poller's
@@ -630,6 +655,169 @@ source IPs vary, so an IP-keyed throttle risks rate-limiting legitimate Twitch
 retries rather than an attacker. Accepted as-is rather than adding a
 `ratelimits` binding.
 
+## 3b. OBS Overlay & Server TTS
+
+`GET /overlay` is a read-only SSE consumer — transparent `html`/`body`, no
+controls, no pull-to-refresh, no service worker, no manifest, no error beacon.
+It shares one renderer (`buildRow`, `src/lib.js`) with the PWA rather than
+maintaining a second copy — `buildRow(msg, opts)` is pure (no `feed`,
+`MAX_ROWS`, `paused`, `unseenCount`, `updatePill`, `fireEmission`; everything
+arrives via `msg`/`opts`) and reaches the browser the same way `roleClass`/
+`emitCategory`/etc. already do: `Function.prototype.toString()` interpolation
+into the served page (`worker.js`'s `overlayHtml`/`pageHtml`), never a build
+step. `GET /overlay/config` is a separate page (never added to an OBS scene)
+that renders a handful of fixed fake rows via the same `buildRow`, exposes one
+control per `OVERLAY_PARAM_SPEC` entry (`src/lib.js`), and emits the finished
+`/overlay` URL — both pages import the same spec so they cannot drift.
+
+**Auth: one secret, and one route that deliberately carries none.**
+`MULTICHAT_OVERLAY_SECRET` gates `/overlay/config`, `/tts`, and
+`/overlay/admin` (`requireOverlayToken`) — the view secret is **not**
+accepted on any of them. An OBS scene URL leaks through screen shares and
+scene-collection exports far more readily than a phone-bookmarked link, so
+it must be independently rotatable without touching `/events`. `GET
+/overlay` is **unauthenticated** (Jon's call) — it still reads whatever `t`
+it was given from the query string and embeds it client-side (`overlayHtml`'s
+`TOKEN` constant) purely to forward to `/events`/`/tts` — the page load
+itself carries no chat data, so an unauthenticated request just gets a shell
+with a blank or non-working token, not live chat.
+
+`/overlay/admin` (the TTS kill switch) had a short unauthenticated window
+(2026-08-27, same commit that dropped `/overlay`'s gate): `requireAdminToken`
+and its own `MULTICHAT_ADMIN_SECRET` were removed outright rather than left
+dead. A background security review flagged the open kill switch the same
+day; Jon's call was to restore a gate on `/overlay/admin` specifically, but
+onto `MULTICHAT_OVERLAY_SECRET` rather than reintroducing a fourth secret —
+one secret is the standing design now, not two. `requireOverlayToken` itself
+was untouched throughout (it never stopped gating `/tts`/`/overlay/config`),
+so `handleOverlayAdmin` just gained the same call back
+(`const denied = requireOverlayToken(url, env)`) — no new function, no
+rewritten check logic, the exact proven gate reused a third time. The one
+exception among what remains gated: `/events` itself accepts *either* the
+view or overlay secret (`requireEventsToken`), mirroring `handleIngestYt`'s
+existing two-secret pattern — the overlay's own
+`EventSource` has to reach the same feed the PWA does, and there's no
+separate broadcast path. The duplicated `?t=` check that predated this
+feature (`handleEvents`/`handleClientError`) is one shared `requireViewToken`
+helper, next to `safeEqual`.
+
+**Param validation** (`OVERLAY_PARAM_SPEC`): colors are `/^#[0-9a-fA-F]{6}$/`
+only, `font` is a 6-entry hardcoded stack enum, `fontSize`/`maxRows`/
+`rowTtlSec`/`ttsVolume` are bounded integers, `order`/`outline`/`tts`/
+`ttsBody` are fixed enums. `validateOverlayConfig` never lets a raw param
+reach markup or a style block — an invalid value falls back to its default
+plus one `ev: 'overlay_param_reject'` log line, never a 500. `bg` backs each
+row's own background panel (a "text pill over video" look) — `html`/`body`
+themselves stay hardcoded transparent regardless of `bg`, that's not
+configurable.
+
+**Server TTS is split across the Worker and the DO on purpose.** `ChatHub` is
+single-threaded and owns every SSE client plus the IRC socket — awaiting a
+Workers AI generation there would put audio latency in the chat hot path, and
+streaming the result back through the stub would pin a DO request open for
+the whole generation. So the DO (`ChatHub.handleTtsAllow`, `/tts-allow`) does
+**only** a fast synchronous check-and-increment and returns a verdict; the
+Worker (`handleTts`, `POST /tts`) does the actual `env.AI.run` call and
+streams the audio back. Model/speaker are single-source constants
+(`TTS_MODEL`/`TTS_SPEAKER`, currently `@cf/deepgram/aura-2-en` / `luna`) —
+verified live against `developers.cloudflare.com/workers-ai/models/aura-2-en`
+during design: $0.03/1k chars, `ReadableStream` of MPEG audio, 40-voice enum.
+`/tts` is POST (not GET) specifically so donation text never lands in a query
+string / request log.
+
+Three independent ceilings, deliberately different persistence:
+- **20 calls/min**, in-memory (`ChatHub.ttsMinuteWindow`/`ttsMinuteCount`) —
+  resets on DO eviction, which is fine since its job is bursty-abuse-in-the-
+  moment, not a spend ceiling. This is the guard that actually bites: 20
+  calls/min × the 200-char server-side cap would exhaust the Workers AI free
+  daily neuron allocation in under a minute.
+- **25,000 chars/day**, `ctx.storage` (`TTS_DAILY_STORAGE_KEY = 'ttsDaily'`,
+  shape `{day, chars}`) — survives DO eviction, so it's the real spend
+  ceiling. Window resets at **UTC midnight** (`Date.prototype.toISOString`
+  date-string comparison), not a rolling 24h. Stop-loss framing: a full
+  stream's real financial-TTS volume is ~1,200 chars, so this is ~20x
+  headroom, capping a runaway at ~$0.75/day.
+- **Kill switch** (`TTS_KILL_STORAGE_KEY = 'ttsKill'`, also `ctx.storage`),
+  flipped via `POST /overlay/admin {op:'tts_kill', on}` — gated by
+  `requireOverlayToken` / `MULTICHAT_OVERLAY_SECRET`, the same secret
+  `/tts` and `/overlay/config` check. Briefly unauthenticated on 2026-08-27
+  (dropped along with `/overlay`'s own gate, then restored the same day onto
+  the overlay secret rather than a reintroduced fourth secret).
+
+Every gate failure (`killed`/`minute`/`budget`) and every generation error
+logs one `ev` line (`tts_killed`/`tts_throttled`/`tts_budget_exhausted`/
+`tts_generate_error`/etc.) and fails **silent to the caller** — `/tts` returns
+204, never a 500 and never a visible error to the viewer/OBS source. Silent
+failure to the operator would read as "TTS is broken" mid-stream; the log
+line is how that gets diagnosed instead.
+
+**Spoken-body scope (a real feature addition, not just a fix).**
+`formatUtterance` (PWA, frozen — "PWA keeps Web Speech, unchanged") never
+reads `msg.text`; the PWA's TTS has always spoken a templated summary only
+("Jon, cheer, 500 bits"), never the donation message. The overlay's own
+`formatOverlayUtterance` *can* speak a financial row's message body, opt-in
+via `ttsBody` (default **off** — a moderation surface a viewer can pay to
+have spoken aloud gets probed, so the scene operator opts in deliberately,
+per scene). Body text runs through `sanitizeSpokenBody` (`src/lib.js`): strip
+control chars → strip URLs → collapse runs of a repeated char beyond 3 →
+`normalizeSpokenMentions` → hard-cap at 120 chars — that 120-char cap is the
+body's *own* budget, separate from and smaller than `/tts`'s own 200-char
+whole-utterance cap, specifically so a long donation message can never
+truncate the name/amount prefix out of the utterance. A body that sanitizes
+to `''` (e.g. a message that was only a URL) degrades exactly to
+`formatUtterance`'s own line, never to a broken or silent utterance. Body
+speech is financial-rows-only, never chat/raid/sys, regardless of the
+`tts=all` setting — `tts=all` additionally speaks plain chat rows through a
+separate, simpler `"<name> says <text>"` utterance (mention-normalized, not
+run through the control/URL/collapse pipeline — that pipeline's hardening is
+specifically about untrusted donation text).
+
+**Mod-action drop: "deleted must mean unspoken."** The overlay's TTS queue
+carries the same identity fields `buildRow` stamps onto its row
+(`dataset.twid`/`login`/`ytid`/`ytauthor`) — `markMatchesQueueItem` (pure,
+`src/lib.js`) mirrors the PWA's own `mark`-listener branching field-for-field
+against a queued item's identity. On a `mark` event, any matching queued
+(not-yet-played) utterance is dropped; a matching **currently-playing or
+currently-generating** utterance is cancelled via a `currentCancelled` flag,
+checked right after each `await` in `pumpQueue` — not just `currentAudio.
+pause()`, which covers only the post-generation playing case and, on its
+own, has two gaps: (1) a mark arriving while the `/tts` fetch is still in
+flight (before `currentAudio` even exists) would otherwise be silently
+swallowed and the audio would still play once the fetch resolved; (2)
+`pause()` does not fire `onended`/`onerror`, so without explicitly resolving
+the pending playback `Promise` (`currentResolvePlayback`) a mid-playback
+strike would permanently stall the entire queue — `ttsPlaying` stuck `true`
+forever, nothing speaks again until reload. Both closed before this shipped.
+
+**Replay tagging is for animation suppression only, not TTS suppression.**
+`sendToController` (the ring-replay writer — confirmed sole caller is the
+replay loop, `broadcast`'s live path is separate) tags every replayed frame
+`replay: true`. A fresh connect gets zero ring rows at all (replay is
+entirely inside `if (lastEventId)`), so a scene-switch reload was never the
+risk here — the only frames that ever carry `replay: true` arrive after a
+**transient reconnect**, and those are messages the overlay hasn't spoken
+yet and *should*. So `replay: true` suppresses the entry animation only; TTS
+suppression stays governed entirely by the overlay's own
+floor+spokenIds+`EMIT_TTL_MS` predicate (same shape as the PWA's
+`isEmittable`, just not that exact function — its category gate is fixed to
+the PWA's financial/raid/silent split, while the overlay's category decision
+is `config.tts`-driven).
+
+**localStorage: separate key, not a shared one.** The overlay writes exactly
+one key, `multichat-ov-spoken` — namespaced apart from the PWA's four
+(`multichat-fontsize-px`/`multichat-spoken`/`multichat-speak`/
+`multichat-token`) despite sharing an origin. Same origin + unnamespaced keys
+would let the two surfaces cross-suppress each other's spoken message ids.
+
+**The `@` fix applies to both surfaces.** `cleanSpokenName` (`src/lib.js`)
+gains a leading-`@` strip that runs *before* the existing trailing-digit
+strip and the `<2`-char guard, falling back de-`@` → original, never empty
+(`"@Jon_123"` → `"Jon"`, `"@x"` → `"x"`, `"@"` alone stays non-empty).
+`normalizeSpokenMentions` turns an in-body `@name` into just `name` for
+speech (`/(^|\s)@(\S)/` → `$1$2`) — an email address like `a@b.com` is
+untouched, since its `@` isn't preceded by whitespace/start-of-string.
+Display text is never touched by either — spoken output only.
+
 ## 4. Gap Recovery & Telemetry/Capture Sinks
 
 ### Twitch (server-side, in the DO)
@@ -763,7 +951,12 @@ retries rather than an attacker. Accepted as-is rather than adding a
     during an active stream (once per global emoji in every message), so
     full logging was rejected on cost/noise grounds; 2% is enough to catch a
     recurring bad `emojiText`/`alt` pair within a few dozen occurrences
-    without meaningfully inflating log volume.
+    without meaningfully inflating log volume. A non-sampled counter rides
+    alongside it (`takeGlobalEmojiRenderCount()`, drained into the
+    `poller_heartbeat` log's `globalEmojiRenders` field each cycle — added
+    2026-08-20 after an audit window with zero sampled hits over an
+    otherwise-active 24h couldn't tell "genuinely zero" from "sampling never
+    caught one").
   - `tw_resub_streak_raw {login, rawStreakMonths, rawShouldShareStreak}` —
     logged in `parseUsernotice` for every `resub` USERNOTICE, before
     `parseStreakMonths`/`parseShouldShareStreak` (§2's streak-coverage logic,
@@ -863,7 +1056,10 @@ retries rather than an attacker. Accepted as-is rather than adding a
   (`poller.mjs`'s top-level `setInterval`, NOT live-gated — it runs
   identically whether a stream is live or not) logs one bounded line:
   `{ev: 'poller_heartbeat', fetched, posted, failed, status, counts,
-  rtt_buckets, rtt_max_ms, rtt_count}`.
+  rtt_buckets, rtt_max_ms, rtt_count, globalEmojiRenders}`.
+  `globalEmojiRenders` (added 2026-08-20) is the non-sampled counterpart to
+  `yt_global_emoji_render` above — a single cycle-scoped integer, no
+  per-emoji fields, drained via `takeGlobalEmojiRenderCount()`.
   `fetched` = chat items received from `youtube-chat` this cycle (all
   renderer types); `posted` = `post()` attempts for non-heartbeat messages
   this cycle (retry re-sends go through `sendOnce` directly via
@@ -887,7 +1083,21 @@ retries rather than an attacker. Accepted as-is rather than adding a
 - **Stuck-session self-heal**: `youtube-chat`'s poll loop doesn't recover from
   a broken chat session on its own (stale continuation token) — the poller
   forces a reconnect after `MAX_CONSECUTIVE_ERRORS` = 8 consecutive `error`
-  events (`poller.mjs`).
+  events (`poller.mjs`). `stop()` has only two callers (this path and the
+  zombie watchdog) — there is no clean stream-ended signal from YouTube, so
+  `MAX_CONSECUTIVE_ERRORS` is also the expected, ordinary death path for a
+  normal end-of-broadcast, not just a failure path. `yt_session_end` (added
+  2026-08-20) carries `{ev: 'yt_session_end', videoId, reason, lastErrors,
+  classification}` — `lastErrors` is the last 5 error messages that drove
+  `consecutiveErrors` (bounded array, reset per session); `classification` is
+  a best-effort read of the same liveness signal the zombie-watchdog
+  threshold selection already trusts (`lastLiveness.state` at close time):
+  `'stream_ended'` (YouTube confirms `not_live`, the expected quiet-tail
+  case), `'stall'` (YouTube still says `'live'` — worth investigating), or
+  `'unknown'` (`'unknown'`/`'gate_off'`, signal unavailable this cycle — not
+  a claim either way). Added specifically so a following audit doesn't need
+  to hand-cross-reference `poller_heartbeat` against Worker-side logs to
+  answer this, as the 2026-08-20 round had to.
 - **Stream-not-live retry cadence** (2026.07.20.3, TRIAGE remediation): the
   2026-07-20 incident's ~8-9 min stream-start ingest outage was
   `"Live Stream was not found"` repeating while `scheduleReconnect`'s normal
@@ -918,6 +1128,17 @@ All client behavior lives in the inline `<script>` inside `PAGE_HTML`
   already-rendered rows via `[data-twid]`/`[data-login]` selectors.
 - **Emotes**: native Twitch CDN images inline, dark/static variant, text
   fallback on load failure (§2c).
+- **GIFs (Twitch only)**: default-on `#gifsToggle` (🎞️/🎞️🚫), persisted to
+  `localStorage` (`multichat-gifs`, absence-means-on — the opposite polarity
+  from `multichat-speak` below) — the PWA-only bandwidth toggle mentioned in
+  §2c/§3. Off renders a tappable `.gif-chip` instead of an eager `<img>`;
+  `/overlay` and `/overlay/config`'s preview don't wire this toggle at all
+  (no `gifsEnabled` passed to `buildRow`, so `renderText`'s
+  `gifsEnabled !== false` default applies) — deliberate, since the overlay
+  runs on the OBS host, not a cellular phone. The overlay instead has its
+  own `gifAlt` config param (`OVERLAY_PARAM_SPEC`, default **on** — §2c/§3b)
+  that forces alt-text-only rendering unless a scene operator explicitly
+  sets `gifAlt=off` per scene; unrelated to and independent of this toggle.
 - **TTS read-aloud**: default-off `#speakToggle`
   (🔊/🔇). Buzz and speak fire from **one shared gate**, `fireEmission(msg,
   buzzPattern)`, which calls `isEmittable(msg, {floor, spokenIds, now})` —
@@ -1041,6 +1262,15 @@ All client behavior lives in the inline `<script>` inside `PAGE_HTML`
    always-on host outside Cloudflare (your compose host), in a Docker Compose
    stack directory of your choosing. It is **rsync'd from this repo, never
    hand-edited on the host** — see `CLAUDE.md`. Rollout pattern:
+   - **Step zero, every time, no exceptions**: fresh timestamped
+     `tar -czf` of the whole stack directory (e.g.
+     `/path/to/your/stack`) before touching anything — rsync,
+     compose edits, restarts, all of it. The stack directory holds
+     host-only files (`docker-compose.yml` — see the protected-host-files
+     list in `INSTALL.md`) that this repo has no other copy of; a tar taken
+     *before* the touch is the only way back if the touch goes wrong.
+     2026-08-20 incident: an `rsync --delete` wiped the host-only
+     `docker-compose.yml` with no working backup on hand — see item below.
    - `rsync` the `tools/yt-poller/` contents to the stack directory on your
      compose host — e.g. `rsync -a --exclude=node_modules tools/yt-poller/ user@YOUR_POLLER_HOST:/path/to/your/stack`.
      The exclude matters: a bare `rsync -a` also syncs your local (gitignored)
@@ -1048,6 +1278,13 @@ All client behavior lives in the inline `<script>` inside `PAGE_HTML`
      the host's own, harmless to the Docker build (the Dockerfile's `COPY`
      never touches it) but wrong for the host-level "local `node poller.mjs`"
      debug path (2026-08-17 incident).
+     **Never pass `--delete` to this `rsync`, no exceptions.** Stale files
+     left behind in the stack directory have never caused a problem; a
+     deleted host-only file has (2026-08-20 incident — `docker-compose.yml`
+     is not in this repo, so `--delete` doesn't "clean up," it destroys the
+     only copy). If the stack directory has accumulated cruft you actually
+     want gone, remove it by hand over SSH after inspecting what's there —
+     never by letting rsync infer it from a diff against this repo.
      This is the exclusive deployment path; no other route (manual SSH edits,
      `docker cp`, editing via a stack-management UI's own file editor) is
      valid.
@@ -1066,7 +1303,12 @@ All client behavior lives in the inline `<script>` inside `PAGE_HTML`
 4. **Rollback** — both stages have a same-day tag pair (`rollback-YYYY-MM-DD`,
    pointing at the PREVIOUS deploy's commit/image, cut *before* the new
    deploy per the tag law in step 2/3 above). Literal commands, not just the
-   tag convention:
+   tag convention. **Every command below (and in step 3/5) is quoted
+   verbatim — run it as written, exact flags included (e.g. `--config
+   wrangler.jsonc`, never a bare `wrangler deploy` from a worktree that
+   lacks it). An improvised or added flag is a stop-and-ask, not a judgment
+   call — same failure mode as the 2026-08-20 `rsync --delete` incident
+   above: an "obviously fine" ad-hoc flag turned out not to be:**
    - **Worker, fast path** (traffic-split rollback, no redeploy needed): find
      the prior Version ID — `wrangler versions list --config wrangler.jsonc`
      (the one just before today's, timestamp-ordered) — then
@@ -1103,6 +1345,14 @@ All client behavior lives in the inline `<script>` inside `PAGE_HTML`
 5. **Rotating `MULTICHAT_INGEST_SECRET`** — same value must land on both the
    Worker and the poller; unlike `EVENTSUB_SECRET` this is an operational
    secret swap, not a code deploy, so the diff-review step above doesn't gate it.
+   **This is a hard 401 window, not an overlapping swap**: `handleIngestYt`
+   validates the incoming secret against exactly one current value
+   (`safeEqual(secret, env.MULTICHAT_INGEST_SECRET)`) — there is no
+   dual old/new acceptance during rotation. That's why the order below is
+   fixed (Worker secret first, then the host compose file, then the poller
+   restart) and why it's off-stream only: a live stream sees every poller
+   POST 401 from the moment the Worker's copy changes until the host's
+   copy and the restart both land.
    **Rotate off-stream only**: `wrangler secret put` publishes a new Worker
    version, which cycles the DO — in-memory ring/counter reset, SSE clients
    drop-and-resume. From the `multichat/` dir (confirm `wrangler.jsonc`
@@ -1128,9 +1378,63 @@ All client behavior lives in the inline `<script>` inside `PAGE_HTML`
      `MULTICHAT_RAIDQ_INGEST_SECRET` (the privilege-confusion bug the split is
      meant to prevent, §Setup) — stop, don't delete the rollback backup, and
      rotate `MULTICHAT_RAIDQ_INGEST_SECRET` on both sides too.
+   - **Known gap (2026-08-20 incident): the `rtk` output-filter hook's
+     redaction pattern only matched `KEY=value` and missed YAML's
+     `KEY: "value"`** — two secrets printed in cleartext into local tee logs
+     during a session that read a value back through an `rtk`-wrapped `ssh`.
+     The pattern needs to cover both syntaxes. `rtk`'s config
+     (`~/Library/Application Support/rtk/filters.toml`) lives outside this
+     repo (global Homebrew tool, not a project dependency) — the fix
+     belongs there, not here; this doc only records the requirement so it
+     isn't rediscovered blind next time. Whoever owns that config should
+     add a redaction test asserting both `SECRET=abc123` and
+     `secret_key: "abc123"` get masked.
+   - **Reading a secret value back after rotation (e.g. for a password
+     manager) must happen in a plain terminal you control directly, never
+     via any command Claude Code runs.** `rtk` tees raw output from every
+     Bash-tool command (not just `ssh`) to local log files
+     (`~/Library/Application Support/rtk/tee/`) for its output-filter
+     feature — an `ssh`/`grep` that prints the value back,
+     run through Claude Code's Bash tool (rtk-wrapped or not — the tee
+     happens regardless of the filter), recreates the exact leak this
+     incident was about. Copy the command, run it yourself in a separate
+     terminal window outside any Claude Code session.
 
 ## 7. Known Caveats
 
+- **`Function.prototype.toString()` interpolation is fragile against
+  production minification — confirmed live, not theoretical (2026-09-03
+  incident, "resolved" 2026.09.03.2).** `wrangler deploy` minifies via
+  esbuild by default even with no explicit `minify` key in `wrangler.jsonc`
+  — `wrangler dev` and plain `vitest` imports of `src/lib.js`/`src/worker.js`
+  do **not**, so this whole class of bug is invisible to `npm test` and to
+  local dev, only to the actual deployed bundle. The concrete failure: a
+  server-side-only Twitch GIF message logged `gif_host_accepted` correctly,
+  but the PWA rendered zero `<img class="gif">`, no console error — esbuild
+  had wrapped `renderGifToken`'s old locally-scoped `buildImg` closure (a
+  `const buildImg = () => {...}`) in its own `__name()` runtime helper
+  (defined only in the *server's* bundle scope), and that call was baked
+  into `buildImg`'s own `Function.prototype.toString()` text — which is
+  exactly what `${renderGifToken}` re-embeds into the *client* `<script>`,
+  where `__name` doesn't exist. `ReferenceError`, silently swallowed by
+  `socket.onmessage`'s `catch {}`. **Fix:** inline the `<img>`-building code
+  at both call sites instead of factoring it into a named local closure — a
+  bare `function`/`const x = () => {}` nested inside any interpolated
+  function is the trigger, not just `renderGifToken`'s specific case. Root-
+  caused and reproduced via `wrangler deploy --dry-run --outdir=<tmp>` (no
+  real deploy needed) — `test/bundle-gif-render.test.js` is the only test in
+  this repo that drives the actual bundled/minified output through a `vm`
+  sandbox rather than plain source; it would have caught this before ship.
+  **Any future interpolated function that defines its own named local
+  closure must be checked against that test before merging.** The test's
+  esbuild-runtime-helper sweep now covers all 24 `${helper}` interpolations
+  across the 3 served pages (static-text, not per-helper execution — see
+  `FASTFOLLOW_BATCH.md` item 8). The `socket.onmessage` `catch {}` itself was
+  the second problem exposed by this incident (an empty catch is exactly why
+  it produced no console error) — now reports via the existing client-error
+  beacon (`reportClientError`, error name + message only, never `e.data`/the
+  parsed frame) and, deliberately, still doesn't rethrow — one bad frame must
+  never stop the next one from rendering.
 - **iOS: reload doesn't replay the audio-unlock gesture** — *addressed
   2026.07.20.3 by hardening A* (§5), still manual-smoke-only on-device.
   Previously, on a page reload with `multichat-speak` already `on`, no `speak()`

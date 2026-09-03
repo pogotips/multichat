@@ -29,6 +29,40 @@ describe('icon routes', () => {
   });
 });
 
+describe('GET /favicon.ico', () => {
+  it('200, image/png, 1-day cache — unauthenticated, no ?t= needed', async () => {
+    const res = await worker.fetch(new Request('https://x/favicon.ico'), {}, {});
+    expect(res.status).toBe(200);
+    expect(res.headers.get('content-type')).toBe('image/png');
+    expect(res.headers.get('cache-control')).toBe('public, max-age=86400');
+    const bytes = new Uint8Array(await res.arrayBuffer());
+    // PNG magic bytes — proves it's a real decoded image, not an empty/garbled body.
+    expect([...bytes.slice(0, 8)]).toEqual([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a]);
+  });
+});
+
+describe('<link rel="icon"> present on every served page', () => {
+  it('PWA (GET /)', async () => {
+    const res = await worker.fetch(new Request('https://x/'), env, {});
+    const html = await res.text();
+    expect(html).toContain('<link rel="icon" href="/favicon.ico">');
+  });
+
+  it('/overlay', async () => {
+    const overlayEnv = { ...env, MULTICHAT_OVERLAY_SECRET: 'y' };
+    const res = await worker.fetch(new Request('https://x/overlay?t=y'), overlayEnv, {});
+    const html = await res.text();
+    expect(html).toContain('<link rel="icon" href="/favicon.ico">');
+  });
+
+  it('/overlay/config', async () => {
+    const overlayEnv = { ...env, MULTICHAT_OVERLAY_SECRET: 'y' };
+    const res = await worker.fetch(new Request('https://x/overlay/config?t=y'), overlayEnv, {});
+    const html = await res.text();
+    expect(html).toContain('<link rel="icon" href="/favicon.ico">');
+  });
+});
+
 describe('resolveToken', () => {
   it('fragment present, no storage — persists fragment', () => {
     expect(resolveToken({ fragmentToken: 'abc', storedToken: null }))
