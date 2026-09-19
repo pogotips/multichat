@@ -1,0 +1,14 @@
+{
+  "reactionBuckets": [
+    {
+      "totalReactions": 12,
+      "duration": { "seconds": "6" },
+      "intensityScore": 0.42,
+      "reactionsData": [
+        { "unicodeEmojiId": "❤", "reactionCount": 9 },
+        { "unicodeEmojiId": "😂", "reactionCount": 3 }
+      ]
+    }
+  ],
+  "updateTimeUsec": "1757800000000000"
+}

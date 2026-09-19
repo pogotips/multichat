@@ -29,9 +29,15 @@ import {
   enqueueRetry, drainBatch, isRetryable, RETRY_QUEUE_MAX, SEND_CONCURRENCY, nextAttempt,
   formatIngestFailureLog, formatIngestErrorLog,
 } from './retry-queue.mjs';
-import { bumpCount, appendCapture, CAPTURE_DIR, CAPTURE_FILE } from './capture.mjs';
+import {
+  bumpCount, appendCapture, CAPTURE_DIR, CAPTURE_FILE, CAPTURE_MAX_BYTES, REACTIONS_CAPTURE_FILE,
+  reactionCaptureLine, aggregateReactionBuckets, shouldPostReaction, reactionPostPayload,
+} from './capture.mjs';
 import { createVideoIdTracker, fetchYtVideoState } from './yt-counts.mjs';
 import { probeCurrentLiveId, createRediscoveryGate, resolveRediscoveryOutcome } from './rediscovery.mjs';
+import {
+  HEARTBEAT_INTERVAL_MS, REDISCOVERY_MIN, resolveLiveness, selectWatchdogThreshold, watchdogTick,
+} from './watchdog.mjs';
 
 const { YT_CHANNEL_ID, MULTICHAT_URL, MULTICHAT_INGEST_SECRET, YOUTUBE_API_KEY, WATCHDOG_LIVENESS_GATE: WATCHDOG_LIVENESS_GATE_RAW } =
   process.env;
@@ -88,6 +94,24 @@ const seenYtIds = new Set();
 // ride the heartbeat payload; raw items land in a bounded JSONL capture file.
 const unknownRendererCounts = {};
 const CAPTURE_PATH = path.join(CAPTURE_DIR, CAPTURE_FILE);
+// Live reaction bursts (heart/like fountain) — log-only capture file, same
+// dir/cap as CAPTURE_PATH, plus a status POST through the normal ingest lane
+// (see the 'chat' listener's emojiFountain branch below). reactionsSeen is
+// cumulative for the process lifetime, same convention as unknownRendererCounts.
+const REACTIONS_CAPTURE_PATH = path.join(CAPTURE_DIR, REACTIONS_CAPTURE_FILE);
+let reactionsSeen = 0;
+// Dedupes the ingest POST against the SAME rolling-window entity being
+// re-emitted across consecutive polls — updateTimeUsec only advances once
+// YouTube's fountain window actually recomputes, not on every poll that
+// happens to return it, so without this an unchanged burst would post (and
+// visibly re-trigger) as a brand-new one each time it's re-sent. A same-usec
+// poll can still carry a larger running total than the last one posted
+// (the window hasn't rolled yet, but more reactions landed in it) — that
+// must still post, as a delta (see reactionPostPayload), not be dropped.
+// Capture (below) is intentionally NOT deduped by this — the raw per-poll
+// record is exhaust for debugging, and seeing a repeated updateTimeUsec
+// there is itself useful signal, not noise.
+let lastReaction = null; // { usec, total, emoji }
 
 // Single send path for every non-heartbeat message (live and recovered
 // alike) — this is what kills the cold-boot stampede: without it, a history
@@ -144,83 +168,32 @@ let zeroStreak = 0;                // consecutive ungated heartbeat cycles with 
 // instead of tearing down a session it was never actually measuring.
 let sessionGeneration = 0;
 // The heartbeat interval and the counts/liveness poll are the same tick —
-// see the setInterval below. Every other *_MS/*_CYCLES constant here is
-// derived from this one so they can never drift out of sync with the actual
-// cadence (FIX 2 of the round-3 audit: an assumed-but-unverified interval
-// would silently age out every liveness sample and turn the gate into a
-// no-op). Guarded by a source-text regression test
-// (test/heartbeat-interval.test.mjs) rather than a runtime assertion, since
-// poller.mjs isn't import-safe in a test process (see zombie-watchdog.test.mjs).
-const HEARTBEAT_INTERVAL_MS = 15_000;
-
-// Round-3 audit (YT "stall" burst re-audit): the original single 3-min
-// threshold false-fired on 254/279 observed watchdog events because
-// liveChatSessionActive only means "a chat session attached", which YouTube
-// grants for waiting rooms that never go live — see the plan doc. Liveness
-// (from fetchYtVideoState, below) now SELECTS which threshold zeroStreak is
-// compared against; it never suppresses the watchdog outright. Suppressing
-// on `not_live` was the first-pass design and was rejected: the watchdog and
-// MAX_CONSECUTIVE_ERRORS below are the *only* two paths back to a fresh
-// fetchLivePage() call, and a rescheduled-but-undeleted waiting room
-// produces no errors — suppression would leave the poller polling a dead
-// continuation with no way out, losing chat for an entire subsequent stream.
+// see the setInterval below. Every *_MS/*_CYCLES watchdog constant is
+// derived from HEARTBEAT_INTERVAL_MS (defined in watchdog.mjs, imported
+// above) so they can never drift out of sync with the actual cadence (FIX 2
+// of the round-3 audit: an assumed-but-unverified interval would silently
+// age out every liveness sample and turn the gate into a no-op). Guarded by
+// a source-text regression test (test/heartbeat-interval.test.mjs) against
+// watchdog.mjs rather than a runtime assertion, since poller.mjs isn't
+// import-safe in a test process (see zombie-watchdog.test.mjs).
 //
-// ZOMBIE_WATCHDOG_MIN (15 min) — the live/unknown backstop, i.e. "a real
-// stuck continuation on a broadcast that might actually have chat to lose".
-// `unknown` deliberately takes this same patient threshold, never the
-// rediscovery one, so an ambiguous liveness read can only ever make the
-// watchdog *more* patient (fail open). Derived from a full week's measured
-// quiet-tail inside genuinely live chat: longest observed gap between
-// posted>0 heartbeat cycles was 540s (9m00s); 15 min is 1.67x that.
-const ZOMBIE_WATCHDOG_MIN = 15;
-const ZOMBIE_WATCHDOG_CYCLES = (ZOMBIE_WATCHDOG_MIN * 60_000) / HEARTBEAT_INTERVAL_MS;
-
-// REDISCOVERY_MIN (5 min) — the not_live path: liveness has positively
-// confirmed there's no broadcast to lose chat from. REFINEMENT 3: this is
-// now a CHECK cadence, not a teardown cadence — every REDISCOVERY_MIN, a
-// throwaway probe (rediscovery.mjs) re-resolves the channel's current live
-// videoId and compares it to the one this run() is holding; the real
-// session is only ever torn down if that id genuinely changed. First-pass
-// value went 12 -> 2 -> 5 across three revisions of this same audit: 12 was
-// too patient (a real new stream could lose 12 minutes of its opening
-// chat); 2 priced only the dedupe/reattach cost a full teardown-every-cycle
-// design carried and ignored the OTHER cost — the probe itself still
-// spends one fetchLivePage call every cycle regardless of outcome, and
-// sustained scraping is the one failure mode that could get discovery
-// throttled or blocked outright (which costs an entire stream, not a few
-// minutes of one). check-then-act (below) fully retires the dedupe cost;
-// it does nothing for the scrape-frequency cost, which is why this stayed
-// at 5 rather than returning to 2 once check-then-act became reachable.
-// Kept well below ZOMBIE_WATCHDOG_MIN so a stale waiting room is never more
-// patient than a confirmed-live session. Logged under its own event name,
-// yt_rediscovery, never zombie_watchdog_reconnect — this path is
-// expected/near-zero-cost in the common case, not a health signal, and
-// conflating the two was the original complaint this audit was chasing.
-const REDISCOVERY_MIN = 5;
-const REDISCOVERY_CYCLES = (REDISCOVERY_MIN * 60_000) / HEARTBEAT_INTERVAL_MS;
-// Independent cadence + single-flight gate for the probe itself (HIGH
-// finding, round-3 audit review round): the old design self-reset via a
-// full teardown on every fire ('end' -> fresh run() -> zeroStreak restart).
-// check-then-act removed that teardown in the common case, so nothing
-// else guaranteed probe spacing if the zeroStreak reset around the
+// Threshold-selection + zeroStreak decision logic (ZOMBIE_WATCHDOG_MIN,
+// REDISCOVERY_MIN, LEGACY_ZOMBIE_WATCHDOG_MIN, LIVENESS_MAX_AGE_MS,
+// resolveLiveness, watchdogTick) lives in watchdog.mjs — see that file for
+// the round-3 audit rationale (false-fire history, check-then-act,
+// fail-open liveness freshness). Kept there rather than inline so
+// zombie-watchdog.test.mjs can import the real decision function instead of
+// re-typing it.
+//
+// Independent cadence + single-flight gate for the rediscovery probe itself
+// (HIGH finding, round-3 audit review round): the old design self-reset via
+// a full teardown on every fire ('end' -> fresh run() -> zeroStreak
+// restart). check-then-act removed that teardown in the common case, so
+// nothing else guaranteed probe spacing if the zeroStreak reset around the
 // no-teardown path were ever wrong in a future edit — this gate makes
 // spacing correct on its own, independent of that bookkeeping.
 const rediscoveryGate = createRediscoveryGate({ minIntervalMs: REDISCOVERY_MIN * 60_000 });
 
-// Legacy single threshold, used only when WATCHDOG_LIVENESS_GATE=off (FIX 3)
-// — byte-for-byte the pre-round-3-audit behavior, so flipping the kill
-// switch is a true rollback, not a different design at a different number.
-const LEGACY_ZOMBIE_WATCHDOG_MIN = 3;
-const LEGACY_ZOMBIE_WATCHDOG_CYCLES = (LEGACY_ZOMBIE_WATCHDOG_MIN * 60_000) / HEARTBEAT_INTERVAL_MS;
-
-// Change 2 / FIX 2: a liveness sample older than this reads as 'unknown'
-// rather than being trusted — since 'unknown' always takes the patient
-// 15-min path (never a suppression), a frozen or cached sample can only ever
-// make the watchdog MORE patient, never hold it off indefinitely. In the
-// current wiring the sample is always produced and consumed in the same
-// setInterval tick (age ~0), so this is defense-in-depth against a future
-// refactor that decouples the two, not a control that fires today.
-const LIVENESS_MAX_AGE_MS = 4 * HEARTBEAT_INTERVAL_MS;
 let lastLiveness = { state: 'unknown', at: 0 };
 
 // Ingest-tail RTT tracking (Phase 3) — RTT is
@@ -442,6 +415,38 @@ async function run() {
       }
       return;
     }
+    // Live reaction bursts (heart/like fountain) — intermittent, rides
+    // frameworkUpdates rather than an action (see the patch). Per-bucket
+    // detail goes to a log-only capture file; the aggregated summary (one
+    // {total, intensity, emoji} object, not the raw per-bucket array) goes
+    // out through the normal ingest lane as its own status message type —
+    // never a chat row, never through classifyYtItem/normalizeChatItem.
+    // Both are skipped (no write, no post, no reactionsSeen bump) when every
+    // bucket in this poll totaled zero.
+    if (item.rendererType === 'emojiFountain') {
+      const videoId = videoIdTracker.get();
+      const line = reactionCaptureLine(item.raw, { ts: Date.now(), videoId });
+      if (line) {
+        try {
+          appendCapture(REACTIONS_CAPTURE_PATH, line, CAPTURE_MAX_BYTES);
+        } catch (err) {
+          console.error(`reactions capture write failed: ${err.message}`);
+        }
+      }
+      const agg = aggregateReactionBuckets(item.raw);
+      if (agg && shouldPostReaction(item.raw.updateTimeUsec, agg.total, lastReaction)) {
+        const payload = reactionPostPayload(agg, item.raw.updateTimeUsec, lastReaction);
+        // lastReaction advances even on a null (empty-delta) payload, so the
+        // same growth isn't re-evaluated on every subsequent poll of the
+        // same window.
+        lastReaction = { usec: item.raw.updateTimeUsec, total: agg.total, emoji: agg.emoji };
+        if (payload) {
+          reactionsSeen++; // counts posted bursts, not fountain entities seen
+          post({ type: 'yt_reactions', emoji: payload.emoji, intensity: payload.intensity });
+        }
+      }
+      return;
+    }
     // Mod-action control messages — bypass classifyYtItem/normalizeChatItem
     // entirely (these aren't ChatItems); routed through the same post()/queue
     // path as chat so they share retry/backoff behavior, never fire-and-forget.
@@ -501,13 +506,15 @@ async function run() {
     // while YouTube still says the stream is up (a genuine stall worth
     // investigating); 'unknown'/'gate_off' means the signal wasn't available
     // this cycle — not a claim either way. Applies the identical
-    // livenessFresh/LIVENESS_MAX_AGE_MS guard the heartbeat interval uses for
-    // this same lastLiveness variable (FIX 2 above) — a stale sample must
-    // only ever read as 'unknown' here too, never a stale positive/negative.
-    const livenessFreshAtEnd = Date.now() - lastLiveness.at <= LIVENESS_MAX_AGE_MS;
-    const effectiveLivenessAtEnd = !WATCHDOG_LIVENESS_GATE
-      ? 'gate_off'
-      : livenessFreshAtEnd ? lastLiveness.state : 'unknown';
+    // resolveLiveness guard (watchdog.mjs) the heartbeat interval uses for
+    // this same lastLiveness variable (FIX 2) — a stale sample must only
+    // ever read as 'unknown' here too, never a stale positive/negative.
+    const effectiveLivenessAtEnd = resolveLiveness({
+      gateEnabled: WATCHDOG_LIVENESS_GATE,
+      sampleState: lastLiveness.state,
+      sampleAt: lastLiveness.at,
+      now: Date.now(),
+    });
     const classification = effectiveLivenessAtEnd === 'not_live' ? 'stream_ended'
       : effectiveLivenessAtEnd === 'live' ? 'stall'
       : 'unknown';
@@ -612,29 +619,24 @@ setInterval(async () => {
   const countsOutcome = (!YOUTUBE_API_KEY || !videoId) ? 'skip' : (counts ? 'ok' : 'err');
   const lastMessageAgeSec = lastChatAt ? Math.round((Date.now() - lastChatAt) / 1000) : null;
 
-  // FIX 2 / Change 2: a stale sample is never trusted as a positive not_live
-  // read — it can only make the watchdog MORE patient (route to 'unknown'),
-  // never hold it off. FIX 3: the kill switch reports its own 'gate_off'
-  // value distinct from 'unknown', so heartbeat consumers can tell "off on
-  // purpose" from "couldn't classify this cycle".
-  const livenessFresh = Date.now() - lastLiveness.at <= LIVENESS_MAX_AGE_MS;
-  const liveness = !WATCHDOG_LIVENESS_GATE ? 'gate_off' : livenessFresh ? lastLiveness.state : 'unknown';
+  // resolveLiveness (watchdog.mjs, FIX 2/Change 2): a stale sample is never
+  // trusted as a positive not_live read — it can only make the watchdog MORE
+  // patient (route to 'unknown'), never hold it off. FIX 3: the kill switch
+  // reports its own 'gate_off' value distinct from 'unknown', so heartbeat
+  // consumers can tell "off on purpose" from "couldn't classify this cycle".
+  const liveness = resolveLiveness({
+    gateEnabled: WATCHDOG_LIVENESS_GATE,
+    sampleState: lastLiveness.state,
+    sampleAt: lastLiveness.at,
+    now: Date.now(),
+  });
 
-  // BLOCKING (round-3 audit): liveness SELECTS a threshold, it never
-  // suppresses — see the constants block above for why. not_live gets the
-  // cheap rediscovery cadence; live/unknown/gate_off all get the patient
-  // backstop (gate_off uses the pre-audit legacy constant so the kill switch
-  // is a true rollback).
-  const watchdogThresholdMin = !WATCHDOG_LIVENESS_GATE
-    ? LEGACY_ZOMBIE_WATCHDOG_MIN
-    : liveness === 'not_live'
-      ? REDISCOVERY_MIN
-      : ZOMBIE_WATCHDOG_MIN;
-  const watchdogThresholdCycles = !WATCHDOG_LIVENESS_GATE
-    ? LEGACY_ZOMBIE_WATCHDOG_CYCLES
-    : liveness === 'not_live'
-      ? REDISCOVERY_CYCLES
-      : ZOMBIE_WATCHDOG_CYCLES;
+  // selectWatchdogThreshold (watchdog.mjs, BLOCKING round-3 audit): liveness
+  // SELECTS a threshold, it never suppresses. not_live gets the cheap
+  // rediscovery cadence; live/unknown/gate_off all get the patient backstop
+  // (gate_off uses the pre-audit legacy constant so the kill switch is a
+  // true rollback).
+  const { min: watchdogThresholdMin } = selectWatchdogThreshold({ gateEnabled: WATCHDOG_LIVENESS_GATE, liveness });
 
   const status = await post({
     type: 'heartbeat',
@@ -660,39 +662,36 @@ setInterval(async () => {
     rtt_max_ms: Math.round(cycleRttMaxMs),
     rtt_count: cycleRttCount,
     globalEmojiRenders: cycleGlobalEmojiRenders,
+    // Cumulative for the process lifetime (never reset per-cycle), same
+    // convention as unknownRendererCounts — a burst is a rare, bursty event;
+    // a running total is more useful here than a per-15s-cycle count.
+    reactionsSeen,
   }));
-  // forensics rec 4 + round-3 audit: empty-200 zombie watchdog, threshold
-  // now liveness-selected (see constants block). Gated on
+  // watchdogTick (watchdog.mjs): forensics rec 4 + round-3 audit empty-200
+  // zombie watchdog, threshold liveness-selected internally. Gated on
   // liveChatSessionActive — this heartbeat interval is deliberately NOT
   // live-gated (see comment above), so cycleFetched===0 is the normal,
   // permanent state whenever there's no stream at all; ungated, this would
   // force a "reconnect" on a fixed cadence all night, every night, with no
-  // stream up.
-  if (liveChatSessionActive) {
-    if (cycleFetched === 0) {
-      zeroStreak++;
-      if (zeroStreak >= watchdogThresholdCycles) {
-        zeroStreak = 0; // avoid re-checking every tick — see rediscoveryGate below for the independent, authoritative spacing guarantee
-        // REFINEMENT 1: not_live rediscovery is expected, near-zero-cost in
-        // the common case, not a health problem — it gets its own event so
-        // it never pollutes zombie_watchdog_reconnect, which stays reserved
-        // for "something might actually be wrong".
-        if (WATCHDOG_LIVENESS_GATE && liveness === 'not_live') {
-          // fire-and-forget: logs its own outcome, tears down currentLiveChat
-          // itself only if the videoId genuinely changed. runRediscoveryProbe
-          // is not expected to ever reject (probeCurrentLiveId never does),
-          // but this must never surface as an unhandled rejection regardless.
-          runRediscoveryProbe().catch((err) => console.error(`rediscovery probe failed: ${err.message}`));
-        } else {
-          console.log(JSON.stringify({ ev: 'zombie_watchdog_reconnect', zeroStreakMin: watchdogThresholdMin, liveness }));
-          currentLiveChat?.stop('zombie watchdog: sustained fetched=0');
-        }
-      }
+  // stream up. avoid re-checking every tick on fire — see rediscoveryGate
+  // below for the independent, authoritative spacing guarantee.
+  const tick = watchdogTick({ liveChatSessionActive, zeroStreak, cycleFetched, liveness, gateEnabled: WATCHDOG_LIVENESS_GATE });
+  zeroStreak = tick.zeroStreak;
+  if (tick.fired) {
+    // REFINEMENT 1: not_live rediscovery is expected, near-zero-cost in the
+    // common case, not a health problem — it gets its own event so it never
+    // pollutes zombie_watchdog_reconnect, which stays reserved for
+    // "something might actually be wrong".
+    if (tick.event === 'yt_rediscovery') {
+      // fire-and-forget: logs its own outcome, tears down currentLiveChat
+      // itself only if the videoId genuinely changed. runRediscoveryProbe
+      // is not expected to ever reject (probeCurrentLiveId never does),
+      // but this must never surface as an unhandled rejection regardless.
+      runRediscoveryProbe().catch((err) => console.error(`rediscovery probe failed: ${err.message}`));
     } else {
-      zeroStreak = 0;
+      console.log(JSON.stringify({ ev: 'zombie_watchdog_reconnect', zeroStreakMin: watchdogThresholdMin, liveness }));
+      currentLiveChat?.stop('zombie watchdog: sustained fetched=0');
     }
-  } else {
-    zeroStreak = 0; // idle/offline — explicit reset, not just "don't increment"
   }
   cycleFetched = 0;
   cyclePosted = 0;

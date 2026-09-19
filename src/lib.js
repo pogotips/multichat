@@ -180,6 +180,18 @@ export function markMatchesQueueItem(mark, item) {
   return Boolean(mark.login) && item.login === mark.login;
 }
 
+// Client-side companion to the server's sse_replay_result log (src/worker.js
+// handleEvents) — decides whether a Last-Event-ID replay left a gap the
+// ring could no longer cover. ringFloor is the oldest surviving ring
+// message id, or null when the ring is empty (nothing was ever dropped, so
+// no gap is possible). Equal is anchored, not a gap: lastEventId === ringFloor
+// means the client's last-seen row is still the oldest one in the ring, so
+// every message after it was replayed intact.
+export function detectReplayGap(lastEventId, ringFloor) {
+  if (lastEventId == null) return false;
+  return ringFloor === null || lastEventId < ringFloor;
+}
+
 // ── Overlay param validation ────────────────────────────────────────────────
 // Single source of truth for both /overlay (which enforces this) and
 // /overlay/config (which renders controls from it) — importing the same
@@ -221,6 +233,11 @@ export const OVERLAY_PARAM_SPEC = {
   // stays default-on regardless of this param. See renderGifToken's
   // asAltOnly param above.
   gifAlt: { type: 'enum', values: ['on', 'off'], default: 'on' },
+  // OFF by default — unlike gifAlt (an opt-out safety default on content
+  // already flowing through chat), a reaction burst is a brand-new animated
+  // element on the scene with nothing behind it upstream; the scene operator
+  // opts in deliberately, per scene, same posture as ttsBody above.
+  reactions: { type: 'enum', values: ['on', 'off'], default: 'off' },
 };
 
 // Validates one raw query-param string against its OVERLAY_PARAM_SPEC entry.
@@ -440,6 +457,44 @@ export function renderGifToken(container, token, url, doc, gifsEnabled, asAltOnl
   container.append(chip);
 }
 
+// Pure, no DOM: expands a status-payload reactions object (server shape —
+// see sanitizeYtReactions/buildStatusPayload in worker.js) into per-emoji
+// {glyph, n} spawn units. Object.keys order matches the order
+// sanitizeYtReactions already sorted its top-N entries in (descending
+// count), so a caller enforcing a per-tick spawn cap exhausts the loudest
+// emoji first rather than round-robining arbitrarily.
+export function reactionSpawnUnits(reactions) {
+  if (!reactions || !reactions.emoji) return [];
+  return Object.keys(reactions.emoji).map((glyph) => ({ glyph, n: reactions.emoji[glyph] }));
+}
+
+// One reaction-burst particle for the overlay: an emoji span animated up the
+// right edge via CSS (see .reaction-particle/@keyframes reactionRise in the
+// overlay's <style>). intensity (0-1) scales size and speed — a hotter
+// burst reads as bigger and faster, not just "more particles" (the per-tick
+// spawn-rate cap is the caller's job, not this function's). doc is always
+// injected — same reasoning as every other DOM-touching helper in this file
+// (see the block comment above appendWithMention): this function's body is
+// re-embedded into the overlay's client-side <script> via
+// Function.prototype.toString(), so a bare `document` reference would only
+// fail silently on that path, never at build/test time.
+export function spawnReactionParticle(container, glyph, intensity, doc) {
+  const el = doc.createElement('span');
+  el.className = 'reaction-particle';
+  el.textContent = glyph;
+  const clamped = Math.max(0, Math.min(1, intensity || 0));
+  const size = 20 + clamped * 28; // 20px..48px
+  const duration = 2600 - clamped * 1200; // 2.6s..1.4s, hotter = faster
+  const drift = Math.round((Math.random() - 0.5) * 40); // px, horizontal wander
+  el.style.fontSize = size + 'px';
+  el.style.right = Math.round(8 + Math.random() * 24) + 'px';
+  el.style.animationDuration = duration + 'ms';
+  el.style.setProperty('--drift', drift + 'px');
+  container.append(el);
+  setTimeout(() => el.remove(), duration);
+  return el;
+}
+
 // Merges msg.emotes and msg.gifs into one start-sorted annotation list so a
 // single code-point walk below can splice both — both are the same shape
 // (Unicode code-point offsets, end INCLUSIVE; see parseEmotes/parseGifs and
@@ -554,7 +609,7 @@ export function buildRow(msg, opts) {
     return row;
   }
 
-  row.className = 'msg' + (msg.kind ? ' paid' : '') + (msg.recovered ? ' recovered' : '') + (msg.deleted ? ' deleted' : '');
+  row.className = 'msg' + (msg.kind ? ' paid' : '') + (msg.pointsGigantify ? ' points-gigantify' : '') + (msg.rewardGift ? ' reward-gift' : '') + (msg.recovered ? ' recovered' : '') + (msg.deleted ? ' deleted' : '');
   if (msg.firstMsg) {
     const glyph = doc.createElement('span');
     glyph.className = 'firstmsg';

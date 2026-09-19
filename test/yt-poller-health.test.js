@@ -10,7 +10,10 @@ import { logEvents } from './helpers/logEvents.js';
 function heartbeatReq(body) {
   return new Request('https://do/ingest/yt', {
     method: 'POST',
-    headers: { 'content-type': 'application/json' },
+    // The edge always overwrites x-multichat-caller from whichever ingest
+    // secret matched — 'poller' here mirrors a real poller heartbeat, which
+    // the heartbeat branch now caller-scopes (403 otherwise).
+    headers: { 'content-type': 'application/json', 'x-multichat-caller': 'poller' },
     body: JSON.stringify(body),
   });
 }

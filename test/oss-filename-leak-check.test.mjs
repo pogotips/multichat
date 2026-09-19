@@ -31,14 +31,33 @@ describe('derivePatterns', () => {
     expect(derivePatterns('SHIP_REPORT_*.md\n')).toEqual(['SHIP_REPORT_']);
   });
 
-  it('ignores comments, blank lines, and exact (non-wildcard) filenames', () => {
-    const content = [
-      '# a comment',
-      '',
-      'CAPTURE_AUDIT_2026-08-05.md', // exact filename, no "*" — not a reusable token on its own
-      '*_REVIEW_*.md',
-    ].join('\n');
+  it('ignores comments and blank lines', () => {
+    const content = ['# a comment', '', '*_REVIEW_*.md'].join('\n');
     expect(derivePatterns(content)).toEqual(['_REVIEW_']);
+  });
+
+  // M3 fix (2026-09-12 review, round 2): exact (non-wildcard) .md entries
+  // used to contribute nothing, on the (false) assumption they're always
+  // covered by a shared wildcard convention token — FASTFOLLOW_BATCH.md,
+  // BACKLOG.md, and CONSENT_DAY_RUNBOOK.md all disproved that. They now
+  // contribute their own basename as a literal, case-sensitive pattern.
+  it('derives a literal basename pattern from an exact (non-wildcard) .md filename', () => {
+    const content = ['# a comment', '', 'FASTFOLLOW_BATCH.md', '*_REVIEW_*.md'].join('\n');
+    expect(derivePatterns(content).sort()).toEqual(['FASTFOLLOW_BATCH.md', '_REVIEW_'].sort());
+  });
+
+  it('derives the basename, not the full path, for an exact entry nested in a directory', () => {
+    expect(derivePatterns('docs/BACKLOG.md\n')).toEqual(['BACKLOG.md']);
+  });
+
+  it('dedupes an exact entry and a directory-nested entry that share a basename', () => {
+    const content = 'BACKLOG.md\ndocs/BACKLOG.md\n';
+    expect(derivePatterns(content)).toEqual(['BACKLOG.md']);
+  });
+
+  it('does not derive a pattern from exact non-.md entries (infra excludes, not doc filenames)', () => {
+    const content = ['.git', '.claude/', 'node_modules', '.dev.vars', 'wrangler.jsonc', '.oss-exclude'].join('\n');
+    expect(derivePatterns(content)).toEqual([]);
   });
 
   it('dedupes identical tokens across multiple glob lines', () => {
@@ -107,6 +126,16 @@ describe('CLI (subprocess, real .oss-exclude derivation)', () => {
     expect(result.stdout).toContain('clean');
   });
 
+  it('exits 1 when an exact-name .oss-exclude entry is referenced by filename in a published doc (M3 fix, round 2)', () => {
+    const scanRoot = makeTmpDir('oss-leak-cli-');
+    const ossExcludeFile = path.join(makeTmpDir('oss-leak-exclude-'), '.oss-exclude');
+    writeFileSync(ossExcludeFile, 'FASTFOLLOW_BATCH.md\n', 'utf8');
+    writeFileSync(path.join(scanRoot, 'CHANGELOG.md'), 'see FASTFOLLOW_BATCH.md item 3\n', 'utf8');
+    const result = runCheck(scanRoot, ossExcludeFile);
+    expect(result.status).toBe(1);
+    expect(result.stderr).toContain('FASTFOLLOW_BATCH.md');
+  });
+
   it('does not flag its own excluded files (.oss-exclude, publish-oss.sh) even though they legitimately contain the glob patterns', () => {
     const scanRoot = makeTmpDir('oss-leak-cli-');
     const ossExcludeFile = path.join(makeTmpDir('oss-leak-exclude-'), '.oss-exclude');
@@ -118,5 +147,40 @@ describe('CLI (subprocess, real .oss-exclude derivation)', () => {
     writeFileSync(path.join(scanRoot, 'publish-oss.sh'), "FORBIDDEN=('SHIP_REPORT_')\n", 'utf8');
     const result = runCheck(scanRoot, ossExcludeFile);
     expect(result.status).toBe(0);
+  });
+
+  // 2026-09-19: publish-oss.sh's own regression tests for its FORBIDDEN
+  // gate (test/publish-oss-forbidden-gate.test.mjs and
+  // test/publish-oss-post-sync-check.test.mjs) legitimately write
+  // BACKLOG.md/FASTFOLLOW_BATCH.md as fixture content and tripped this
+  // check on themselves the moment they were added — same class of
+  // self-reference as the two files above.
+  it('does not flag its own excluded test files (publish-oss-forbidden-gate.test.mjs, publish-oss-post-sync-check.test.mjs) even though they legitimately write BACKLOG.md/FASTFOLLOW_BATCH.md as fixtures', () => {
+    const scanRoot = makeTmpDir('oss-leak-cli-');
+    const ossExcludeFile = path.join(makeTmpDir('oss-leak-exclude-'), '.oss-exclude');
+    writeFileSync(ossExcludeFile, 'BACKLOG.md\nFASTFOLLOW_BATCH.md\n', 'utf8');
+    writeFileSync(
+      path.join(scanRoot, 'publish-oss-forbidden-gate.test.mjs'),
+      "writeFileSync(path.join(scanRoot, 'CHANGELOG.md'), 'see BACKLOG.md item 3');\n",
+      'utf8',
+    );
+    writeFileSync(
+      path.join(scanRoot, 'publish-oss-post-sync-check.test.mjs'),
+      "const dst = makeFakeDst(['FASTFOLLOW_BATCH.md']);\n",
+      'utf8',
+    );
+    const result = runCheck(scanRoot, ossExcludeFile);
+    expect(result.status).toBe(0);
+  });
+
+  it('still flags BACKLOG.md/FASTFOLLOW_BATCH.md referenced from any other file (original leak case preserved)', () => {
+    const scanRoot = makeTmpDir('oss-leak-cli-');
+    const ossExcludeFile = path.join(makeTmpDir('oss-leak-exclude-'), '.oss-exclude');
+    writeFileSync(ossExcludeFile, 'BACKLOG.md\nFASTFOLLOW_BATCH.md\n', 'utf8');
+    writeFileSync(path.join(scanRoot, 'NOTES.md'), 'see BACKLOG.md and FASTFOLLOW_BATCH.md\n', 'utf8');
+    const result = runCheck(scanRoot, ossExcludeFile);
+    expect(result.status).toBe(1);
+    expect(result.stderr).toContain('BACKLOG.md');
+    expect(result.stderr).toContain('FASTFOLLOW_BATCH.md');
   });
 });

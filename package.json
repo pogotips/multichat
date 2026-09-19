@@ -11,12 +11,12 @@
     "deploy": "wrangler deploy"
   },
   "devDependencies": {
-    "@cloudflare/vitest-pool-workers": "^0.19.0",
-    "vitest": "^4.1.10"
+    "@cloudflare/vitest-pool-workers": "^0.22.0",
+    "vitest": "^4.1.0"
   },
   "allowScripts": {
     "esbuild@0.28.1": true,
-    "workerd@1.20260722.1": true,
+    "workerd@1.20260815.1": true,
     "fsevents@2.3.3": true
   }
 }

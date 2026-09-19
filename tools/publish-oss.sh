@@ -2,11 +2,25 @@
 # Publish the monorepo multichat/ tree to the standalone oss export.
 # Overwrite-only: monorepo multichat/ is the source of truth, ~/multichat-oss
 # is the publish target. This script never pushes — it stops after commit.
+#
+# Usage: publish-oss.sh [--yes] [commit message]
+#   --yes   skip the interactive confirm and commit immediately.
+#           Without it, non-interactive stdin (no tty) refuses to commit
+#           (exit 2) instead of silently aborting — DST stays staged either way.
 set -euo pipefail
 
 SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
 SRC="$(dirname -- "$SCRIPT_DIR")/"
 DST="${HOME}/multichat-oss"
+
+YES=0
+args=()
+for arg in "$@"; do
+  case "$arg" in
+    --yes) YES=1 ;;
+    *) args+=("$arg") ;;
+  esac
+done
 
 if [ ! -d "$DST/.git" ]; then
   echo "abort: $DST is not a git repo (missing .git)" >&2
@@ -44,7 +58,7 @@ FORBIDDEN=(
   'BACKLOG.md'
 )
 
-grep_args=(-rIn --exclude-dir=.git --exclude-dir=node_modules --exclude-dir=.wrangler --exclude=publish-oss.sh -i)
+grep_args=(-rIn --exclude-dir=.git --exclude-dir=node_modules --exclude-dir=.wrangler --exclude=publish-oss.sh --exclude=oss-filename-leak-check.mjs --exclude=oss-filename-leak-check.test.mjs --exclude=publish-oss-forbidden-gate.test.mjs --exclude=publish-oss-post-sync-check.test.mjs -i)
 for term in "${FORBIDDEN[@]}"; do
   grep_args+=(-F -e "$term")
 done
@@ -111,6 +125,38 @@ test -d "$DST/.git" || {
   exit 1
 }
 
+# --- Post-sync check: rsync --delete --exclude-from protects an excluded
+# path in $DST from deletion the same way it protects $DST/.git above — so a
+# doc that becomes newly excluded never actually leaves $DST on its own.
+# (2026-09-19: FASTFOLLOW_BATCH.md sat tracked and pushed in the public repo
+# for weeks after being added to .oss-exclude, because this sync only ever
+# adds/updates, never prunes an excluded destination path.) Abort here so a
+# stale excluded doc forces an explicit `git rm` in $DST before the publish
+# can complete, rather than silently staying public forever.
+stale_hits=""
+while IFS= read -r pattern; do
+  case "$pattern" in
+    ''|'#'*) continue ;;
+    *.md) ;;
+    *) continue ;;
+  esac
+  while IFS= read -r tracked; do
+    [ -z "$tracked" ] && continue
+    base="$(basename -- "$tracked")"
+    if [[ "$base" == $pattern || "$tracked" == $pattern ]]; then
+      stale_hits="${stale_hits}${tracked}"$'\n'
+    fi
+  done < <(git -C "$DST" ls-files)
+done < "${SRC}.oss-exclude"
+
+if [ -n "$stale_hits" ]; then
+  echo "abort: $DST still tracks file(s) matching a .oss-exclude .md entry —" >&2
+  echo "rsync --delete never removes an excluded destination path. Run" >&2
+  echo "'git -C $DST rm <path>' for each below, commit, then re-run this script:" >&2
+  printf '%s' "$stale_hits" | sort -u >&2
+  exit 1
+fi
+
 # --- Commit in DST ---
 
 cd "$DST"
@@ -123,12 +169,20 @@ fi
 
 git diff --stat --cached
 
-read -r -p "publish? [y/N] " confirm
+if [ "$YES" -eq 1 ]; then
+  confirm=y
+elif [ ! -t 0 ]; then
+  echo "publish-oss: non-interactive and no --yes, refusing to commit" >&2
+  exit 2
+else
+  read -r -p "publish? [y/N] " confirm
+fi
+
 if [ "$confirm" != "y" ] && [ "$confirm" != "Y" ]; then
   echo "aborted, changes staged but not committed"
   exit 0
 fi
 
-commit_msg="${1:-sync from private}"
+commit_msg="${args[0]:-sync from private}"
 git commit -m "$commit_msg"
 echo "now run: git push"

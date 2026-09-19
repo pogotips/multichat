@@ -28,6 +28,29 @@ external renewal cron (optional, renewals) ────────────�
   DO lifetime, not DO eviction. The `migrations`/SQLite classing in
   `wrangler.jsonc` is a platform requirement for DO classes, not a signal that
   chat state is persisted.
+  **Intra-lifetime replay can still silently truncate** (found undocumented
+  in the 2026-09-12 review, H2): `handleEvents`' replay loop only sends ring
+  entries with `id > lastId` — if more than `RING_SIZE` messages have landed
+  since a client's `Last-Event-ID` (a `>2min` idle-disconnect during a busy
+  raid, a phone that slept through a hot moment), the gap between `lastId`
+  and the ring's current floor is gone, not just unreplayed. `buildStatusPayload`
+  now carries `ringFloor` (the oldest surviving `ring[0].id`, or `null` when
+  the ring is empty — `ring` is FIFO, `pushMessage` appends, eviction
+  `shift()`s the front) precisely so the client can tell the two cases apart.
+  `detectReplayGap(lastEventId, ringFloor)` (`src/lib.js`) is the shared
+  decision — a gap is `ringFloor === null || lastEventId < ringFloor`;
+  `lastEventId === ringFloor` is anchored, not a gap, since the client's last
+  seen row is still the oldest one the ring held onto. The PWA arms a
+  one-shot check on any (re)connect that sent a `Last-Event-ID`, consumes it
+  on the first `status` frame after open (status also pushes on later count
+  changes — the flag guarantees this can't re-fire from one of those), and on
+  a real gap inserts a single client-only gray row ("reconnected, some
+  messages may be missing") via the same `sys` gray-row path as any
+  server-sent info row — no `msg.id`, so it never touches `seenIds`/
+  `lastMsgId`, and (like every non-`raid` `sys` row) never buzzes or speaks.
+  The server's own `sse_replay_result` log line carries the identical
+  `ringFloor`/`gap` fields so the audit trail and the client agree on which
+  reconnects actually lost messages.
 - **Outbound Twitch socket**: the DO itself opens `wss://irc-ws.chat.twitch.tv`
   anonymously (`justinfan<rand>` nick, no OAuth) and parses raw IRC lines.
   Connects lazily on first SSE client (`ensureTwitchConnected` from
@@ -185,6 +208,8 @@ string if unmapped).
 Role color precedence (`roleClass()`, shared by both platforms): `isMod` > financial `kind` (gold) > `isMember` > default text color. Twitch's per-user `tags.color` is parsed nowhere and never applied — role color only, everyone else (including VIPs and founders with no independent subscription) renders in the page's default text color.
 | `emotes` | Twitch `emotes` tag (`parseEmotes`) — entries `{id,start,end}`. YouTube custom emojis (poller `normalize.mjs`, worker `sanitizeYtEmotes`) — entries `{url,alt,start,end}` | Shared `renderText()` walker, one array, two entry shapes: Twitch derives the CDN URL from `id` (`EMOTE_ID_RE`-anchored before touching `img.src`); YouTube uses `url` directly (worker-side host-allowlisted at ingest, client re-checks as defense in depth — see §3). Both: inline `<img class="emote">` at text height, `onerror` falls back to the original text/shortcode. **`start`/`end` are Unicode code-point offsets (`[...str]` semantics), end inclusive, on both the Twitch and YouTube paths** — the poller computes YT offsets the same way the client walks them, verified by a multibyte fixture (astral + CJK + ZWJ-sequence emoji before a custom emoji). Standard unicode emoji never get an entry — they're plain text. |
 | `gifs` | Twitch `gifs` tag (`parsePrivmsg` -> `parseGifs` -> `sanitizeGifs`, `src/worker.js`, docs dated 2026-07-31) — entries `{start,end,id,url?}`, `url` present only if the host allowlist accepted it | Merged into the same `renderText()` walker as `emotes` (`mergeAnnotations`, `src/lib.js`) via a shared start-sorted annotation list — one code-point walk handles both. `start`/`end` are Unicode code-point offsets, end inclusive, same convention as `emotes`; the docs' wire format covers the whole bracketed alt-text body (`"[Y A Y Yes GIF by Djemilah Birnie]"`) in one range. Default-on eager `<img class="gif" loading="lazy" decoding="async">` (max-height 96px, rounded); the client's `gifs` localStorage toggle (off, mirrors `multichat-speak`'s pattern) instead renders a tappable `.gif-chip` that builds the `<img>` only on tap — IRL cellular bandwidth, GIFs are multi-MB and Twitch forbids picking a smaller rendition. Absent/rejected `url` (host disallowed, or a structurally-dropped entry) renders the bracketed alt text as plain gray `.gif-alt` text instead of an image — the row is never dropped. YouTube has no gif ingest path (Twitch-only feature; the poller sends no `gifs` field). GIF rows carry no `kind`, so they're structurally excluded from TTS/buzz (`emitCategory`) exactly like a plain chat message — never spoken. The overlay's `gifAlt` config param (`OVERLAY_PARAM_SPEC`, default **on** — same opt-in-not-opt-out posture as `ttsBody`, §3b) forces the `.gif-alt` text branch unconditionally regardless of url/host validity — a scene operator must explicitly set `gifAlt=off` per scene to see images at all. The PWA never reads this param and stays on its own default-on `gifsEnabled` eager `<img>` render regardless. |
+| `pointsGigantify` | Twitch EventSub `channel.channel_points_automatic_reward_redemption.add` (`reward_type: 'gigantify_an_emote'`, §3a) correlated against the matching PRIVMSG via `ChatHub.markPointsGigantify` | Gray + gold-row-sized: `.msg.points-gigantify` tint, same singular `msg.emote`/3.0-scale-image path `channel.bits.use`'s gold row uses (`EMOTE_ID_RE`-anchored). No `kind`, so never gold/ledger/buzz/TTS. Reconnect/replay-correct only — see §3a's "no live upgrade" caveat, corrected 2026-09-15. |
+| `rewardGift` | Twitch `USERNOTICE msg-id=rewardgift` (`parseUsernotice`) — a generic channel-points reward notice, **not** emote gigantify (see the internal streak-coverage audit of 2026-08-08 and internal gigantify investigation of 2026-08-01; corrected 2026-09-15 after an earlier version of this branch keyed `pointsGigantify` off this event by mistake) | Plain gray, standard-height: `.msg.reward-gift` tint, ordinary inline emotes via the shared `emotes` array — never the singular gigantify-sized field. No `kind`, silent. |
 | `recovered` | Gap-recovery paths (both platforms, §4) | `.msg.recovered { opacity: .55 }`. **No longer TTS-suppressed by the `recovered` flag** (2026.07.20.3): a financial row that landed during a connection blip and is replayed as `recovered` now buzzes/speaks **once** via the `isEmittable` id-set gate, because it carries a fresh monotonic id above the floor. Re-replays and already-heard ids are deduped by `spokenIds`; rows older than `EMIT_TTL_MS` (30 min) never fire. |
 | *(uncaptured, unclassified)* | Any Twitch IRC line the parser doesn't recognize and isn't known connection/membership scaffolding (`isProtocolNoise`) | Never rendered — written to R2 capture (§4) as untrusted data, never dropped silently |
 
@@ -352,11 +377,11 @@ failed delete (logged `ev:'eventsub_delete_failed'`) would leave Twitch with
 two enabled subscriptions of the same type, double-delivering every event; a
 failed delete instead leaves that slot unhealthy for the next hourly retry.
 A 409 on create is treated as benign (already exists, e.g. a race with a
-prior ensure) and never fails the routine. Six of the seven subscribed types
-use scopes the broadcaster already consented to, so those cost **0** against
-the account's EventSub subscription limit; the seventh, `channel.moderate`,
-needs its own separate 8-scope re-consent before it can ever go healthy —
-see below.
+prior ensure) and never fails the routine. Seven of the eight subscribed
+types use scopes the broadcaster already consented to, so those cost **0**
+against the account's EventSub subscription limit; the eighth,
+`channel.moderate`, needs its own separate 8-scope re-consent before it can
+ever go healthy — see below.
 
 **Chronic 403, root-caused and fixed 2026-07-28.** The "already consented"
 claim above was false from 2026-07-22 through 2026-07-27: only
@@ -513,6 +538,69 @@ lifetime and is never refreshed — a `not_a_scope_issue` diagnosis reflects
 the grant as of that one check, not a live guarantee, if the grant is
 revoked mid-lifetime.
 
+**`channel.channel_points_automatic_reward_redemption.add` — points-funded
+gigantify (2026-09-15, corrected from an earlier wrong-event version of this
+same branch).** An earlier version of this feature keyed a `pointsGigantify`
+gray/gold-sized row off IRC `USERNOTICE msg-id=rewardgift`. Review found that
+event is unrelated: this repo's own internal streak-coverage audit (2026-08-08)
+already classified `rewardgift` as a generic channel-points reward notice,
+never gold, no gigantify connection; and an internal gigantify investigation
+(2026-08-01) already established that emote gigantify — bits- or points-funded — never
+sets any IRC tag at all, since PRIVMSG has no `msg-id` (that tag is
+USERNOTICE-only). The `rewardgift` branch could never have fired for a real
+gigantify event. `rewardgift` now renders as its own honest gray kind
+(`rewardGift` flag, `.msg.reward-gift`, §2c) with no gigantify claim.
+
+The real signal, per that same investigation doc, is this EventSub
+subscription's `reward_type: 'gigantify_an_emote'` — same standing rule as
+`channel.bits.use` above ("EventSub subscribes only to what IRC cannot
+see"). Unlike `channel.bits.use`, it never renders its own row —
+`mapEventToRow` always returns `null` for this subType (no amount, by
+design, same precedent as the plain `redeem` row) — it only feeds the
+*same* `pendingGigantifies`/`consumePendingGigantify` correlation
+`channel.bits.use`'s dedupe uses, tagged with a `points` marker
+(`ChatHub.handleGigantifyDedupe`'s `opts.points`). A match calls
+`ChatHub.markPointsGigantify` instead of `markSuperseded`: the correlated
+PRIVMSG is mutated in place (`pointsGigantify: true`, `emote: {id, name}`)
+rather than hidden, since there's no separate gold row for it to be
+redundant with — the matched PRIVMSG *is* the row. Match extraction differs
+slightly from the bits path: the v1 event's `message.emotes[0].id` carries
+no emote name (unlike `power_up.emote.name`), so this path is always
+id-tier-only via `gigantifyRowMatches` — safe, since the text-tier fallback
+requires a non-empty name and never fires on an empty one. Every other
+`reward_type` on this subscription (`single_message_bypass_sub_mode`,
+`send_highlighted_message`, `*_sub_emote_unlock`, `message_effect`,
+`celebration`) is structured-log-only (`automatic_reward_redemption_unmapped`),
+no row — not scoped here.
+
+**No live upgrade, disclosed.** `pushMessage`'s own broadcast already sends
+the plain PRIVMSG to every already-connected client before the correlation
+can resolve, regardless of arrival order (`handleIrcData` always pushes
+first, same structural guarantee the bits path relies on) — and unlike
+`markSuperseded`'s hide (a bare CSS-class/removal patch any client can do),
+upgrading a rendered row to gold-sized needs new content (the 3.0-scale
+image) that today's `'mark'` SSE listener has no handler for. This mutation
+is ring-authoritative — any replay that re-sends the row delivers it
+upgraded — but `Last-Event-ID` resume skips already-delivered ids
+(`handleSse` sends only `msg.id > lastId`), so an already-open client sees
+the upgrade only after a full page load, not a silent reconnect. Adding a
+live client-side patch handler is a real, bounded follow-up, deliberately
+not done in this pass.
+
+**Scope reuse, not a new scope.** `channel:read:redemptions` — same scope
+`channel.channel_points_custom_reward_redemption.add` already uses — covers
+this subscription too (Twitch's Authorization section for this type accepts
+`channel:read:redemptions` *or* `channel:manage:redemptions`); the
+broadcaster already granted the former as part of the original 5-scope
+EventSub consent. No new scope, no new re-consent is technically required
+for this subscription. It's still held back from going live until the
+pending `channel.moderate` 13-scope re-consent ("consent day") completes and
+this branch merges after it — process discipline (one coordinated EventSub
+deploy ceremony), not a scope gap. See the consent-day runbook (internal,
+unmerged branch, on `feature/eventsub-mod-attribution`) for the verify-list addition (8 subs
+enabled, one live points gigantify shows gray) once that file lands on this
+branch's ancestry.
+
 **Merge-order invariant.** Per the CLAUDE.md "Standing invariants" bullet on
 EventSub scope additions, the broadcaster's single-URL 5-scope re-consent
 must complete and be verified live before this feature's branch merges — else
@@ -521,7 +609,8 @@ above, just for `bits:read` instead of the original 3 scopes.
 
 **Subscribed set** (`buildDesiredSubs`): `channel.channel_points_custom_reward_redemption.add` v1,
 `channel.hype_train.begin`/`.progress`/`.end` **v2**, `channel.ad_break.begin`
-v1, `channel.bits.use` **v1** — all with `condition: {broadcaster_user_id}`.
+v1, `channel.bits.use` **v1**, `channel.channel_points_automatic_reward_redemption.add`
+**v1** — all with `condition: {broadcaster_user_id}`.
 `channel.moderate` **v2** is the one exception, needing its own two-field
 `condition: {broadcaster_user_id, moderator_user_id}` — see below. Hype Train was originally pinned to v1 — the fields actually read
 (`level`/`total`/`progress`/`goal`) are identical between versions, and v1 is
@@ -817,6 +906,114 @@ strip and the `<2`-char guard, falling back de-`@` → original, never empty
 speech (`/(^|\s)@(\S)/` → `$1$2`) — an email address like `a@b.com` is
 untouched, since its `@` isn't preceded by whitespace/start-of-string.
 Display text is never touched by either — spoken output only.
+
+## 3c. Live Reaction Bursts (YouTube heart/like fountain)
+
+YouTube's `get_live_chat` response carries a live reaction-burst summary at
+`frameworkUpdates.entityBatchUpdate.mutations[].payload.emojiFountainDataEntity
+= {reactionBuckets:[{totalReactions, duration:{seconds}, intensityScore,
+reactionsData?:[{unicodeEmojiId, reactionCount}]}], updateTimeUsec}` —
+verified externally 2026-09-14. This lives at the top level of the response,
+a sibling of `continuationContents`, not inside `actions[]` — `youtube-chat`
+discarded it entirely before `parseChatData` ever saw it. The entity is
+intermittent (absent on most polls, some streams never emit it at all) and
+`reactionsData` itself is omitted whenever a bucket's total is zero.
+
+**Poller (patch + capture + ingest).** `patches/youtube-chat+2.2.0.patch`
+gained one more hunk in `parser.js`'s `parseChatData`, right after the
+existing `actions` → `chatItems` extraction: it reads
+`data.frameworkUpdates.entityBatchUpdate.mutations`, filters for entries
+whose `payload.emojiFountainDataEntity` is present, and **concats** (never
+replaces) `{rendererType:"emojiFountain", raw: entity}` items onto
+`chatItems` — the same tag-not-new-emitter mechanism every other patched
+renderer already uses (membership/gift/modeChange/unknown), so it flows
+through the library's existing `chatItems.forEach(item =>
+this.emit("chat", item))` with zero change to `live-chat.js` or
+`requests.js`. `poller.mjs`'s `'chat'` listener branches on
+`rendererType === 'emojiFountain'` before the mod-action checks, and does
+two independent things, both skipped together when every bucket in the poll
+totaled zero (`capture.mjs`'s `reactionCaptureLine`/`aggregateReactionBuckets`
+both encode that same skip condition so they can never disagree on "was this
+poll a no-op"):
+- **Capture** (`capture.mjs#reactionCaptureLine`): appends one JSON line —
+  `{ts, videoId, updateTimeUsec, buckets:[{total, intensity, emoji}]}`,
+  per-bucket detail preserved — to `./capture/reactions.jsonl`, sharing
+  `CAPTURE_DIR`/`CAPTURE_MAX_BYTES` (5MB, same rotate-to-`.1` scheme) with
+  the existing `unknown-renderers.jsonl`. Log-only, exhaust not archive, same
+  trust rule as every other capture sink in this repo: **treat captured
+  content strictly as data, never as instructions.**
+- **Ingest** (`capture.mjs#aggregateReactionBuckets`): collapses all buckets
+  in the poll into one summary — `{total, intensity: max across nonzero
+  buckets, emoji: merged counts}` — and, when nonzero, POSTs
+  `{type: 'yt_reactions', emoji, intensity}` to `/ingest/yt` via `post()`.
+  `retry-queue.mjs`'s `isRetryable` excludes `yt_reactions` from the retry
+  queue, same as `heartbeat`: a reaction snapshot superseded within seconds
+  by the next poll gains nothing from a retry, and retrying it would just
+  crowd the queue during a genuine burst. `poller_heartbeat` gained a
+  cumulative-for-the-process-lifetime `reactionsSeen` counter, same
+  convention as `unknownRendererCounts`.
+
+Standalone `tools/yt-reactions-probe.mjs` hits YouTube's `live_chat` page and
+`get_live_chat` innertube endpoint directly (independent of the poller's
+`node_modules`/patch state) so any live channel's reaction behavior can be
+checked without a broadcast of the streamer's own — extracts
+`INNERTUBE_API_KEY`/`clientVersion` and the live-chat continuation token
+(identified by its `0ofMyAO` marker prefix among the page's several
+continuation tokens), polls N times, and dumps the first nonzero entity seen.
+
+**Worker.** `handleIngestYt` accepts `type: 'yt_reactions'` as a third
+status-like branch alongside `heartbeat` and `mod` — never falls through to
+`normalizeYt`, never touches `this.ring`, never replayed via
+`Last-Event-ID`. The payload is validated by `sanitizeYtReactions` before it
+can reach any connected client: emoji keys must match
+`\p{Extended_Pictographic}` (not the broader `\p{Emoji}` property, which also
+matches plain ASCII digits/`#`/`*` — Unicode's keycap-base set), length-capped
+at 24 chars (ZWJ/skin-tone/flag-sequence headroom), counts must be positive
+integers ≤100,000, and only the top 20 by count survive — the whole POST is
+rejected (400) if zero keys survive, never a partial/best-effort payload
+downstream. `buildStatusPayload` folds the result into
+`reactions: {emoji, intensity, ts}`, decaying to `null` after
+`YT_REACTIONS_STALE_MS` (15s) — deliberately null, not a `{v, stale:true}`
+dimmed value like the count fields, since a burst that already faded out of
+the client's own rolling window shouldn't reappear on a fresh SSE connect.
+Every valid POST broadcasts `status` immediately (the poller already
+guarantees nonzero-only), unlike the heartbeat's change-gated push.
+
+**PWA.** A `#reactions` cell in the existing `#chips` topbar grid — inline
+enum sibling of `#chip-tw`/`#chip-yt` — accumulates incoming bursts
+client-side over a rolling 10s window (`reactionEvents`, decayed by dropping
+entries older than the window on every render tick, `setInterval` every 1s),
+shows the top 4 emoji by summed count, and adds a `.pulse` CSS class
+(400ms scale keyframe) when `intensity >= 0.75`. Empty/zero-width exactly
+like the `.count:empty` cells when quiet or when YT isn't live
+(`status.yt == null || status.yt >= CHIP_STALE_MS`) — no persistent slot
+sitting blank between bursts. Each server snapshot is deduped by its `ts` so
+an unrelated `status` broadcast (a viewer-count tick, say) holding the same
+still-fresh `reactions` object can't re-add it to the window repeatedly. No
+buzz, no TTS — reaction rows never carry a `kind` or `sys`, same treatment as
+GIF rows.
+
+**Overlay.** New `OVERLAY_PARAM_SPEC` param `reactions` (`on`/`off`, default
+**off**) — unlike `gifAlt`'s opt-out-of-already-flowing-content posture, a
+burst animation is a brand-new element with nothing behind it upstream, so
+the scene operator opts in per scene deliberately. Renders automatically on
+`/overlay/config` with no new UI code (controls are generated generically
+from the spec). Two new `src/lib.js` helpers, interpolated into the overlay's
+`<script>` the same `${helperFn}` way every other overlay helper is:
+`reactionSpawnUnits(reactions)` (pure — expands the status payload's `emoji`
+map into `{glyph, n}` units, in the same descending-count order
+`sanitizeYtReactions` already sorted) and `spawnReactionParticle(container,
+glyph, intensity, doc)` (one emoji `<span>` animated up the right edge via a
+`--drift` custom property + `@keyframes reaction-rise`; `intensity` scales
+size 20–48px and duration 2.6s–1.4s). The overlay's own page-local
+`maybeSpawnReactions` (not itself interpolated — page-native code, same
+category as `insertRow`/`handleMsg`) owns the per-tick spawn-rate cap
+(8/sec, exhausting the loudest emoji first) and the `reactions==='on'`
+gate; it's wired to a new `socket.addEventListener('status', ...)` listener
+— the overlay previously subscribed to no named SSE events besides `'mark'`.
+Both new helpers are added to `test/bundle-gif-render.test.js`'s
+`PAGE_HELPERS['https://x/overlay?t=y']` list, so the existing esbuild-leak
+sweep and the transitive-interpolation-reference check both cover them.
 
 ## 4. Gap Recovery & Telemetry/Capture Sinks
 
@@ -1126,6 +1323,14 @@ All client behavior lives in the inline `<script>` inside `PAGE_HTML`
   pre-struck (no client reconciliation protocol needed) — see §2b. Live
   clients additionally get a transient `mark` SSE event to strike
   already-rendered rows via `[data-twid]`/`[data-login]` selectors.
+- **Self-mention highlighting**: `MULTICHAT_MY_NAME` (`wrangler.jsonc` plain
+  `vars`, not a secret — the streamer's own chat login) flows into both
+  served pages as `MY_NAME` (`src/worker.js:3752` PWA, `:4710` overlay,
+  lowercased at read via `src/worker.js:120,136`) and is passed as `buildRow`'s
+  `myName` option (`mention: true`) to highlight rows that mention the
+  streamer by name. Empty/unset (the default) simply disables the
+  highlighting — chat itself is unaffected. The `/overlay/config` preview
+  hardcodes `myName: 'streamer'` instead of reading the real var.
 - **Emotes**: native Twitch CDN images inline, dark/static variant, text
   fallback on load failure (§2c).
 - **GIFs (Twitch only)**: default-on `#gifsToggle` (🎞️/🎞️🚫), persisted to
@@ -1252,8 +1457,11 @@ All client behavior lives in the inline `<script>` inside `PAGE_HTML`
    `deployed/multichat` tag (`git log deployed/multichat..HEAD`) for
    correctness, security, and docs impact. Fix anything high-severity,
    re-review, repeat until clean.
-2. **Tag + push rule** — deploy only from a `main` checkout (never a
-   worktree or feature branch — merge to main first). After a successful
+2. **Tag + push rule** — deploy only from a checkout on `main` (never a
+   feature branch — merge to main first). A worktree is fine as long as it's
+   pinned to `main` (or, for a rollback, a `rollback-YYYY-MM-DD` tag) rather
+   than a feature branch — this is the scratch-worktree-pinned-to-`main`
+   pattern step 4's rollback path below already uses. After a successful
    `wrangler deploy`, retag: `git tag -f deployed/multichat && git push -f
    origin deployed/multichat`. The gate isn't done until `git push origin
    main` too — a deployed-but-unpushed `main` leaves the next session's
@@ -1429,7 +1637,7 @@ All client behavior lives in the inline `<script>` inside `PAGE_HTML`
   closure must be checked against that test before merging.** The test's
   esbuild-runtime-helper sweep now covers all 24 `${helper}` interpolations
   across the 3 served pages (static-text, not per-helper execution — see
-  `FASTFOLLOW_BATCH.md` item 8). The `socket.onmessage` `catch {}` itself was
+  the internal fast-follow list, item 8). The `socket.onmessage` `catch {}` itself was
   the second problem exposed by this incident (an empty catch is exactly why
   it produced no console error) — now reports via the existing client-error
   beacon (`reportClientError`, error name + message only, never `e.data`/the

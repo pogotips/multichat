@@ -38,6 +38,12 @@ TWITCH_CLIENT_SECRET="replace-with-twitch-app-client-secret"
 # follower count never populates. See docs/ARCHITECTURE.md §1 "Live counts".
 TWITCH_USER_REFRESH_TOKEN="replace-with-twitch-user-refresh-token"
 
+# Gates the OBS overlay's /overlay/config, /tts, and /overlay/admin.
+# Deliberately separate from MULTICHAT_VIEW_SECRET so the OBS scene URL is
+# independently rotatable. Unset => those three routes 401/204, chat and
+# /overlay itself are unaffected.
+MULTICHAT_OVERLAY_SECRET="replace-with-random-string"
+
 # Chat display-name for self-mention highlighting in the viewer UI. Normally
 # set via wrangler.jsonc `vars` — set here only to override for local
 # `wrangler dev`. Independent of TWITCH_CHANNEL (that's the login, this is

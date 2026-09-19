@@ -1,12 +1,14 @@
 // Internal forensics doc (2026-08-05), rec 5: a minimal client error beacon,
-// gated on the same view token /events already uses (never an open
-// endpoint), with server-side size/field caps and no echo of the token
-// itself into the log line.
+// gated on requireEventsToken — the same either-secret (view or overlay)
+// check /events already uses (never an open endpoint), widened from
+// view-only per the ChatHub review of 2026-09-12 (internal), H1 follow-up so the
+// overlay's own onmessage catch can beacon too, with server-side size/field
+// caps and no echo of the token itself into the log line.
 import { describe, it, expect, vi } from 'vitest';
 import worker from '../src/worker.js';
 import { logEvents } from './helpers/logEvents.js';
 
-const env = { MULTICHAT_VIEW_SECRET: 'correct-secret' };
+const env = { MULTICHAT_VIEW_SECRET: 'correct-secret', MULTICHAT_OVERLAY_SECRET: 'overlay-secret' };
 
 function post(url, body) {
   return worker.fetch(new Request(url, {
@@ -24,6 +26,16 @@ describe('POST /client-error', () => {
 
   it('401 when the token is wrong', async () => {
     const res = await post('https://x/client-error?t=wrong', JSON.stringify({ message: 'boom' }));
+    expect(res.status).toBe(401);
+  });
+
+  it('200 when the overlay secret is used — same either-secret gate as /events, so the overlay\'s own beacon isn\'t always 401', async () => {
+    const res = await post('https://x/client-error?t=overlay-secret', JSON.stringify({ message: 'boom' }));
+    expect(res.status).toBe(200);
+  });
+
+  it('401 on a junk token matching neither MULTICHAT_VIEW_SECRET nor MULTICHAT_OVERLAY_SECRET', async () => {
+    const res = await post('https://x/client-error?t=junk', JSON.stringify({ message: 'boom' }));
     expect(res.status).toBe(401);
   });
 

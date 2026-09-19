@@ -1,5 +1,5 @@
 import { describe, it, expect, vi } from 'vitest';
-import { ChatHub, isProtocolNoise } from '../src/worker.js';
+import { ChatHub, isProtocolNoise, emitCategory } from '../src/worker.js';
 import { makeHub } from './helpers/makeHub.js';
 import { logEvents } from './helpers/logEvents.js';
 import { withFakeTimers } from './helpers/withFakeTimers.js';
@@ -96,6 +96,42 @@ describe('capture liveness (2.4): which IRC lines reach R2', () => {
     expect(logEvents(logSpy, 'shared_chat_notice_capture')).toEqual([]);
     logSpy.mockRestore();
   });
+
+  it('flushCapture logs capture_flush {count, ok:true} on a successful R2 put', async () => {
+    const logSpy = vi.spyOn(console, 'log').mockImplementation(() => {});
+    const { hub } = makeHub();
+    hub.handleIrcData(unclassifiedLine);
+    hub.handleIrcData(unclassifiedLine);
+    await hub.flushCapture();
+    expect(logEvents(logSpy, 'capture_flush')).toEqual([{ ev: 'capture_flush', count: 2, ok: true }]);
+    logSpy.mockRestore();
+  });
+
+  it('flushCapture logs capture_flush {count, ok:false, err} when the R2 put rejects, without throwing', async () => {
+    const logSpy = vi.spyOn(console, 'log').mockImplementation(() => {});
+    const errorSpy = vi.spyOn(console, 'error').mockImplementation(() => {});
+    const { hub } = makeHub({
+      capturePut: () => {
+        throw new Error('bucket down');
+      },
+    });
+    hub.handleIrcData(unclassifiedLine);
+    await expect(hub.flushCapture()).resolves.toBeUndefined();
+    const events = logEvents(logSpy, 'capture_flush');
+    expect(events).toHaveLength(1);
+    expect(events[0]).toMatchObject({ ev: 'capture_flush', count: 1, ok: false });
+    expect(events[0].err).toContain('bucket down');
+    logSpy.mockRestore();
+    errorSpy.mockRestore();
+  });
+
+  it('flushCapture with an empty buffer logs nothing (no-op)', async () => {
+    const logSpy = vi.spyOn(console, 'log').mockImplementation(() => {});
+    const { hub } = makeHub();
+    await hub.flushCapture();
+    expect(logEvents(logSpy, 'capture_flush')).toEqual([]);
+    logSpy.mockRestore();
+  });
 });
 
 describe('viewermilestone (watch-streak) renders as a gray info row', () => {
@@ -111,6 +147,36 @@ describe('viewermilestone (watch-streak) renders as a gray info row', () => {
       text: 'airbrake88 watched 100 consecutive streams and sparked a watch streak!',
     });
     expect(hub.ring[0].kind).toBeUndefined();
+  });
+});
+
+describe('rewardgift renders as its own plain gray row — no ledger/buzz/TTS, NOT emote gigantify', () => {
+  it('reaches the ring with rewardGift + emotes surviving pushMessage\'s field allowlist, no kind, no financial log', async () => {
+    const logSpy = vi.spyOn(console, 'log').mockImplementation(() => {});
+    const { hub, putCalls } = makeHub();
+    const line = '@display-name=Giver;login=giver;msg-id=rewardgift;emotes=25:0-4;system-msg=Giver\\shas\\sredeemed\\sa\\sReward\\sGift! :tmi.twitch.tv USERNOTICE #dallas :Kappa';
+    hub.handleIrcData(line);
+    await hub.flushCapture();
+    expect(putCalls).toHaveLength(0); // classified, never falls to the capture sink
+    expect(hub.ring).toHaveLength(1);
+    expect(hub.ring[0]).toMatchObject({
+      user: 'Giver',
+      login: 'giver',
+      text: 'Kappa',
+      rewardGift: true,
+      emotes: [{ id: '25', start: 0, end: 4 }],
+    });
+    expect(hub.ring[0].kind).toBeUndefined();
+    expect(hub.ring[0].sys).toBeUndefined();
+    expect(hub.ring[0].amount).toBeUndefined();
+    expect(hub.ring[0].pointsGigantify).toBeUndefined();
+    expect(hub.ring[0].emote).toBeUndefined(); // no singular gigantify-sized field
+    expect(logEvents(logSpy, 'financial')).toEqual([]); // no kind -> FINANCIAL_KINDS gate never fires
+    logSpy.mockRestore();
+  });
+
+  it('emitCategory is silent for a rewardGift row — no buzz, no TTS eligibility', () => {
+    expect(emitCategory({ user: 'Giver', text: 'Kappa', rewardGift: true, emotes: [{ id: '25', start: 0, end: 4 }] })).toBe('silent');
   });
 });
 
@@ -226,6 +292,54 @@ describe('own-keepalive PONG classification', () => {
     hub.handleIrcData(pongLine);
     expect(hub.ring).toHaveLength(0);
   });
+});
+
+describe('tw_close msgCount: IRC lines received over the socket lifetime', () => {
+  it('starts at 0 on a fresh hub', () => {
+    const { hub } = makeHub();
+    expect(hub.ircMsgCount).toBe(0);
+  });
+
+  it('increments once per IRC line handled, including PING/PONG protocol lines', () => {
+    const { hub } = makeHub();
+    hub.socket = { send: () => {} };
+    hub.handleIrcData(':tmi.twitch.tv PONG tmi.twitch.tv :ka1');
+    hub.handleIrcData('PING :tmi.twitch.tv');
+    hub.handleIrcData('@display-name=Alice :alice!alice@alice.tmi.twitch.tv PRIVMSG #testchannel :hi');
+    expect(hub.ircMsgCount).toBe(3);
+  });
+
+  it('a single message carrying multiple CRLF-joined lines counts each line', () => {
+    const { hub } = makeHub();
+    hub.handleIrcData('PING :one\r\nPING :two\r\nPING :three');
+    expect(hub.ircMsgCount).toBe(3);
+  });
+
+  it('handleSocketDown includes msgCount in the tw_close event', () => withFakeTimers(async () => {
+    const logSpy = vi.spyOn(console, 'log').mockImplementation(() => {});
+    const { hub } = makeHub();
+    const ws = { send: () => {}, close: () => {} };
+    hub.socket = ws;
+    hub.handleIrcData('@display-name=Alice :alice!alice@alice.tmi.twitch.tv PRIVMSG #testchannel :hi');
+    hub.handleIrcData('@display-name=Bob :bob!bob@bob.tmi.twitch.tv PRIVMSG #testchannel :yo');
+    await hub.handleSocketDown(ws, { code: 1006, reason: '', wasClean: false });
+    expect(logEvents(logSpy, 'tw_close')).toEqual([
+      expect.objectContaining({ ev: 'tw_close', msgCount: 2 }),
+    ]);
+    logSpy.mockRestore();
+  }));
+
+  it('tw_error (no close event) is unaffected — no msgCount field', () => withFakeTimers(async () => {
+    const logSpy = vi.spyOn(console, 'log').mockImplementation(() => {});
+    const { hub } = makeHub();
+    const ws = { send: () => {}, close: () => {} };
+    hub.socket = ws;
+    hub.handleIrcData('PING :one');
+    await hub.handleSocketDown(ws, null);
+    const events = logEvents(logSpy, 'tw_error');
+    expect(events).toEqual([{ ev: 'tw_error', connId: hub.connId }]);
+    logSpy.mockRestore();
+  }));
 });
 
 // Bounds DO console.log flush latency (logs only flush when the held Twitch

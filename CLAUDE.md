@@ -28,6 +28,7 @@ Merges Twitch + YouTube live chat into a single dark, mobile SSE feed for viewin
 | `POST /overlay/admin` | `?t=<MULTICHAT_OVERLAY_SECRET>` only | TTS kill-switch toggle. Briefly unauthenticated (2026-08-27), gate restored the same day — shares the overlay secret with `/tts`/`/overlay/config` rather than a separate `MULTICHAT_ADMIN_SECRET` (retired, not checked anywhere). See §3b. |
 | `POST /ingest/yt` | `X-Multichat-Secret: <MULTICHAT_INGEST_SECRET>` **or** `<MULTICHAT_RAIDQ_INGEST_SECRET>` header | YouTube poller ingest, or an optional external membership-renewal cron |
 | `POST /eventsub/callback` | `Twitch-Eventsub-Message-Signature` (HMAC-SHA256 vs `EVENTSUB_SECRET`) | Twitch EventSub webhook — redemptions, hype train, ad break, mod-action attribution. **First public unauthenticated route** in this Worker; see `docs/ARCHITECTURE.md` §3a for the full verification spec. |
+| `POST /client-error` | `?t=<MULTICHAT_VIEW_SECRET>` **or** `<MULTICHAT_OVERLAY_SECRET>` (`requireEventsToken`) | Client-side error beacon (PWA + overlay `onmessage` handler) — session-capped at `CLIENT_ERROR_SEND_MAX` (5) sends so a looping error can't spam the endpoint/log. |
 | `GET /api/version` | none | `{ releaseVersion }`, `no-store` |
 | `GET /manifest.webmanifest` | none | PWA manifest, `application/manifest+json`, `no-store` |
 | `GET /icon-180.png` / `/icon-192.png` / `/icon-512.png` | none | PWA icons, embedded base64, `public, max-age=31536000, immutable` |
@@ -68,6 +69,14 @@ These hold across sessions — do not relax them without discussion:
 - **Deploys end with `git push origin main`, not just the `wrangler deploy` +
   retag.** A deployed-but-unpushed `main` leaves the next session's diff-review
   baseline pointed at a commit nobody else can see.
+- **After any worker deploy, verify the ChatHub DO actually adopted the new
+  script version before assuming it has.** Verify scriptVersion via ingest
+  invocations, or curl -N /events and check the first status frame for
+  ringFloor; force a cycle only if stale. Adoption timing is variable, not
+  instant and not reliably slow either — 2026-08-05's deploy didn't land in
+  the live DO until ~1.5h into the next stream (the mid-stream ring wipe that
+  caused), while 2026-08-06's landed in ~2 min (DO reset logged right after
+  `wrangler deploy` returned).
 - **Tag convention (adopted 2026-08-06): before deploying, tag the PREVIOUS
   deploy commit `rollback-YYYY-MM-DD` (today's date) — this tag stays put
   until the new deploy is verified live. Only after verification does
@@ -119,9 +128,9 @@ These hold across sessions — do not relax them without discussion:
   requesting all 13 at once — same reasoning as above, just a bigger union.
   Before merging, confirm `eventsub_scope_check` shows `hasBitsRead: true`
   **and** `hasAllEventSubScopes: true` **and** `hasAllModerateScopes: true`
-  live, via CF Observability (never `wrangler tail`). Expected sequencing:
-  PR #31 merges first; this branch's merge waits until after this re-consent
-  completes and is verified live — same gate as `bits:read` above. Full
+  live, via CF Observability (never `wrangler tail`). This branch's merge
+  waits until after this re-consent completes and is verified live — same
+  gate as `bits:read` above. Full
   detail (condition rationale, the `moderator_user_id`-is-not-an-actor-filter
   citation and its live-verification follow-up, render mapping, IRC/EventSub
   ownership rule, `esModerateHealthy` persistence) in `docs/ARCHITECTURE.md`
@@ -173,6 +182,19 @@ render mapping, the mod-attribution ownership rule — in
 | `npm test` | Run vitest — worker's IRC tag parsing/normalization (pure functions) plus the yt-poller's own test suite. Includes `test/bundle-gif-render.test.js`, which shells out to `wrangler deploy --dry-run` — needs `wrangler.jsonc` present (gitignored, see Setup below) |
 | `npm run test:gate` | Real-workerd ingest-gate harness (`@cloudflare/vitest-pool-workers`) — DO input-gate dispatch probe, not part of `npm test` |
 
+**Dependency versions:** any edit to `package.json` or `tools/yt-poller/package.json`
+versions must be followed in the same session by
+`rm -rf node_modules package-lock.json && npm install` (both packages), then
+`npm test` AND `npm run test:gate`, before the session ends. Do not bump
+`vitest` past `^4` (`vitest-pool-workers` pins it). Never leave an unverified
+version edit in the working tree. Origin: 09-13 ERESOLVE from an unverified
+`^5.0.0` edit.
+
+A reused worktree can carry a stale `youtube-chat` patch in
+`tools/yt-poller/node_modules` that fails main tests while `patch-package`
+still logs a checkmark. Fix before trusting results:
+`cd tools/yt-poller && rm -rf node_modules/youtube-chat && npm install`.
+
 ## Setup
 
 ```
@@ -203,6 +225,11 @@ wrangler secret put MULTICHAT_OVERLAY_SECRET
 the numeric id behind that login) — resolved once via a public login→id
 lookup, not sensitive, never changes for a given channel. `Get Channel
 Followers` needs it and doesn't accept a login string.
+`MULTICHAT_MY_NAME` is also a plain `wrangler.jsonc` var (not a secret — the
+streamer's own chat login, lowercased on read, `src/worker.js:120,136`) —
+drives self-mention highlighting (`MY_NAME` on both the PWA and overlay
+pages, `buildRow`'s `myName` option). Empty/unset simply disables that
+highlighting; chat itself is unaffected.
 
 **Live counts (2026-07-22, optional):** Twitch viewer-count polling (`ChatHub.pollTwitchViewers`) needs a Twitch app registered at [dev.twitch.tv](https://dev.twitch.tv/console/apps) (client-credentials flow, no user consent) — set both:
 ```
@@ -265,7 +292,7 @@ until Twitch itself revokes them (`notification_failures_exceeded`) or they're
 proactively replaced. **Rotation procedure: delete all EventSub subscriptions
 first** (`DELETE helix/eventsub/subscriptions?id=...` for each, via an app
 token), *then* `wrangler secret put EVENTSUB_SECRET` with the new value —
-`ensureEventSubSubscriptions` recreates all seven with the new secret on the
+`ensureEventSubSubscriptions` recreates all eight with the new secret on the
 next client attach. Never rotate the secret before deleting the old subs, or
 there's a window where 403s pile up against dead subscriptions instead of a
 clean cutover.

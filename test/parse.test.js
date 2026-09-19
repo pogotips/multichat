@@ -424,6 +424,34 @@ describe('parseUsernotice', () => {
     expect(parsed.isMember).toBe(true);
   });
 
+  it('parses rewardgift as a kind-less gray row — NOT emote gigantify (see docs/ARCHITECTURE.md §3a; corrected 2026-09-15)', () => {
+    const line = '@display-name=Giver;login=giver;msg-id=rewardgift;emotes=25:0-4;system-msg=Giver\\shas\\sredeemed\\sa\\sReward\\sGift! :tmi.twitch.tv USERNOTICE #dallas :Kappa';
+    const parsed = parseUsernotice(line);
+    expect(parsed).toEqual({
+      user: 'Giver',
+      login: 'giver',
+      text: 'Kappa',
+      rewardGift: true,
+      emotes: [{ id: '25', start: 0, end: 4 }],
+    });
+    expect(parsed.kind).toBeUndefined();
+    expect(parsed.sys).toBeUndefined();
+    expect(parsed.pointsGigantify).toBeUndefined(); // reserved for the real EventSub-correlated feature, see eventsub.test.js
+    expect(parsed.emote).toBeUndefined(); // no singular gigantify-sized field — this was never an enlarge event
+  });
+
+  it('rewardgift with no emotes tag still renders (gray, text-only — no crash)', () => {
+    const line = '@display-name=Giver;login=giver;msg-id=rewardgift;system-msg=Giver\\shas\\sredeemed\\sa\\sReward\\sGift! :tmi.twitch.tv USERNOTICE #dallas';
+    const parsed = parseUsernotice(line);
+    expect(parsed).toEqual({
+      user: 'Giver',
+      login: 'giver',
+      text: 'Giver has redeemed a Reward Gift!',
+      rewardGift: true,
+    });
+    expect(parsed.emotes).toBeUndefined();
+  });
+
   // Watch-streak notice (PR #38's 2026-08-08 streak coverage audit, §2): sample
   // payload confirms msg-param-category is always watch-streak, but this is
   // rendered unconditionally off msg-id alone — category isn't consulted.

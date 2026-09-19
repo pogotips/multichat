@@ -1,0 +1,10 @@
+{
+  "reactionBuckets": [
+    {
+      "totalReactions": 0,
+      "duration": { "seconds": "6" },
+      "intensityScore": 0
+    }
+  ],
+  "updateTimeUsec": "1757800000000000"
+}

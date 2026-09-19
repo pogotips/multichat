@@ -1,4 +1,4 @@
-import { describe, it, expect, vi, afterEach } from 'vitest';
+import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
 import { createHmac } from 'node:crypto';
 import { readFileSync } from 'node:fs';
 import { fileURLToPath } from 'node:url';
@@ -157,6 +157,7 @@ describe('buildDesiredSubs', () => {
       'channel.hype_train.end',
       'channel.ad_break.begin',
       'channel.bits.use',
+      'channel.channel_points_automatic_reward_redemption.add',
       'channel.moderate',
     ]);
     expect(subs.every((s) => s.condition.broadcaster_user_id === '123456')).toBe(true);
@@ -176,7 +177,15 @@ describe('buildDesiredSubs', () => {
     expect(bitsUse).toBeDefined();
     expect(bitsUse.version).toBe('1');
     expect(bitsUse.condition).toEqual({ broadcaster_user_id: '123456' });
-    expect(subs).toHaveLength(7);
+    expect(subs).toHaveLength(8);
+  });
+
+  it('includes channel.channel_points_automatic_reward_redemption.add pinned to v1, same condition shape as every other non-moderate sub', () => {
+    const subs = buildDesiredSubs('123456');
+    const autoRedemption = subs.find((s) => s.type === 'channel.channel_points_automatic_reward_redemption.add');
+    expect(autoRedemption).toBeDefined();
+    expect(autoRedemption.version).toBe('1');
+    expect(autoRedemption.condition).toEqual({ broadcaster_user_id: '123456' });
   });
 
   it('includes channel.moderate pinned to v2, with its own two-field condition (needs moderator_user_id, unlike every other desired sub)', () => {
@@ -312,6 +321,20 @@ describe('mapEventToRow', () => {
 // an owned action. Every other action returns null silently (expected/
 // frequent — settings toggles, VIP/mod grants, raids, ...).
 describe('mapEventToRow: channel.moderate', () => {
+  // Clock frozen for this block: withExpiresIn() and mapEventToRow's own
+  // internal duration calc each call Date.now() independently — on real
+  // clocks the ~1ms gap between the two calls occasionally straddles a
+  // rounding boundary (e.g. 30.000s -> 29.999s), failing the duration
+  // assertion below (seen 2026-08-20, internal fast-follow list item 3). Freezing
+  // makes both reads return the identical instant.
+  beforeEach(() => {
+    vi.useFakeTimers();
+    vi.setSystemTime(new Date('2026-01-01T00:00:00.000Z'));
+  });
+  afterEach(() => {
+    vi.useRealTimers();
+  });
+
   // expires_at is mutated to "now + duration" per case — the committed
   // fixtures carry a fixed 2022 timestamp (Twitch's own doc example), which
   // would render as "0s" (clamped, see formatDuration) against the real
@@ -742,10 +765,11 @@ describe('ChatHub.ensureEventSubSubscriptions', () => {
         condition: { broadcaster_user_id: '42' }, transport: { callback },
       }],
       deleted: false,
-      // Only the 6 OTHER desired subs get created (redemption.add + 3 hype
-      // train + bits.use + channel.moderate) — ad_break.begin has a live
-      // match and must not be re-created.
-      createCount: 6,
+      // Only the 7 OTHER desired subs get created (redemption.add + 3 hype
+      // train + bits.use + channel_points_automatic_reward_redemption.add +
+      // channel.moderate) — ad_break.begin has a live match and must not be
+      // re-created.
+      createCount: 7,
     },
     {
       label: 'treats a pending sub older than the 10min grace window as dead: deletes then recreates',
@@ -756,7 +780,7 @@ describe('ChatHub.ensureEventSubSubscriptions', () => {
         condition: { broadcaster_user_id: '42' }, transport: { callback },
       }],
       deleted: true,
-      createCount: 7, // ad_break recreated + the other 6
+      createCount: 8, // ad_break recreated + the other 7
     },
     {
       label: 'a dead sub (e.g. authorization_revoked) is logged loudly and delete+recreated',
@@ -776,8 +800,8 @@ describe('ChatHub.ensureEventSubSubscriptions', () => {
         condition: { broadcaster_user_id: '42' }, transport: { callback },
       }],
       deleted: false,
-      createCount: 6, // only the other 6 desired subs
-      esAllHealthy: false, // 6 of 7 desired subs still had to be created
+      createCount: 7, // only the other 7 desired subs
+      esAllHealthy: false, // 7 of 8 desired subs still had to be created
     },
     {
       label: 'every desired sub already enabled at the correct version -> esAllHealthy true, zero create/delete',
@@ -802,7 +826,7 @@ describe('ChatHub.ensureEventSubSubscriptions', () => {
       }],
       deleted: true,
       errContains: 'eventsub_version_mismatch',
-      createCount: 7, // the recreated hype_train.begin + the other 6 desired subs
+      createCount: 8, // the recreated hype_train.begin + the other 7 desired subs
       esAllHealthy: false,
     },
   ])('$label', async ({ existingSubs, deleted, createCount, errContains, esAllHealthy, esModerateHealthy }) => {
@@ -854,8 +878,8 @@ describe('ChatHub.ensureEventSubSubscriptions', () => {
     await hub.ensureEventSubSubscriptions(origin);
     const createCalls = calls.filter((c) => c.method === 'POST' && c.url.includes('/eventsub/subscriptions'));
     // ad_break.begin's replacement is withheld since its delete failed; the
-    // other 6 desired subs (no existing match at all) are created normally.
-    expect(createCalls).toHaveLength(6);
+    // other 7 desired subs (no existing match at all) are created normally.
+    expect(createCalls).toHaveLength(7);
     expect(errSpy).toHaveBeenCalledWith(expect.stringContaining('eventsub_delete_failed'));
     expect(hub.esAllHealthy).toBe(false);
     errSpy.mockRestore();
@@ -890,7 +914,7 @@ describe('ChatHub.ensureEventSubSubscriptions', () => {
     const hub = makeEventSubHub({ EVENTSUB_SECRET: 's3cret', TWITCH_BROADCASTER_ID: '42' });
     await hub.ensureEventSubSubscriptions(origin);
     const createCalls = calls.filter((c) => c.method === 'POST' && c.url.includes('/eventsub/subscriptions'));
-    expect(createCalls).toHaveLength(6); // hype_train.begin's replacement withheld; other 6 created
+    expect(createCalls).toHaveLength(7); // hype_train.begin's replacement withheld; other 7 created
     expect(errSpy).toHaveBeenCalledWith(expect.stringContaining('eventsub_version_mismatch'));
     expect(errSpy).toHaveBeenCalledWith(expect.stringContaining('eventsub_delete_failed'));
     expect(hub.esAllHealthy).toBe(false);
@@ -1650,6 +1674,140 @@ describe('ChatHub gigantify double-display suppression', () => {
   });
 });
 
+// Points-funded sibling of the bits.use gigantify suppression above —
+// channel.channel_points_automatic_reward_redemption.add, reward_type
+// gigantify_an_emote. Same correlation machinery (handleGigantifyDedupe/
+// consumePendingGigantify), opposite outcome: never a second row (see
+// mapEventToRow's automatic_reward_redemption case — always null), so a
+// match UPGRADES the matched PRIVMSG (markPointsGigantify) instead of
+// hiding it (markSuperseded).
+describe('ChatHub points-funded gigantify correlation (channel.channel_points_automatic_reward_redemption.add)', () => {
+  const POINTS_GIGANTIFY_EVENT = {
+    user_login: 'cool_user',
+    user_name: 'Cool_User',
+    reward: { type: 'gigantify_an_emote', cost: 500 },
+    message: { text: 'PogChamp', emotes: [{ id: 'emotesv2_abc123', begin: 0, end: 7 }] },
+  };
+  // Real chat PRIVMSGs carry their own genuine IRC `emotes` tag for
+  // whatever emote is in the text, independent of the redemption event —
+  // the id-tier match in gigantifyRowMatches needs that tag present on the
+  // candidate row itself (points events carry no emote NAME to fall back
+  // to via the text tier — see handleGigantifyDedupe), so every seed
+  // PRIVMSG below carries the matching `emotes=` tag.
+  const ircLine = (id, login, text) =>
+    `@id=${id};display-name=${login};emotes=emotesv2_abc123:0-${text.length - 1} :${login}!${login}@${login}.tmi.twitch.tv PRIVMSG #testchannel :${text}`;
+  const seedEmotes = [{ id: 'emotesv2_abc123', start: 0, end: 7 }];
+
+  it('never renders its own row — mapEventToRow returns null for this subType even on a match', async () => {
+    const hub = makeEventSubHub();
+    const res = await hub.handleEventSub(eventSubDoRequest('pgig-norow-1', 'channel.channel_points_automatic_reward_redemption.add', POINTS_GIGANTIFY_EVENT));
+    expect(res.status).toBe(200);
+    expect(hub.ring).toHaveLength(0); // no plain PRIVMSG yet, no gold row either — nothing pushed
+    expect(hub.pendingGigantifies).toHaveLength(1);
+    expect(hub.pendingGigantifies[0].points).toBe(true);
+  });
+
+  it('IRC-first: the matching ring entry is upgraded in place — pointsGigantify + emote, never superseded/hidden', async () => {
+    const hub = makeEventSubHub();
+    hub.pushMessage('tw', { user: 'Cool_User', login: 'cool_user', text: 'PogChamp', emotes: seedEmotes }, { id: 'irc-pts-1' });
+
+    await hub.handleEventSub(eventSubDoRequest('pgig-irc-1', 'channel.channel_points_automatic_reward_redemption.add', POINTS_GIGANTIFY_EVENT));
+
+    const row = hub.ring.find((e) => e.twId === 'irc-pts-1');
+    expect(row.pointsGigantify).toBe(true);
+    expect(row.emote).toEqual({ id: 'emotesv2_abc123', name: '' });
+    expect(row.superseded).toBeUndefined();
+    expect(row.kind).toBeUndefined();
+    expect(hub.ring).toHaveLength(1); // still just the one row — never a second
+  });
+
+  it('EventSub-first: the pending points marker upgrades the matching PRIVMSG on arrival — no second row, no supersede', async () => {
+    const hub = makeEventSubHub();
+    const broadcastSpy = vi.spyOn(hub, 'broadcastEvent');
+
+    await hub.handleEventSub(eventSubDoRequest('pgig-es-1', 'channel.channel_points_automatic_reward_redemption.add', POINTS_GIGANTIFY_EVENT));
+    expect(hub.pendingGigantifies).toHaveLength(1);
+
+    hub.handleIrcData(ircLine('irc-pts-2', 'cool_user', 'PogChamp'));
+
+    expect(hub.ring).toHaveLength(1); // the PRIVMSG itself — never a separate row
+    const row = hub.ring.find((e) => e.twId === 'irc-pts-2');
+    expect(row.pointsGigantify).toBe(true);
+    expect(row.emote).toEqual({ id: 'emotesv2_abc123', name: '' });
+    expect(row.superseded).toBeUndefined();
+    expect(hub.pendingGigantifies).toHaveLength(0); // consumed
+    expect(broadcastSpy.mock.calls.some(([event]) => event === 'mark')).toBe(false); // no client 'mark' handler exists for this — see markPointsGigantify
+  });
+
+  it('logs points_gigantify_applied with the match details, either order', async () => {
+    const logSpy = vi.spyOn(console, 'log').mockImplementation(() => {});
+    const hub = makeEventSubHub();
+    hub.pushMessage('tw', { user: 'Cool_User', login: 'cool_user', text: 'PogChamp', emotes: seedEmotes }, { id: 'irc-pts-log-1' });
+
+    await hub.handleEventSub(eventSubDoRequest('pgig-log-1', 'channel.channel_points_automatic_reward_redemption.add', POINTS_GIGANTIFY_EVENT));
+
+    const events = logEvents(logSpy, 'points_gigantify_applied');
+    expect(events).toHaveLength(1);
+    expect(events[0]).toMatchObject({ order: 'irc_first', login: 'cool_user', twId: 'irc-pts-log-1', emoteId: 'emotesv2_abc123' });
+    logSpy.mockRestore();
+  });
+
+  it('bits-funded gigantify (channel.bits.use) is unaffected — still supersedes + renders its own gold row, never pointsGigantify', async () => {
+    const hub = makeEventSubHub();
+    hub.pushMessage('tw', { user: 'Cool_User', login: 'cool_user', text: 'PogChamp' }, { id: 'irc-bits-still-gold-1' });
+
+    await hub.handleEventSub(eventSubDoRequest('pgig-bits-control-1', 'channel.bits.use', FIXTURES['channel.bits.use'].event));
+
+    const plain = hub.ring.find((e) => e.twId === 'irc-bits-still-gold-1');
+    expect(plain.superseded).toBe(true);
+    expect(plain.pointsGigantify).toBeUndefined();
+    const gold = hub.ring.at(-1);
+    expect(gold.kind).toBe('power_up');
+    expect(gold.pointsGigantify).toBeUndefined();
+  });
+
+  it('other reward_types (not gigantify_an_emote) never enter the correlation — structured log only, no pending entry, no ring mutation', async () => {
+    const logSpy = vi.spyOn(console, 'log').mockImplementation(() => {});
+    const hub = makeEventSubHub();
+    hub.pushMessage('tw', { user: 'Cool_User', login: 'cool_user', text: 'PogChamp' }, { id: 'irc-not-gigantify-1' });
+    const otherEvent = { user_login: 'cool_user', reward: { type: 'message_effect', cost: 300 }, message: { text: 'PogChamp', emotes: [] } };
+
+    const res = await hub.handleEventSub(eventSubDoRequest('pgig-other-1', 'channel.channel_points_automatic_reward_redemption.add', otherEvent));
+
+    expect(res.status).toBe(200);
+    expect(hub.pendingGigantifies).toHaveLength(0);
+    expect(hub.ring.find((e) => e.twId === 'irc-not-gigantify-1').pointsGigantify).toBeUndefined();
+    const events = logEvents(logSpy, 'automatic_reward_redemption_unmapped');
+    expect(events).toEqual([{ ev: 'automatic_reward_redemption_unmapped', rewardType: 'message_effect' }]);
+    logSpy.mockRestore();
+  });
+
+  it('window expiry — EventSub-first: a pending points marker older than GIGANTIFY_SUPPRESS_WINDOW_MS no longer upgrades its PRIVMSG', () => withFakeTimers(async () => {
+    const hub = makeEventSubHub();
+    await hub.handleEventSub(eventSubDoRequest('pgig-expiry-1', 'channel.channel_points_automatic_reward_redemption.add', POINTS_GIGANTIFY_EVENT));
+    expect(hub.pendingGigantifies).toHaveLength(1);
+
+    vi.advanceTimersByTime(GIGANTIFY_SUPPRESS_WINDOW_MS + 1);
+    hub.handleIrcData(ircLine('irc-pts-late-1', 'cool_user', 'PogChamp'));
+
+    const row = hub.ring.find((e) => e.twId === 'irc-pts-late-1');
+    expect(row.pointsGigantify).toBeUndefined(); // pushed normally, not upgraded
+    expect(hub.pendingGigantifies).toHaveLength(0); // stale entry pruned on this call
+  }));
+
+  it('redelivery: a redelivered points-gigantify (same x-es-id) never double-buffers or double-applies', async () => {
+    const hub = makeEventSubHub();
+    hub.pushMessage('tw', { user: 'Cool_User', login: 'cool_user', text: 'PogChamp', emotes: seedEmotes }, { id: 'irc-pts-redeliv-1' });
+
+    await hub.handleEventSub(eventSubDoRequest('pgig-redeliv-1', 'channel.channel_points_automatic_reward_redemption.add', POINTS_GIGANTIFY_EVENT));
+    expect(hub.ring.find((e) => e.twId === 'irc-pts-redeliv-1').pointsGigantify).toBe(true);
+
+    await hub.handleEventSub(eventSubDoRequest('pgig-redeliv-1', 'channel.channel_points_automatic_reward_redemption.add', POINTS_GIGANTIFY_EVENT)); // same x-es-id
+    expect(hub.pendingGigantifies).toHaveLength(0); // no stray pending entry from the dropped redelivery
+    expect(hub.ring).toHaveLength(1); // still just the one row
+  });
+});
+
 describe('mapEventToRow: channel.moderate redelivery/dedupe proof', () => {
   it('a redelivered timeout notification (same x-es-id) is deduped before mapping — only one row', async () => {
     const hub = makeEventSubHub();
@@ -1803,7 +1961,7 @@ describe('ChatHub.logEventSubScopeCheck', () => {
 });
 
 // ── ChatHub.createEventSubSubscription — channel.bits.use 403 diagnosis ───
-describe('ChatHub.createEventSubSubscription: channel.bits.use 403 diagnosis', () => {
+describe('ChatHub.createEventSubSubscription: generic 403 diagnosis (diagnoseScope403)', () => {
   const callback = 'https://multichat.example.com/eventsub/callback';
   const bitsWant = { type: 'channel.bits.use', version: '1', condition: { broadcaster_user_id: '42' } };
 
@@ -1847,11 +2005,37 @@ describe('ChatHub.createEventSubSubscription: channel.bits.use 403 diagnosis', (
     errSpy.mockRestore();
   });
 
-  it('a DIFFERENT subscription type (e.g. channel.ad_break.begin) with a 403 gets NO diagnosis field at all', async () => {
+  it("esScopeCheckResult.hasAllModerateScopes === false -> channel.moderate 403 diagnosis: 'scope_not_granted'", async () => {
     vi.stubGlobal('fetch', stub403());
     const errSpy = vi.spyOn(console, 'error').mockImplementation(() => {});
     const hub = makeEventSubHub();
-    hub.esScopeCheckResult = { hasBitsRead: false, hasAllEventSubScopes: false, checkedAt: Date.now() };
+    hub.esScopeCheckResult = { hasBitsRead: true, hasAllEventSubScopes: true, hasAllModerateScopes: false, scopes: [], checkedAt: Date.now() };
+    const moderateWant = { type: 'channel.moderate', version: '2', condition: { broadcaster_user_id: '42', moderator_user_id: '42' } };
+
+    await hub.createEventSubSubscription('app-token', moderateWant, callback);
+
+    expect(errSpy).toHaveBeenCalledWith(expect.stringContaining('"diagnosis":"scope_not_granted"'));
+    errSpy.mockRestore();
+  });
+
+  it("esScopeCheckResult.hasAllModerateScopes === true -> channel.moderate 403 diagnosis: 'not_a_scope_issue'", async () => {
+    vi.stubGlobal('fetch', stub403());
+    const errSpy = vi.spyOn(console, 'error').mockImplementation(() => {});
+    const hub = makeEventSubHub();
+    hub.esScopeCheckResult = { hasBitsRead: true, hasAllEventSubScopes: true, hasAllModerateScopes: true, scopes: [], checkedAt: Date.now() };
+    const moderateWant = { type: 'channel.moderate', version: '2', condition: { broadcaster_user_id: '42', moderator_user_id: '42' } };
+
+    await hub.createEventSubSubscription('app-token', moderateWant, callback);
+
+    expect(errSpy).toHaveBeenCalledWith(expect.stringContaining('"diagnosis":"not_a_scope_issue"'));
+    errSpy.mockRestore();
+  });
+
+  it('a mapped-but-different subscription type (channel.ad_break.begin) with a 403 NOW also gets diagnosed via its own required scope (channel:read:ads) — the exact gap this generalization closes', async () => {
+    vi.stubGlobal('fetch', stub403());
+    const errSpy = vi.spyOn(console, 'error').mockImplementation(() => {});
+    const hub = makeEventSubHub();
+    hub.esScopeCheckResult = { hasBitsRead: true, hasAllEventSubScopes: false, hasAllModerateScopes: false, scopes: ['bits:read'], checkedAt: Date.now() }; // channel:read:ads missing
     const adBreakWant = { type: 'channel.ad_break.begin', version: '1', condition: { broadcaster_user_id: '42' } };
 
     await hub.createEventSubSubscription('app-token', adBreakWant, callback);
@@ -1859,6 +2043,63 @@ describe('ChatHub.createEventSubSubscription: channel.bits.use 403 diagnosis', (
     expect(errSpy).toHaveBeenCalledTimes(1);
     const logged = JSON.parse(errSpy.mock.calls[0][0]);
     expect(logged.ev).toBe('eventsub_create_failed');
+    expect(logged.diagnosis).toBe('scope_not_granted');
+    errSpy.mockRestore();
+  });
+
+  it('the same mapped type with its required scope actually present -> not_a_scope_issue', async () => {
+    vi.stubGlobal('fetch', stub403());
+    const errSpy = vi.spyOn(console, 'error').mockImplementation(() => {});
+    const hub = makeEventSubHub();
+    hub.esScopeCheckResult = { hasBitsRead: false, hasAllEventSubScopes: false, hasAllModerateScopes: false, scopes: ['channel:read:ads'], checkedAt: Date.now() };
+    const adBreakWant = { type: 'channel.ad_break.begin', version: '1', condition: { broadcaster_user_id: '42' } };
+
+    await hub.createEventSubSubscription('app-token', adBreakWant, callback);
+
+    const logged = JSON.parse(errSpy.mock.calls[0][0]);
+    expect(logged.diagnosis).toBe('not_a_scope_issue');
+    errSpy.mockRestore();
+  });
+
+  it('channel.channel_points_automatic_reward_redemption.add 403 diagnoses via channel:read:redemptions — the SAME scope as channel.channel_points_custom_reward_redemption.add, not a new one', async () => {
+    vi.stubGlobal('fetch', stub403());
+    const errSpy = vi.spyOn(console, 'error').mockImplementation(() => {});
+    const hub = makeEventSubHub();
+    hub.esScopeCheckResult = { hasBitsRead: true, hasAllEventSubScopes: false, hasAllModerateScopes: false, scopes: ['bits:read'], checkedAt: Date.now() }; // channel:read:redemptions missing
+    const autoRedemptionWant = { type: 'channel.channel_points_automatic_reward_redemption.add', version: '1', condition: { broadcaster_user_id: '42' } };
+
+    await hub.createEventSubSubscription('app-token', autoRedemptionWant, callback);
+
+    const logged = JSON.parse(errSpy.mock.calls[0][0]);
+    expect(logged.diagnosis).toBe('scope_not_granted');
+    errSpy.mockRestore();
+  });
+
+  it('a genuinely unmapped sub type (no EVENTSUB_SCOPE_BY_TYPE entry) with a 403 gets NO diagnosis field — no guessing at an unknown cause', async () => {
+    vi.stubGlobal('fetch', stub403());
+    const errSpy = vi.spyOn(console, 'error').mockImplementation(() => {});
+    const hub = makeEventSubHub();
+    hub.esScopeCheckResult = { hasBitsRead: true, hasAllEventSubScopes: true, hasAllModerateScopes: true, scopes: ['some:scope'], checkedAt: Date.now() };
+    const unmappedWant = { type: 'channel.some_future_sub_type', version: '1', condition: { broadcaster_user_id: '42' } };
+
+    await hub.createEventSubSubscription('app-token', unmappedWant, callback);
+
+    const logged = JSON.parse(errSpy.mock.calls[0][0]);
+    expect(logged.ev).toBe('eventsub_create_failed');
+    expect(logged).not.toHaveProperty('diagnosis');
+    errSpy.mockRestore();
+  });
+
+  it('a mapped type whose esScopeCheckResult predates the scopes-array field (no scopes key) degrades to NO diagnosis rather than a wrong guess', async () => {
+    vi.stubGlobal('fetch', stub403());
+    const errSpy = vi.spyOn(console, 'error').mockImplementation(() => {});
+    const hub = makeEventSubHub();
+    hub.esScopeCheckResult = { hasBitsRead: false, hasAllEventSubScopes: false, checkedAt: Date.now() }; // no scopes array
+    const adBreakWant = { type: 'channel.ad_break.begin', version: '1', condition: { broadcaster_user_id: '42' } };
+
+    await hub.createEventSubSubscription('app-token', adBreakWant, callback);
+
+    const logged = JSON.parse(errSpy.mock.calls[0][0]);
     expect(logged).not.toHaveProperty('diagnosis');
     errSpy.mockRestore();
   });

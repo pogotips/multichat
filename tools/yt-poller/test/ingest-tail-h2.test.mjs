@@ -24,7 +24,7 @@
 //       retryBackoffMs = RETRY_BACKOFF_INITIAL_MS;
 //     }
 //   }
-import { describe, it, expect } from 'vitest';
+import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
 import { enqueueRetry, drainBatch, SEND_CONCURRENCY } from '../retry-queue.mjs';
 
 // Real production values are 5_000/60_000 (poller.mjs:88-89) — this test
@@ -97,16 +97,35 @@ describe('Phase 4b: H2 head-of-line-blocking fingerprint', () => {
     expect(aRetry.startedAtMs).toBe(b.startedAtMs);
   });
 
-  it('a clean batch (no failures) does not delay anything queued behind it — control', async () => {
-    const queue = [];
-    enqueueRetry(queue, 'msgA');
-    enqueueRetry(queue, 'msgB');
-    const sendFn = async () => true;
-    const started = Date.now();
-    const timeline = await drainLoopMirror(queue, sendFn, INITIAL_BACKOFF_MS, MAX_BACKOFF_MS);
-    // Both attempted essentially immediately, no backoff — msgB never had
-    // to wait behind anything, since msgA never failed.
-    expect(timeline.length).toBe(2);
-    expect(Date.now() - started).toBeLessThan(INITIAL_BACKOFF_MS / 2);
+  // L8 fix (2026-09-12 review): a real-wall-clock `toBeLessThan` bound here
+  // was plausible-flake under CI load (same class of issue the eventsub
+  // clock freeze, 8e3e869, fixed for duration-rounding races). Scoped fake
+  // timers, only for this control test — the head-of-line-blocking test
+  // above genuinely needs real timers, since it races a real setTimeout
+  // sleep against msgB's arrival.
+  describe('control: clean batch (fake timers scoped to this test)', () => {
+    beforeEach(() => {
+      vi.useFakeTimers();
+      vi.setSystemTime(new Date('2026-01-01T00:00:00.000Z'));
+    });
+    afterEach(() => {
+      vi.useRealTimers();
+    });
+
+    it('a clean batch (no failures) does not delay anything queued behind it — control', async () => {
+      const queue = [];
+      enqueueRetry(queue, 'msgA');
+      enqueueRetry(queue, 'msgB');
+      const sendFn = async () => true;
+      const timeline = await drainLoopMirror(queue, sendFn, INITIAL_BACKOFF_MS, MAX_BACKOFF_MS);
+      // Both attempted essentially immediately, no backoff — msgB never had
+      // to wait behind anything, since msgA never failed.
+      expect(timeline.length).toBe(2);
+      // Deterministic replacement for the old wall-clock bound: a clean
+      // batch's success path never calls sleep()/setTimeout at all, so no
+      // timer is ever scheduled — this can't flake under CI load the way a
+      // real-clock elapsed-time bound could.
+      expect(vi.getTimerCount()).toBe(0);
+    });
   });
 });

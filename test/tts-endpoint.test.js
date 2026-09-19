@@ -231,6 +231,31 @@ describe('POST /tts — DO-side gates (kill switch, minute ceiling, daily budget
   });
 });
 
+describe('POST /tts — pre-charge is not refunded on env.AI.run failure (internal fast-follow list item 4, accepted tradeoff)', () => {
+  it('a failed generation still burns the minute and daily-char budget it was charged before AI.run ran', async () => {
+    const { hub } = makeHub();
+    const env = {
+      MULTICHAT_OVERLAY_SECRET: OVERLAY_SECRET,
+      HUB: { getByName: () => ({ fetch: (url, init) => hub.fetch(new Request(url, init)) }) },
+      AI: { run: vi.fn(async () => { throw new Error('boom'); }) },
+    };
+    const res = await postTts(env, 'hello');
+    expect(res.status).toBe(204);
+    expect(env.AI.run).toHaveBeenCalledTimes(1);
+
+    // Minute bucket: in-memory field on the DO, incremented inside the same
+    // blockConcurrencyWhile that gated this call — no decrement anywhere in
+    // handleTts's catch block (src/worker.js:373-375 only logs), so this
+    // stays incremented even though generation failed.
+    expect(hub.ttsMinuteCount).toBe(1);
+
+    // Daily budget: ctx.storage-persisted, same story — 'hello'.length === 5
+    // chars committed before env.AI.run was ever called.
+    const stored = await hub.ctx.storage.get('ttsDaily');
+    expect(stored.chars).toBe(5);
+  });
+});
+
 describe('POST /overlay/admin — auth restored, shares MULTICHAT_OVERLAY_SECRET with /tts (no separate admin secret)', () => {
   it('401 with no token', async () => {
     const env = makeTtsEnv();

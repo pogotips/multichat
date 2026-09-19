@@ -10,3 +10,4 @@ services:
       MULTICHAT_URL: "https://multichat.YOUR_DOMAIN" # base URL of the multichat Worker
       MULTICHAT_INGEST_SECRET: "replace-with-your-ingest-secret" # must match the Worker's secret
       YOUTUBE_API_KEY: "replace-with-youtube-api-key" # optional — omit to leave live-counts off
+      # WATCHDOG_LIVENESS_GATE: "off" # optional. Default on. Set to `off` to instantly revert to the single fixed 3-minute threshold, ignoring liveness entirely — without a rebuild: an env edit + container recreate, for recovering from a misbehaving gate mid-stream.

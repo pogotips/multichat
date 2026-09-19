@@ -32,6 +32,15 @@ export function chatDataWithTracking(item) {
   return actionDataWithTracking({ addChatItemAction: { item, clientId: 'x' } });
 }
 
+// Wraps mutations in a minimal get_live_chat response carrying
+// frameworkUpdates alongside an empty actions array — the shape reaction
+// bursts ride (see the frameworkUpdates hook in
+// patches/youtube-chat+2.2.0.patch), distinct from every other fixture
+// helper above which only ever populates actions.
+export function frameworkUpdatesData(mutations) {
+  return { ...actionData(), frameworkUpdates: { entityBatchUpdate: { mutations } } };
+}
+
 export function parseOne(fixture) {
   const [chatItems] = parseChatData(chatDataWith(fixture));
   expect(chatItems).toHaveLength(1);

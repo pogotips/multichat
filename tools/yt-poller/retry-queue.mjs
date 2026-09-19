@@ -9,9 +9,11 @@ export const SEND_CONCURRENCY = 4;
 // Heartbeats are liveness pings, not chat — they stay outside this queue
 // entirely (sent direct, no retry): losing one to a transient outage is
 // meaningless (another follows in 15s), and retrying it would just crowd
-// out real messages in a bounded queue.
+// out real messages in a bounded queue. yt_reactions status pushes are the
+// same shape of thing — a live snapshot superseded within seconds by the
+// next poll — so a stale retry would just crowd the queue for no benefit.
 export function isRetryable(msg) {
-  return Boolean(msg) && msg.type !== 'heartbeat';
+  return Boolean(msg) && msg.type !== 'heartbeat' && msg.type !== 'yt_reactions';
 }
 
 export function enqueueRetry(queue, item, maxSize = RETRY_QUEUE_MAX) {

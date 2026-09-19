@@ -8,7 +8,9 @@
 	"preview_urls": false,
 	"routes": [
 		{
-			"pattern": "YOUR_DOMAIN",
+			// custom_domain:true means `pattern` is a bare hostname only — no
+			// wildcard (*), no path — replace chathub.example.com with yours.
+			"pattern": "chathub.example.com",
 			"custom_domain": true
 		}
 	],

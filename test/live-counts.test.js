@@ -99,6 +99,38 @@ describe('/ingest/yt heartbeat counts extension (regression-safe)', () => {
   });
 });
 
+describe('/ingest/yt heartbeat caller scoping (same 403 as yt_reactions/mod branches)', () => {
+  it('a poller-caller heartbeat is still 200 — breaking this means liveness lies', async () => {
+    const { hub } = makeHub();
+    const before = hub.lastSeen.yt;
+    const res = await hub.handleIngestYt(req({ type: 'heartbeat', viewers: 321, likes: 65 }, { caller: 'poller' }));
+    expect(res.status).toBe(200);
+    expect(hub.lastSeen.yt).toBeGreaterThan(before);
+    expect(hub.ytViewers).toBe(321);
+  });
+
+  it('a non-poller caller (e.g. the raidq cron secret) gets 403 and touches nothing — no liveness bump, no counts, no broadcast', async () => {
+    const { hub } = makeHub();
+    const before = hub.lastSeen.yt;
+    const broadcastSpy = vi.spyOn(hub, 'broadcastEvent');
+    const res = await hub.handleIngestYt(req({ type: 'heartbeat', viewers: 999, likes: 999 }, { caller: 'raidq' }));
+    expect(res.status).toBe(403);
+    expect(hub.lastSeen.yt).toBe(before);
+    expect(hub.ytViewers).toBeNull();
+    expect(hub.ytLikes).toBeNull();
+    expect(hub.ytCountsAt).toBe(0);
+    expect(broadcastSpy).not.toHaveBeenCalled();
+  });
+
+  it('a raidq-caller chat message (the membership-renewal lane) is still accepted', async () => {
+    const { hub } = makeHub();
+    const res = await hub.handleIngestYt(req({ user: 'Alice', text: 'membership renewed' }, { caller: 'raidq' }));
+    expect(res.status).toBe(200);
+    expect(hub.ring).toHaveLength(1);
+    expect(hub.ring[0].user).toBe('Alice');
+  });
+});
+
 describe('buildStatusPayload counts block', () => {
   it('includes null/not-stale counts when nothing has been polled yet', () => {
     const { hub } = makeHub();
@@ -133,6 +165,36 @@ describe('buildStatusPayload counts block', () => {
     hub.twViewersAt = Date.now() - 31_000; // > 2 * 15s Helix poll
     const status = hub.buildStatusPayload();
     expect(status.counts.twViewers).toEqual({ v: 100, stale: true });
+  });
+});
+
+// H2 (ChatHub review of 2026-09-12, internal): the client needs to know the
+// oldest surviving ring message id to tell a real replay gap apart from an
+// anchored reconnect. this.ring is FIFO (pushMessage appends, eviction
+// shifts off the front once length exceeds RING_SIZE) — index 0 is always
+// the oldest entry still held.
+describe('buildStatusPayload ringFloor', () => {
+  it('is null when the ring is empty — no messages have ever landed', () => {
+    const { hub } = makeHub();
+    expect(hub.ring).toHaveLength(0);
+    expect(hub.buildStatusPayload().ringFloor).toBeNull();
+  });
+
+  it('is the oldest surviving id — first push, no eviction yet', () => {
+    const { hub } = makeHub();
+    hub.pushMessage('tw', { user: 'Alice', text: 'hi' });
+    hub.pushMessage('tw', { user: 'Bob', text: 'yo' });
+    expect(hub.buildStatusPayload().ringFloor).toBe(hub.ring[0].id);
+  });
+
+  it('advances past evicted ids once the ring exceeds RING_SIZE (200)', () => {
+    const { hub } = makeHub();
+    for (let i = 0; i < 205; i++) hub.pushMessage('tw', { user: 'Alice', text: `msg ${i}` });
+    expect(hub.ring).toHaveLength(200);
+    // The first 5 pushed ids were evicted — the floor must reflect that, not
+    // the very first id this hub ever issued.
+    expect(hub.buildStatusPayload().ringFloor).toBe(hub.ring[0].id);
+    expect(hub.buildStatusPayload().ringFloor).toBeGreaterThan(5);
   });
 });
 

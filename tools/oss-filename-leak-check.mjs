@@ -10,19 +10,36 @@ import { readFileSync, readdirSync } from 'node:fs';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 
-// Derive content-scan substrings from .oss-exclude's own wildcard filename
-// globs (e.g. "*_AUDIT_*.md" -> "_AUDIT_", "SHIP_REPORT_*.md" -> "SHIP_REPORT_")
-// — a comment mentioning any of these tokens is naming an excluded doc by
-// its naming convention, regardless of the specific date/suffix. Exact
-// (non-wildcard) filenames in .oss-exclude are already covered by their
-// shared convention token, so only wildcard lines are used as the source.
+// Derive content-scan substrings from .oss-exclude's own filename entries.
+//
+// Wildcard globs (e.g. "*_AUDIT_*.md" -> "_AUDIT_", "SHIP_REPORT_*.md" ->
+// "SHIP_REPORT_") — a comment mentioning any of these tokens is naming an
+// excluded doc by its naming convention, regardless of the specific
+// date/suffix.
+//
+// M3 fix (2026-09-12 review, round 2): exact (non-wildcard) entries were
+// previously assumed "already covered by their shared convention token" —
+// false whenever an exact-name doc (FASTFOLLOW_BATCH.md, BACKLOG.md,
+// CONSENT_DAY_RUNBOOK.md) doesn't share a wildcard's naming convention at
+// all. Every non-wildcard, non-comment line now also contributes its
+// basename as a literal pattern (case-sensitive) — scoped to `.md` entries
+// specifically, matching this tool's own stated scope (internal DOC
+// filenames), not infra excludes like `node_modules`/`.git`/`.dev.vars`/
+// `wrangler.jsonc`/`.oss-exclude` itself, which would be pure noise (e.g.
+// ".git" is a substring of ".gitignore").
 export function derivePatterns(ossExcludeContent) {
   const patterns = new Set();
   for (const rawLine of ossExcludeContent.split('\n')) {
     const line = rawLine.trim();
-    if (!line || line.startsWith('#') || !line.includes('*')) continue;
-    const stripped = line.replace(/\*/g, '').replace(/\.md$/, '');
-    if (stripped.length >= 4) patterns.add(stripped);
+    if (!line || line.startsWith('#')) continue;
+    if (line.includes('*')) {
+      const stripped = line.replace(/\*/g, '').replace(/\.md$/, '');
+      if (stripped.length >= 4) patterns.add(stripped);
+      continue;
+    }
+    if (!line.endsWith('.md')) continue; // infra excludes, not doc filenames — see comment above
+    const basename = line.split('/').pop();
+    if (basename) patterns.add(basename);
   }
   return [...patterns];
 }
@@ -70,10 +87,20 @@ if (isMain) {
     : path.join(root, '..', '.oss-exclude');
   const patterns = derivePatterns(readFileSync(ossExcludePath, 'utf8'));
   const hits = scanDirForPatterns(scanRoot, patterns, {
-    // These three necessarily contain the literal pattern strings as their
-    // own subject matter (glob source, denylist definitions, unit-test
-    // fixtures) — not real leaks of an excluded doc's existence.
-    excludeFiles: ['.oss-exclude', 'publish-oss.sh', 'oss-filename-leak-check.mjs', 'oss-filename-leak-check.test.mjs'],
+    // These necessarily contain the literal pattern strings as their own
+    // subject matter (glob source, denylist definitions, unit-test
+    // fixtures) — not real leaks of an excluded doc's existence. The last
+    // two are the publish-oss.sh gate's own regression tests (2026-09-19),
+    // which legitimately write BACKLOG.md/FASTFOLLOW_BATCH.md as fixture
+    // content to prove those literals still trip the gate elsewhere.
+    excludeFiles: [
+      '.oss-exclude',
+      'publish-oss.sh',
+      'oss-filename-leak-check.mjs',
+      'oss-filename-leak-check.test.mjs',
+      'publish-oss-forbidden-gate.test.mjs',
+      'publish-oss-post-sync-check.test.mjs',
+    ],
   });
   if (hits.length) {
     console.error(`abort: internal doc filenames referenced in staged export content (${hits.length} hit(s)):`);

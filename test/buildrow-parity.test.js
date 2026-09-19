@@ -143,3 +143,69 @@ describe('buildRow: gif rendering (msg.gifs)', () => {
     });
   });
 });
+
+// Rewardgift (generic channel-points reward notice, see parseUsernotice's
+// rewardgift branch in worker.js) is NOT emote gigantify — corrected
+// 2026-09-15. It's its own plain gray kind: no `kind` field (never earns
+// gold/ledger/buzz/TTS — those all key off msg.kind alone), no singular
+// msg.emote (never the enlarged 3.0-scale image), just an ordinary
+// standard-size inline emote via the plural msg.emotes array like any other
+// chat row.
+describe('buildRow: rewardgift (plain gray, standard-size)', () => {
+  const msg = { platform: 'tw', user: 'Giver', text: 'Kappa', rewardGift: true, emotes: [{ id: '25', start: 0, end: 4 }] };
+
+  it('renders the reward-gift class, not paid, not points-gigantify, with a standard-size inline emote (no 3.0-scale image)', () => {
+    const doc = createFakeDocument();
+    const row = buildRow(msg, { myName: '', roleClass, doc, mention: true });
+    expect(row.className).toBe('msg reward-gift');
+    const serialized = serializeNode(row);
+    expect(serialized.children.some((c) => c.className === 'emote gigantify')).toBe(false);
+    expect(serialized.children.some((c) => c.className === 'amount')).toBe(false);
+    expect(serialized.children[1]).toMatchObject({ tag: 'span', className: 'user' });
+  });
+});
+
+// The REAL points-funded gigantify — driven by ChatHub.markPointsGigantify
+// correlating channel.channel_points_automatic_reward_redemption.add
+// (reward_type gigantify_an_emote) against the matching PRIVMSG (see
+// eventsub.test.js for the correlation itself). Same rendering contract as
+// PR #64 originally claimed for rewardgift, now correctly wired: no `kind`,
+// gray, gold-row-sized via the same singular msg.emote/3.0-scale path
+// channel.bits.use's gold row uses.
+describe('buildRow: points-funded gigantify (gray, gold-sized)', () => {
+  const msg = { platform: 'tw', user: 'Giver', text: 'Kappa', pointsGigantify: true, emote: { id: '25', name: '' } };
+
+  it('renders the points-gigantify class, not paid, with the same 3.0-scale emote image as the gold row', () => {
+    const doc = createFakeDocument();
+    const row = buildRow(msg, { myName: '', roleClass, doc, mention: true });
+    expect(row.className).toBe('msg points-gigantify');
+    const serialized = serializeNode(row);
+    expect(serialized.children.at(-1)).toEqual({
+      tag: 'img',
+      className: 'emote gigantify',
+      src: 'https://static-cdn.jtvnw.net/emoticons/v2/25/default/dark/3.0',
+      alt: '25',
+      loading: 'lazy',
+    });
+  });
+
+  it('carries no amount span and no gold (paid) username color', () => {
+    const doc = createFakeDocument();
+    const row = buildRow(msg, { myName: '', roleClass, doc, mention: true });
+    const serialized = serializeNode(row);
+    expect(serialized.children.some((c) => c.className === 'amount')).toBe(false);
+    expect(serialized.children[1]).toMatchObject({ tag: 'span', className: 'user' });
+  });
+});
+
+describe('buildRow: bits-funded gigantify stays gold (regression)', () => {
+  it('kind:power_up + emote still renders paid/gold, never points-gigantify', () => {
+    const msg = { platform: 'tw', user: 'Baller', text: 'Gigantify an Emote', kind: 'power_up', amount: '500 bits', emote: { id: '25', name: 'Kappa' } };
+    const doc = createFakeDocument();
+    const row = buildRow(msg, { myName: '', roleClass, doc, mention: true });
+    expect(row.className).toBe('msg paid');
+    const serialized = serializeNode(row);
+    expect(serialized.children[1]).toMatchObject({ tag: 'span', className: 'user paid' });
+    expect(serialized.children.some((c) => c.className === 'amount')).toBe(true);
+  });
+});

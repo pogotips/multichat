@@ -26,7 +26,12 @@ class FakeElement {
     this.nodeType = 'element';
     this._className = '';
     this.classList = new FakeClassList();
-    this.style = {};
+    // setProperty/getPropertyValue for CSS custom properties (e.g. the
+    // reaction-burst particle's --drift) — real CSSStyleDeclaration objects
+    // don't support plain dot/bracket assignment for `--`-prefixed
+    // properties, only these two methods, so a fake style object standing in
+    // for one needs to support the same real API real code will call.
+    this.style = { setProperty(k, v) { this[k] = v; }, getPropertyValue(k) { return this[k] || ''; } };
     this.dataset = {};
     this.children = [];
     this.scrollTop = 0;
@@ -47,20 +52,24 @@ class FakeElement {
     return el;
   }
   removeChild(el) { this.children = this.children.filter((c) => c !== el); return el; }
-  addEventListener() {}
+  addEventListener(type, handler) { (this._listeners ??= {})[type] = handler; }
+  click() { this._listeners?.click?.(); }
   setAttribute() {}
   querySelector() { return null; }
   get offsetHeight() { return 0; }
 }
 
 class FakeEventSource {
-  constructor() { this._onmessage = null; FakeEventSource.lastInstance = this; }
+  constructor(url) { this._onmessage = null; this._listeners = {}; this.url = url; FakeEventSource.lastInstance = this; }
   set onmessage(fn) { this._onmessage = fn; }
   get onmessage() { return this._onmessage; }
   set onerror(_fn) {}
   set onopen(_fn) {}
-  addEventListener() {}
-  removeEventListener() {}
+  // Keyed by type (not an array) — every real addEventListener call site in
+  // this codebase attaches exactly one handler per event type on a given
+  // socket, same simplifying assumption FakeElement's own listener map makes.
+  addEventListener(type, handler) { this._listeners[type] = handler; }
+  removeEventListener(type) { delete this._listeners[type]; }
   close() {}
 }
 
@@ -71,7 +80,12 @@ class FakeEventSource {
 // sentBeacons collects every navigator.sendBeacon(url, blob) call as
 // { url, body } with body already read out of the Blob, for asserting what
 // the client error beacon actually reports.
-export function driveClientScriptSession(scriptSrc) {
+export function driveClientScriptSession(scriptSrc, opts = {}) {
+  const {
+    location: locationOverrides = {},
+    localStorage: initialLocalStorage = {},
+    fetch: fetchImpl = () => Promise.reject(new Error('no network in vm-page-driver')),
+  } = opts;
   FakeEventSource.lastInstance = null;
   const feed = new FakeElement('div');
   const elementsById = new Map([['feed', feed]]);
@@ -79,7 +93,7 @@ export function driveClientScriptSession(scriptSrc) {
     if (!elementsById.has(id)) elementsById.set(id, new FakeElement('div'));
     return elementsById.get(id);
   };
-  const localStorageStore = new Map(); // fresh — no keys ever set
+  const localStorageStore = new Map(Object.entries(initialLocalStorage));
   const fakeLocalStorage = {
     getItem: (k) => (localStorageStore.has(k) ? localStorageStore.get(k) : null),
     setItem: (k, v) => localStorageStore.set(k, String(v)),
@@ -97,13 +111,15 @@ export function driveClientScriptSession(scriptSrc) {
     querySelectorAll: () => [],
   };
   const sentBeacons = [];
+  const baseLocation = { origin: 'https://x', hash: '#t=x', pathname: '/', search: '', href: 'https://x/#t=x', reload: () => {} };
+  const location = { ...baseLocation, ...locationOverrides };
   const sandbox = {
     document: fakeDocument,
     window: {
       speechSynthesis: undefined,
       addEventListener: () => {},
       removeEventListener: () => {},
-      location: { origin: 'https://x', hash: '#t=x', pathname: '/', reload: () => {} },
+      location,
       matchMedia: () => ({ matches: false, addEventListener: () => {} }),
     },
     localStorage: fakeLocalStorage,
@@ -117,9 +133,9 @@ export function driveClientScriptSession(scriptSrc) {
       sendBeacon: (url, blob) => { sentBeacons.push({ url, body: blob && blob._parts ? blob._parts.join('') : String(blob) }); return true; },
     },
     Blob: class FakeBlob { constructor(parts) { this._parts = parts; } },
-    location: { origin: 'https://x', hash: '#t=x', pathname: '/', href: 'https://x/#t=x', reload: () => {} },
+    location,
     history: { replaceState: () => {} },
-    fetch: () => Promise.reject(new Error('no network in vm-page-driver')),
+    fetch: fetchImpl,
     setInterval: () => 0,
     clearInterval: () => {},
     setTimeout: () => 0,
@@ -146,12 +162,25 @@ export function driveClientScriptSession(scriptSrc) {
     feed,
     sentBeacons,
     fire: (frame) => es._onmessage({ data: JSON.stringify(frame) }),
+    // Drives a named addEventListener('<type>', ...) handler (e.g. 'status',
+    // 'ping', 'mark') through the same {data: JSON string} shape the real
+    // EventSource passes onmessage — no-ops if this page never registered
+    // that listener, so a caller can tell "not fired" from "not wired" by
+    // checking the return value.
+    fireEvent: (type, data) => {
+      const handler = es._listeners[type];
+      if (!handler) return false;
+      handler({ data: JSON.stringify(data) });
+      return true;
+    },
+    getConnectUrl: () => es.url,
+    getElementById: (id) => elementsById.get(id) || null,
   };
 }
 
 // Convenience wrapper for the common one-frame case.
-export function driveClientScript(scriptSrc, frame) {
-  const { feed, fire } = driveClientScriptSession(scriptSrc);
+export function driveClientScript(scriptSrc, frame, opts) {
+  const { feed, fire } = driveClientScriptSession(scriptSrc, opts);
   fire(frame);
   return feed;
 }

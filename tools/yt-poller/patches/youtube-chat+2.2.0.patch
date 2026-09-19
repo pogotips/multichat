@@ -1,8 +1,25 @@
 diff --git a/node_modules/youtube-chat/dist/parser.js b/node_modules/youtube-chat/dist/parser.js
-index 2245f50..79ad530 100644
+index 2245f50..61d490c 100644
 --- a/node_modules/youtube-chat/dist/parser.js
 +++ b/node_modules/youtube-chat/dist/parser.js
-@@ -104,6 +104,23 @@ function parseMessages(runs) {
+@@ -54,6 +54,16 @@ function parseChatData(data) {
+             .map((v) => parseActionToChatItem(v))
+             .filter((v) => v !== null);
+     }
++    // Live reaction bursts (heart/like fountain) ride a separate top-level
++    // frameworkUpdates array, not actions — present on maybe one poll in
++    // several, absent otherwise. Surfaced the same way unknown renderers are
++    // (rendererType tag, no new emitter/event) so it flows through the
++    // existing chatItems.forEach(... this.emit("chat", ...)) in live-chat.js.
++    const mutations = ((data.frameworkUpdates || {}).entityBatchUpdate || {}).mutations || [];
++    const reactionItems = mutations
++        .filter((m) => m.payload && m.payload.emojiFountainDataEntity)
++        .map((m) => ({ rendererType: "emojiFountain", raw: m.payload.emojiFountainDataEntity }));
++    chatItems = chatItems.concat(reactionItems);
+     const continuationData = data.continuationContents.liveChatContinuation.continuations[0];
+     let continuation = "";
+     if (continuationData.invalidationContinuationData) {
+@@ -104,6 +114,23 @@ function parseMessages(runs) {
          }
      });
  }
@@ -26,7 +43,7 @@ index 2245f50..79ad530 100644
  /** actionの種類を判別してRendererを返す */
  function rendererFromAction(action) {
      if (!action.addChatItemAction) {
-@@ -120,14 +137,162 @@ function rendererFromAction(action) {
+@@ -120,14 +147,162 @@ function rendererFromAction(action) {
          return item.liveChatPaidStickerRenderer;
      }
      else if (item.liveChatMembershipItemRenderer) {
@@ -190,7 +207,7 @@ index 2245f50..79ad530 100644
      if (messageRenderer === null) {
          return null;
      }
-@@ -136,7 +301,8 @@ function parseActionToChatItem(data) {
+@@ -136,7 +311,8 @@ function parseActionToChatItem(data) {
          message = messageRenderer.message.runs;
      }
      else if ("headerSubtext" in messageRenderer) {
@@ -200,7 +217,7 @@ index 2245f50..79ad530 100644
      }
      const authorNameText = (_b = (_a = messageRenderer.authorName) === null || _a === void 0 ? void 0 : _a.simpleText) !== null && _b !== void 0 ? _b : "";
      const ret = {
-@@ -191,6 +357,31 @@ function parseActionToChatItem(data) {
+@@ -191,6 +367,31 @@ function parseActionToChatItem(data) {
              color: convertColorToHex6(messageRenderer.bodyBackgroundColor),
          };
      }

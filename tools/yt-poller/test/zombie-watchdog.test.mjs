@@ -4,43 +4,29 @@
 // continuation can poll forever with fetched=0. This exercises the
 // zeroStreak decision block poller.mjs's heartbeat interval runs every 15s.
 //
-// The block itself isn't exported (module-level state + top-level run()
-// side effects on import — same no-export rationale as drainLoop, see
-// ingest-tail-h2.test.mjs). Reimplemented inline here, quoted from the
-// source for traceability (poller.mjs, inside the 15s setInterval):
-//
-//   if (liveChatSessionActive) {
-//     if (cycleFetched === 0) {
-//       zeroStreak++;
-//       if (zeroStreak >= ZOMBIE_WATCHDOG_CYCLES) {
-//         zeroStreak = 0;
-//         currentLiveChat?.stop('zombie watchdog: sustained fetched=0');
-//       }
-//     } else {
-//       zeroStreak = 0;
-//     }
-//   } else {
-//     zeroStreak = 0;
-//   }
+// M1 fix (2026-09-12 review): the decision block was extracted out of
+// poller.mjs into watchdog.mjs's watchdogTick() specifically so this file
+// could import the real function instead of re-typing it — poller.mjs
+// itself remains not import-safe (module-level state + top-level run() side
+// effects on import — same no-export rationale as drainLoop, see
+// ingest-tail-h2.test.mjs), but watchdog.mjs has neither of those.
 import { describe, it, expect } from 'vitest';
-
-const ZOMBIE_WATCHDOG_MIN = 3;
-const ZOMBIE_WATCHDOG_CYCLES = (ZOMBIE_WATCHDOG_MIN * 60_000) / 15_000; // 12, real poller.mjs constant
+import {
+  watchdogTick as realWatchdogTick, resolveLiveness as realResolveLiveness,
+  ZOMBIE_WATCHDOG_CYCLES, REDISCOVERY_MIN, REDISCOVERY_CYCLES,
+  LEGACY_ZOMBIE_WATCHDOG_CYCLES, LIVENESS_MAX_AGE_MS,
+} from '../watchdog.mjs';
 
 function zombieWatchdogTick(state, cycleFetched, onFire) {
-  if (state.liveChatSessionActive) {
-    if (cycleFetched === 0) {
-      state.zeroStreak++;
-      if (state.zeroStreak >= ZOMBIE_WATCHDOG_CYCLES) {
-        state.zeroStreak = 0;
-        onFire();
-      }
-    } else {
-      state.zeroStreak = 0;
-    }
-  } else {
-    state.zeroStreak = 0;
-  }
+  const result = realWatchdogTick({
+    liveChatSessionActive: state.liveChatSessionActive,
+    zeroStreak: state.zeroStreak,
+    cycleFetched,
+    liveness: 'live', // this legacy-shape helper only exercises the live/unknown/gate_off cadence
+    gateEnabled: true,
+  });
+  state.zeroStreak = result.zeroStreak;
+  if (result.fired) onFire();
 }
 
 describe('zombie watchdog: trigger case', () => {
@@ -65,7 +51,7 @@ describe('zombie watchdog: no-false-fire (quiet-but-live)', () => {
     let fireCount = 0;
     const minutes = 15; // longer than ZOMBIE_WATCHDOG_MIN, spanning well past the quiet stretch
     for (let m = 0; m < minutes; m++) {
-      const isZeroMinute = m % 2 === 0; // alternating, so max consecutive zero cycles is 4, well under 12
+      const isZeroMinute = m % 2 === 0; // alternating, so max consecutive zero cycles is 4, well under ZOMBIE_WATCHDOG_CYCLES
       for (let cycle = 0; cycle < 4; cycle++) {
         const fetched = isZeroMinute ? 0 : (cycle === 0 ? 2 : 0);
         zombieWatchdogTick(state, fetched, () => fireCount++);
@@ -98,63 +84,28 @@ describe('zombie watchdog: no-false-fire (idle/no session)', () => {
 // undeleted waiting room produces no errors, so suppression would strand the
 // poller on a dead continuation with no way out.)
 //
-// Reimplemented inline, quoted from poller.mjs's setInterval body (same
-// no-export rationale as above). Note REFINEMENT 3: reaching the not_live
-// threshold no longer fires 'yt_rediscovery' directly — it calls
-// runRediscoveryProbe(), which is itself gated/tested separately in
-// rediscovery.test.mjs (spacing, single-flight, conditional teardown). What
-// this file tests is strictly the threshold-selection layer: WHICH cadence
-// applies and WHICH path (probe-triggering vs the zombie backstop) gets
-// taken, not the probe's own internals.
-//
-//   const watchdogThresholdCycles = !WATCHDOG_LIVENESS_GATE
-//     ? LEGACY_ZOMBIE_WATCHDOG_CYCLES
-//     : liveness === 'not_live' ? REDISCOVERY_CYCLES : ZOMBIE_WATCHDOG_CYCLES;
-//   if (liveChatSessionActive) {
-//     if (cycleFetched === 0) {
-//       zeroStreak++;
-//       if (zeroStreak >= watchdogThresholdCycles) {
-//         zeroStreak = 0;
-//         if (WATCHDOG_LIVENESS_GATE && liveness === 'not_live') {
-//           onTriggered('yt_rediscovery'); // runRediscoveryProbe() in the real code
-//         } else {
-//           onTriggered('zombie_watchdog_reconnect');
-//         }
-//       }
-//     } else {
-//       zeroStreak = 0;
-//     }
-//   } else {
-//     zeroStreak = 0;
-//   }
-
-const HEARTBEAT_INTERVAL_MS = 15_000;
-const NEW_ZOMBIE_WATCHDOG_MIN = 15; // live/unknown/gate_off-legacy-exempt backstop
-const NEW_ZOMBIE_WATCHDOG_CYCLES = (NEW_ZOMBIE_WATCHDOG_MIN * 60_000) / HEARTBEAT_INTERVAL_MS; // 60
-const REDISCOVERY_MIN = 5; // not_live path — REFINEMENT 3: a check cadence, not a teardown cadence
-const REDISCOVERY_CYCLES = (REDISCOVERY_MIN * 60_000) / HEARTBEAT_INTERVAL_MS; // 20
-const LEGACY_ZOMBIE_WATCHDOG_MIN = 3; // WATCHDOG_LIVENESS_GATE=off (FIX 3)
-const LEGACY_ZOMBIE_WATCHDOG_CYCLES = (LEGACY_ZOMBIE_WATCHDOG_MIN * 60_000) / HEARTBEAT_INTERVAL_MS; // 12
+// M1 fix (2026-09-12 review): watchdogTick/resolveLiveness below are thin
+// positional-argument wrappers over the real functions imported from
+// watchdog.mjs (kept for minimal diff against this file's many existing
+// call sites) — REFINEMENT 3: reaching the not_live threshold no longer
+// fires 'yt_rediscovery' directly — it calls runRediscoveryProbe(), which is
+// itself gated/tested separately in rediscovery.test.mjs (spacing,
+// single-flight, conditional teardown). What this file tests is strictly
+// the threshold-selection layer: WHICH cadence applies and WHICH path
+// (probe-triggering vs the zombie backstop) gets taken, not the probe's own
+// internals.
+const NEW_ZOMBIE_WATCHDOG_CYCLES = ZOMBIE_WATCHDOG_CYCLES; // live/unknown/gate_off-legacy-exempt backstop (60)
 
 function watchdogTick(state, cycleFetched, liveness, gateOn, onTriggered) {
-  const watchdogThresholdCycles = !gateOn
-    ? LEGACY_ZOMBIE_WATCHDOG_CYCLES
-    : liveness === 'not_live'
-      ? REDISCOVERY_CYCLES
-      : NEW_ZOMBIE_WATCHDOG_CYCLES;
-  if (state.liveChatSessionActive) {
-    if (cycleFetched === 0) {
-      state.zeroStreak++;
-      if (state.zeroStreak >= watchdogThresholdCycles) {
-        state.zeroStreak = 0;
-        onTriggered(gateOn && liveness === 'not_live' ? 'yt_rediscovery' : 'zombie_watchdog_reconnect');
-      }
-    } else {
-      state.zeroStreak = 0;
-    }
-  } else {
-    state.zeroStreak = 0;
-  }
+  const result = realWatchdogTick({
+    liveChatSessionActive: state.liveChatSessionActive,
+    zeroStreak: state.zeroStreak,
+    cycleFetched,
+    liveness,
+    gateEnabled: gateOn,
+  });
+  state.zeroStreak = result.zeroStreak;
+  if (result.fired) onTriggered(result.event);
 }
 
 describe('round-3 audit: threshold selection by liveness (never suppression)', () => {
@@ -237,17 +188,12 @@ describe('round-3 audit: threshold selection by liveness (never suppression)', (
 });
 
 // --- Change 2 / FIX 2: freshness bound ---
-// Reimplemented inline, quoted from poller.mjs's setInterval body:
-//
-//   const livenessFresh = Date.now() - lastLiveness.at <= LIVENESS_MAX_AGE_MS;
-//   const liveness = !WATCHDOG_LIVENESS_GATE ? 'gate_off' : livenessFresh ? lastLiveness.state : 'unknown';
-
-const LIVENESS_MAX_AGE_MS = 4 * HEARTBEAT_INTERVAL_MS; // 60_000
+// resolveLiveness below is a thin positional-argument wrapper over the real
+// watchdog.mjs function (kept for minimal diff against this file's existing
+// call sites).
 
 function resolveLiveness(sampleState, sampleAt, now, gateOn) {
-  if (!gateOn) return 'gate_off';
-  const fresh = now - sampleAt <= LIVENESS_MAX_AGE_MS;
-  return fresh ? sampleState : 'unknown';
+  return realResolveLiveness({ gateEnabled: gateOn, sampleState, sampleAt, now });
 }
 
 describe('round-3 audit: liveness freshness bound', () => {

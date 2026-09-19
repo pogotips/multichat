@@ -36,7 +36,7 @@ Edit **`wrangler.jsonc`** and replace the placeholders:
 |---|---|
 | `YOUR_CHANNEL` | Your Twitch login (e.g. `yourchannel`) |
 | `YOUR_BROADCASTER_ID` | Numeric Twitch user id for that channel (one-time public login→id lookup; not secret — see below) |
-| `YOUR_DOMAIN` | The hostname to serve on (e.g. `multichat.example.com`), or remove the `routes` block and set `"workers_dev": true` |
+| `chathub.example.com` | The hostname to serve on — must be a bare hostname, no path/wildcard (Custom Domains reject both) — or remove the `routes` block and set `"workers_dev": true` |
 
 **Looking up `YOUR_BROADCASTER_ID`:** register a Twitch app once at [dev.twitch.tv/console/apps](https://dev.twitch.tv/console/apps) (client-credentials flow, no user consent needed for this lookup), then:
 
@@ -67,6 +67,14 @@ Then add a **30-day lifecycle rule scoped to the `capture/` prefix** (Cloudflare
 
 The Durable Object (`ChatHub`) and its SQLite migration are declared in `wrangler.jsonc` — no manual step; `wrangler deploy` provisions them.
 
+### Run the tests
+
+```bash
+npm install && (cd tools/yt-poller && npm install) && npm test && npm run test:gate
+```
+
+Expect `1059 passed` from `npm test` and `2 passed` from `npm run test:gate`. Both need `wrangler.jsonc` present (step 1 above) — without it, `npm test` fails one suite and `npm run test:gate` fails with a raw parse error instead of a clear message.
+
 ### 3. Set secrets
 
 Edit `.dev.vars` (used by `wrangler dev` locally) — every variable is documented inline in the file. For production, push the same values as Worker secrets:
@@ -80,6 +88,7 @@ wrangler secret put EVENTSUB_SECRET
 wrangler secret put TWITCH_CLIENT_ID
 wrangler secret put TWITCH_CLIENT_SECRET
 wrangler secret put TWITCH_USER_REFRESH_TOKEN
+wrangler secret put MULTICHAT_OVERLAY_SECRET   # optional — OBS overlay, /tts, /overlay/config
 ```
 
 **Required:** `MULTICHAT_VIEW_SECRET` (gates the viewer link) and `MULTICHAT_INGEST_SECRET` (gates the YouTube poller's POST). Everything else is optional and degrades to "feature off" when unset — see the comments in `.dev.vars.example` for exactly what each one enables. Generate the `*_SECRET` values as opaque random strings, e.g. `openssl rand -hex 32`.

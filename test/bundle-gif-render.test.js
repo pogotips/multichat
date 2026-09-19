@@ -48,7 +48,7 @@ async function extractScript(worker, url, extraEnv = {}) {
 beforeAll(() => {
   if (!existsSync(path.join(REPO_ROOT, 'wrangler.jsonc'))) {
     throw new Error(
-      'wrangler.jsonc not found (gitignored) — copy it in from any existing checkout before running this test. See CLAUDE.md Setup.',
+      'wrangler.jsonc not found — run: cp wrangler.jsonc.example wrangler.jsonc (see INSTALL.md)',
     );
   }
   bundleDir = mkdtempSync(path.join(tmpdir(), 'multichat-bundle-test-'));
@@ -129,6 +129,52 @@ describe('real wrangler-bundle GIF render (production-parity, not plain source)'
   });
 });
 
+// Drives the OVERLAY page's real onmessage/mark handlers through the same
+// wrangler dry-run bundle + vm sandbox as the GIF suite above — a financial
+// frame must render a row AND enqueue a TTS fetch; a 'mark' delete matching
+// a QUEUED (not-yet-playing) item must drop it before it ever reaches /tts.
+// The vm driver's fetch stub records calls instead of the default silent
+// reject, so "never fetched" is observable without exposing the page's
+// internal ttsQueue variable.
+describe('real wrangler-bundle overlay TTS queue (production-parity)', () => {
+  it('a financial frame renders a row and enqueues a /tts fetch', async () => {
+    const mod = await import(bundlePath);
+    const script = await extractScript(mod.default, 'https://x/overlay?t=y');
+    const ttsCalls = [];
+    const { feed, fire } = driveClientScriptSession(script, {
+      fetch: (url, opts) => { ttsCalls.push({ url, body: JSON.parse(opts.body) }); return Promise.reject(new Error('stub')); },
+    });
+    fire({ id: 1, kind: 'cheer', amount: '500 bits', user: 'baller', text: 'yo', twId: 'msg-1', ts: Date.now() });
+    expect(feed.children).toHaveLength(1);
+    expect(feed.children[0].className).toContain('paid');
+    expect(ttsCalls).toHaveLength(1);
+    expect(ttsCalls[0].url).toContain('/tts?t=');
+    expect(ttsCalls[0].body.text).toContain('500 bits');
+  });
+
+  it('a mark deleting a QUEUED (not-yet-playing) item drops it — it is never fetched from /tts', async () => {
+    const mod = await import(bundlePath);
+    const script = await extractScript(mod.default, 'https://x/overlay?t=y');
+    const ttsCalls = [];
+    // Every call rejects (never resolves) so the first item stays "in
+    // flight" (ttsPlaying=true) while the second sits queued behind it —
+    // exactly the window markMatchesQueueItem's queue-side filter covers.
+    const { feed, fire, fireEvent } = driveClientScriptSession(script, {
+      fetch: (url, opts) => { ttsCalls.push({ url, body: JSON.parse(opts.body) }); return Promise.reject(new Error('stub')); },
+    });
+    fire({ id: 1, kind: 'cheer', amount: '500 bits', user: 'baller', text: 'first', twId: 'msg-1', ts: Date.now() });
+    fire({ id: 2, kind: 'cheer', amount: '100 bits', user: 'other', text: 'second', twId: 'msg-2', ts: Date.now() });
+    expect(feed.children).toHaveLength(2); // both rows still render regardless of TTS queue state
+    expect(ttsCalls).toHaveLength(1); // only the first item has been dequeued to /tts so far
+    const dropped = fireEvent('mark', { action: 'delete', platform: 'tw', targetId: 'msg-2' });
+    expect(dropped).toBe(true); // proves the overlay wired a 'mark' listener, not just a no-op
+    // Flush the microtask queue so item 1's rejected /tts fetch settles and
+    // pumpQueue's finally-block re-drains the queue — item 2 must be gone.
+    for (let i = 0; i < 5; i++) await Promise.resolve();
+    expect(ttsCalls).toHaveLength(1); // item 2 was struck before its turn — never fetched
+  });
+});
+
 // Every ${helper} interpolated into the 3 served pages, generalized from the
 // single renderGifToken check above. Static-text sweep, not per-helper
 // execution: extracts each helper's OWN function body (brace-matched, not a
@@ -137,14 +183,14 @@ describe('real wrangler-bundle GIF render (production-parity, not plain source)'
 // of esbuild's runtime helpers. This is comprehensive for the exact bug class
 // that shipped (any named local closure nested inside an interpolated
 // function) regardless of whether that helper is otherwise exercised by a
-// render-path test above — see FASTFOLLOW_BATCH.md for what a full
+// render-path test above — see the internal fast-follow list for what a full
 // per-helper EXECUTION sweep (actually calling each with valid args, not
 // just text-scanning) would still need beyond this.
 const ESBUILD_RUNTIME_HELPERS = ['__name', '__publicField', '__decorateClass', '__esm', '__commonJS', '__export', '__toESM', '__require', '__privateGet', '__privateSet', '__privateAdd'];
 
 const PAGE_HELPERS = {
-  'https://x/#t=x': ['roleClass', 'emitCategory', 'isEmittable', 'resolveToken', 'cleanSpokenName', 'formatUtterance', 'enqueueCapped', 'formatCount', 'pullPhase', 'versionMismatch', 'createPullGate', 'isClientStale', 'supersedeSocket', 'shouldSendClientError', 'isAllowedEmojiUrl', 'isAllowedGifUrl', 'renderGifToken', 'mergeAnnotations', 'appendWithMention', 'renderText', 'buildRow'],
-  'https://x/overlay?t=y': ['roleClass', 'isAllowedEmojiUrl', 'isAllowedGifUrl', 'renderGifToken', 'mergeAnnotations', 'appendWithMention', 'renderText', 'buildRow', 'cleanSpokenName', 'normalizeSpokenMentions', 'formatUtterance', 'formatOverlayUtterance', 'enqueueCapped', 'supersedeSocket', 'markMatchesQueueItem'],
+  'https://x/#t=x': ['roleClass', 'emitCategory', 'isEmittable', 'resolveToken', 'cleanSpokenName', 'formatUtterance', 'enqueueCapped', 'formatCount', 'pullPhase', 'versionMismatch', 'createPullGate', 'isClientStale', 'supersedeSocket', 'shouldSendClientError', 'isAllowedEmojiUrl', 'isAllowedGifUrl', 'renderGifToken', 'mergeAnnotations', 'appendWithMention', 'renderText', 'buildRow', 'reconnectBackoffMs', 'createSeenIdGate', 'detectReplayGap'],
+  'https://x/overlay?t=y': ['roleClass', 'isAllowedEmojiUrl', 'isAllowedGifUrl', 'renderGifToken', 'mergeAnnotations', 'appendWithMention', 'renderText', 'buildRow', 'reactionSpawnUnits', 'spawnReactionParticle', 'cleanSpokenName', 'normalizeSpokenMentions', 'stripControlChars', 'stripUrls', 'collapseRepeatedChars', 'sanitizeSpokenBody', 'formatUtterance', 'formatOverlayUtterance', 'enqueueCapped', 'supersedeSocket', 'markMatchesQueueItem', 'shouldSendClientError'],
   'https://x/overlay/config?t=y': ['roleClass', 'isAllowedEmojiUrl', 'isAllowedGifUrl', 'renderGifToken', 'mergeAnnotations', 'appendWithMention', 'renderText', 'buildRow'],
 };
 
@@ -179,6 +225,53 @@ describe('all interpolated ${helper} functions across the 3 pages: no esbuild ru
       expect(body, `${name} not found (as a function declaration) in script for ${url}`).not.toBeNull();
       for (const helper of ESBUILD_RUNTIME_HELPERS) {
         expect(body, `${url} :: ${name} body references esbuild runtime helper "${helper}"`).not.toContain(helper + '(');
+      }
+    },
+  );
+});
+
+// M2 (ChatHub review of 2026-09-12, internal): the sweep above only checks a
+// helper's OWN body text for esbuild leaks — it never checks whether an
+// identifier that body actually REFERENCES was itself interpolated onto the
+// same page. That's the exact root-cause class behind H1: formatOverlayUtterance
+// calls sanitizeSpokenBody, but nothing required sanitizeSpokenBody to ship
+// alongside it on the overlay page, so a ReferenceError was possible with
+// zero red flags from the sweep above. This extracts every exported
+// function/const name from BOTH src/lib.js and src/worker.js — a page
+// helper can be a worker.js-local export just as easily as a lib.js one
+// (shouldSendClientError/reconnectBackoffMs/createSeenIdGate/etc. are all
+// `export function` in worker.js, not lib.js, and were previously invisible
+// to this scan entirely — covered only by hand-listing them in PAGE_HELPERS)
+// — scans each interpolated helper's body for free identifiers matching one,
+// and asserts that export is separately declared somewhere else in the SAME
+// page's script (as `function NAME(` or `const NAME =`) — i.e. it was
+// actually interpolated, not just called.
+const LIB_SOURCE = readFileSync(path.join(REPO_ROOT, 'src', 'lib.js'), 'utf8');
+const WORKER_SOURCE = readFileSync(path.join(REPO_ROOT, 'src', 'worker.js'), 'utf8');
+const EXPORT_NAME_RE = /^export (?:function|const)\s+([A-Za-z_$][A-Za-z0-9_$]*)/gm;
+const HELPER_EXPORT_NAMES = [
+  ...new Set([
+    ...[...LIB_SOURCE.matchAll(EXPORT_NAME_RE)].map((m) => m[1]),
+    ...[...WORKER_SOURCE.matchAll(EXPORT_NAME_RE)].map((m) => m[1]),
+  ]),
+];
+
+describe('transitive check: an interpolated helper must not reference a lib.js/worker.js export that is not also interpolated on that page', () => {
+  it.each(Object.entries(PAGE_HELPERS).flatMap(([url, helpers]) => helpers.map((name) => [url, name])))(
+    '%s :: %s',
+    async (url, name) => {
+      const mod = await import(bundlePath);
+      const script = await extractScript(mod.default, url);
+      const body = extractFunctionBody(script, name);
+      expect(body, `${name} not found (as a function declaration) in script for ${url}`).not.toBeNull();
+      const referenced = new Set(
+        [...body.matchAll(/\b([A-Za-z_$][A-Za-z0-9_$]*)\b/g)]
+          .map((m) => m[1])
+          .filter((ident) => ident !== name && HELPER_EXPORT_NAMES.includes(ident)),
+      );
+      for (const ident of referenced) {
+        const declaredOnPage = new RegExp(`function\\s+${ident}\\s*\\(|const\\s+${ident}\\s*=`).test(script);
+        expect(declaredOnPage, `${url} :: ${name} references "${ident}" which is never interpolated into this page's script`).toBe(true);
       }
     },
   );
