@@ -22,19 +22,60 @@ export function enqueueRetry(queue, item, maxSize = RETRY_QUEUE_MAX) {
   return queue;
 }
 
+// HTTP status of each message's most recent failed send. sendOnce records it
+// (noteSendStatus) because sendFn only returns truthy/falsy; drainBatch reads
+// it to tell a payload rejection from a transient failure. A WeakMap for the
+// same reason as attemptCounts below: nothing is stamped on the msg, so it can
+// never leak into the outgoing JSON body. A network error records nothing —
+// sendOnce clears the entry first (status undefined), so a stale status from an
+// earlier attempt can never turn a later network error into a drop.
+const lastStatus = new WeakMap();
+
+export function noteSendStatus(msg, status) {
+  if (!msg || typeof msg !== 'object') return;
+  if (status === undefined) lastStatus.delete(msg);
+  else lastStatus.set(msg, status);
+}
+
+// Statuses the Worker ingest route answers purely from the request body, so a
+// retry can only get the same answer: 400 (bad json / unknown type / bad shape
+// — DO handleIngestYt) and 413 (over INGEST_MAX_BYTES). Deliberately NOT
+// 401/403/404 (secret rotation, caller scope, Worker not deployed yet — all
+// fixed by an operator, and the chat must survive until then), nor 408/429/5xx.
+export function isPayloadRejection(status) {
+  return status === 400 || status === 413;
+}
+
 // Claims up to `concurrency` items off the front of the queue and sends them
 // all at once via sendFn (async, returns truthy on success) — this is what
 // keeps a cold-boot history burst from opening dozens of simultaneous TLS
 // connections. Failures go back at the front, in their original relative
 // order, so FIFO dispatch order holds across retries; anything enqueued
-// while this batch was in flight lands behind them, untouched.
+// while this batch was in flight lands behind them, untouched. The one
+// exception is a payload rejection (isPayloadRejection): it is dropped with
+// one structured log line instead of requeued, so a single poisoned item can't
+// block the chat queued behind it. A dropped item is not a transient failure:
+// it is reported in `dropped` (separate from `sent`) so the caller's backoff
+// only reacts to failures a retry could fix.
 export async function drainBatch(queue, sendFn, concurrency = SEND_CONCURRENCY) {
   const batch = queue.splice(0, concurrency);
-  if (batch.length === 0) return { attempted: 0, sent: 0 };
+  if (batch.length === 0) return { attempted: 0, sent: 0, dropped: 0 };
   const results = await Promise.all(batch.map(async (item) => ({ item, ok: await sendFn(item) })));
-  const failed = results.filter((r) => !r.ok).map((r) => r.item);
+  const failed = [];
+  let dropped = 0;
+  for (const { item, ok } of results) {
+    if (ok) continue;
+    const status = item && typeof item === 'object' ? lastStatus.get(item) : undefined;
+    if (isPayloadRejection(status)) {
+      // No body, URL or headers — type and an id only.
+      console.log(JSON.stringify({ ev: 'ingest_dropped', status, type: item.type ?? null, id: item.ytId ?? item.authorId ?? null }));
+      dropped++;
+      continue;
+    }
+    failed.push(item);
+  }
   queue.unshift(...failed);
-  return { attempted: results.length, sent: results.length - failed.length };
+  return { attempted: results.length, sent: results.filter((r) => r.ok).length, dropped };
 }
 
 // Per-attempt counter for ingest send logs (Phase 6 gap: no retry-number

@@ -27,35 +27,58 @@ export const DEFAULT_PROBE_TIMEOUT_MS = 8_000;
 // 'start'/'error' handler — well inside the window before any first poll
 // tick could fire.
 //
-// Resolves to the liveId string on success, or null on: nothing currently
-// live (an 'error' event — "Live Stream was not found" is the normal shape
-// here), a timeout, or a start() rejection (defensive — the current
-// library's start() always resolves and never rejects, catching
-// internally, but this must never surface as an unhandled rejection in the
-// caller's tick even if that changes). null is never a positive signal —
-// callers must treat it the same as "no answer, no change".
-export function probeCurrentLiveId(LiveChatCtor, channelId, { timeoutMs = DEFAULT_PROBE_TIMEOUT_MS } = {}) {
+// Resolves to { videoId, reason, cleanupError }. `videoId` is the liveId
+// string on success, or null on: nothing currently live (an 'error' event —
+// "Live Stream was not found" is the normal shape here), a timeout, or a
+// start() rejection (defensive — the current library's start() always
+// resolves and never rejects, catching internally, but this must never
+// surface as an unhandled rejection in the caller's tick even if that
+// changes). null is never a positive signal — callers must treat it the
+// same as "no answer, no change". Every null path names why (2026-10-12):
+// `reason` is one of 'error_event' | 'timeout' | 'start_rejected' |
+// 'empty_live_id', plus a `detail` string (error message, capped) when the
+// library gave one; on success `reason` is null. `cleanupError` is set when
+// probe.stop() itself threw during teardown (swallowed, never fatal) so the
+// caller can log it instead of it vanishing.
+const PROBE_DETAIL_MAX = 160;
+function probeDetail(err) {
+  const m = err && typeof err.message === 'string' ? err.message : (typeof err === 'string' ? err : '');
+  return m ? m.slice(0, PROBE_DETAIL_MAX) : null;
+}
+export function probeCurrentLive(LiveChatCtor, channelId, { timeoutMs = DEFAULT_PROBE_TIMEOUT_MS } = {}) {
   return new Promise((resolve) => {
     const probe = new LiveChatCtor({ channelId });
     let settled = false;
-    const finish = (result) => {
+    const finish = (videoId, reason, detail) => {
       if (settled) return;
       settled = true;
       clearTimeout(timer);
       probe.removeAllListeners?.();
+      let cleanupError = null;
       try {
         probe.stop('liveness probe: done');
-      } catch {
+      } catch (err) {
         // already stopped, or never successfully started — cleanup must
-        // never itself throw out of this resolver.
+        // never itself throw out of this resolver; the reason still rides
+        // the result so the caller can log it.
+        cleanupError = probeDetail(err) || 'stop_threw';
       }
-      resolve(result);
+      const out = { videoId, reason, cleanupError };
+      if (detail) out.detail = detail;
+      resolve(out);
     };
-    const timer = setTimeout(() => finish(null), timeoutMs);
-    probe.on('start', (liveId) => finish(liveId || null));
-    probe.on('error', () => finish(null));
-    Promise.resolve(probe.start()).catch(() => finish(null));
+    const timer = setTimeout(() => finish(null, 'timeout', null), timeoutMs);
+    probe.on('start', (liveId) => (liveId ? finish(liveId, null, null) : finish(null, 'empty_live_id', null)));
+    probe.on('error', (err) => finish(null, 'error_event', probeDetail(err)));
+    Promise.resolve(probe.start()).catch((err) => finish(null, 'start_rejected', probeDetail(err)));
   });
+}
+
+// Back-compat shape: just the videoId (string | null). Kept for callers and
+// tests that only care about the id; poller.mjs uses probeCurrentLive so the
+// null reason reaches the yt_rediscovery log.
+export function probeCurrentLiveId(LiveChatCtor, channelId, opts) {
+  return probeCurrentLive(LiveChatCtor, channelId, opts).then((r) => r.videoId);
 }
 
 // LOW-2 fix (Fable review): pure decision step for runRediscoveryProbe's
@@ -113,4 +136,11 @@ export function createRediscoveryGate({ minIntervalMs, now = () => Date.now() })
       };
     },
   };
+}
+
+// One yt_rediscovery log line. `liveness` is the value resolveLiveness
+// returned for the tick that fired the probe (never a literal), so a line
+// can't claim a reading the watchdog didn't actually have.
+export function formatRediscoveryLog(liveness, fields) {
+  return JSON.stringify({ ev: 'yt_rediscovery', liveness, ...fields });
 }

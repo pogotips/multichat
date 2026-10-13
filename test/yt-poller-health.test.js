@@ -1,6 +1,7 @@
 // Internal forensics doc (2026-08-05), rec 4: the poller's heartbeat now
 // carries fetched/lastMessageAgeSec so CF Observability can see poller fetch
-// health directly, without needing vid docker logs. This is unconditional
+// health directly, without needing to shell into the poller host for docker
+// logs. This is unconditional
 // on every heartbeat (health telemetry), distinct from the gated
 // counts_update lines (viewer/like counts only log on change).
 import { describe, it, expect, vi } from 'vitest';

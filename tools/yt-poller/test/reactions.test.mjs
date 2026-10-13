@@ -244,7 +244,9 @@ describe('poller.mjs reaction-burst wiring (source-text guard)', () => {
     expect(POLLER_SOURCE).toMatch(/ev:\s*'poller_heartbeat'/);
     const heartbeatLog = POLLER_SOURCE.slice(
       POLLER_SOURCE.indexOf("ev: 'poller_heartbeat'"),
-      POLLER_SOURCE.indexOf("ev: 'poller_heartbeat'") + 600,
+      // 800, not 600: the object grew a `dropped` line (2026-10-12) and this
+      // window only needs to cover the whole log object, not pin its size.
+      POLLER_SOURCE.indexOf("ev: 'poller_heartbeat'") + 800,
     );
     expect(heartbeatLog).toContain('reactionsSeen,');
   });

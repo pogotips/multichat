@@ -1,0 +1,8 @@
+# Optional. Persist the poller's capture files (unknown-renderers.jsonl,
+# reactions.jsonl) on the host so a container recreate does not lose them.
+# Copy to docker-compose.override.yml (gitignored, host-only) next to your
+# docker-compose.yml; `docker compose up -d` loads it automatically.
+services:
+  multichat-yt-poller:
+    volumes:
+      - ./capture:/app/capture

@@ -25,6 +25,7 @@ Merges Twitch + YouTube live chat into a single dark, mobile SSE feed for viewin
 | `GET /overlay` | none (unauthenticated — Jon's call) | OBS browser-source overlay — transparent, read-only, shares `buildRow` with the PWA. Page load itself carries no chat data; it forwards whatever `t` it was given to `/events`/`/tts`, both still gated. See `docs/ARCHITECTURE.md` §3b. |
 | `GET /overlay/config` | `?t=<MULTICHAT_OVERLAY_SECRET>` | Builder page for the `/overlay` URL — never added to an OBS scene itself. |
 | `POST /tts` | `?t=<MULTICHAT_OVERLAY_SECRET>` only | Server TTS (Workers AI) for the overlay — real-money endpoint, DO-gated (kill switch, 20/min, 25k chars/day). |
+| `POST /translate` | `?t=<MULTICHAT_VIEW_SECRET>` only (overlay secret rejected) | Tap-to-translate for the PWA (Workers AI, DO-gated 10/min, 8,000 neurons/day) |
 | `POST /overlay/admin` | `?t=<MULTICHAT_OVERLAY_SECRET>` only | TTS kill-switch toggle. Briefly unauthenticated (2026-08-27), gate restored the same day — shares the overlay secret with `/tts`/`/overlay/config` rather than a separate `MULTICHAT_ADMIN_SECRET` (retired, not checked anywhere). See §3b. |
 | `POST /ingest/yt` | `X-Multichat-Secret: <MULTICHAT_INGEST_SECRET>` **or** `<MULTICHAT_RAIDQ_INGEST_SECRET>` header | YouTube poller ingest, or an optional external membership-renewal cron |
 | `POST /eventsub/callback` | `Twitch-Eventsub-Message-Signature` (HMAC-SHA256 vs `EVENTSUB_SECRET`) | Twitch EventSub webhook — redemptions, hype train, ad break, mod-action attribution. **First public unauthenticated route** in this Worker; see `docs/ARCHITECTURE.md` §3a for the full verification spec. |
@@ -135,6 +136,14 @@ These hold across sessions — do not relax them without discussion:
   citation and its live-verification follow-up, render mapping, IRC/EventSub
   ownership rule, `esModerateHealthy` persistence) in `docs/ARCHITECTURE.md`
   §3a.
+- **Any commit message or PR body claiming a gate is clean (tests, leak
+  check, forbidden sweep, `test:gate`, etc.) must carry the exact command
+  and its exit code, not just an assertion.** `fa39d07` (2026-09-19) claimed
+  the OSS leak-check was clean in its commit message while the check
+  actually exited 1 — a bare claim with no command/exit-code attached is
+  unverifiable and, as that incident showed, can be wrong. State it as
+  `command` → `exit N`, e.g. `` `tools/publish-oss.sh --stage-only` → exit
+  0 ``.
 
 ## Twitch full visibility (emotes, mod actions, capture)
 
@@ -305,7 +314,7 @@ clean cutover.
 4. Reload the page mid-stream — no gap (Last-Event-ID replay from the ring buffer).
 5. Close all tabs, confirm the Twitch IRC socket disconnects after ~2 min idle (no reconnect spam in logs).
 5a. Pull-to-refresh (installed PWA only — Add to Home Screen first, `display-mode: standalone`): pull down from the top of the feed past ~70px and release — indicator shows "release to refresh", then reconnects live (same behavior as toggling airplane mode briefly). Bump `RELEASE_VERSION` in `src/worker.js`, redeploy, pull again with the old tab still open — confirm a full page reload instead of a silent reconnect. Interrupt a drag mid-gesture (e.g. switch app) — confirm the indicator doesn't stick.
-5b. Refresh button (`↻`, top-right of `#topbar`, same control on every platform — no haptic feedback anywhere for refresh): tap it — feed reconnects live silently, no vibration. Rapid double-tap — second tap no-ops (`refreshBusy` guard), no duplicate reconnect. Leave the app backgrounded past the ~60s stale threshold and foreground it — watchdog reconnects silently, no buzz on any platform.
+5b. Topbar refresh button removed (2026-09-22) — pull-to-refresh (5a) is the only manual trigger now. Watchdog: leave the app backgrounded past the ~60s stale threshold and foreground it — reconnects silently, no buzz on any platform.
 6. EventSub (needs [`twitch-cli`](https://github.com/twitchdev/twitch-cli),
    `brew install twitch-cli`): with `wrangler dev` running and a **throwaway
    dev-only** `EVENTSUB_SECRET` in `.dev.vars` (never the prod value):

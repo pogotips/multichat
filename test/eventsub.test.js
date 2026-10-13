@@ -347,37 +347,37 @@ describe('mapEventToRow: channel.moderate', () => {
     {
       action: 'timeout',
       buildEvent: (event) => withExpiresIn(event, 'timeout', 598), // rounds to 10m, not floors to 9m
-      expected: 'quotrok timed out TwitchDev (10m)',
+      expected: 'modexample timed out TwitchDev (10m)',
     },
-    { action: 'ban', buildEvent: (e) => e, expected: 'quotrok banned TwitchDev' },
-    { action: 'unban', buildEvent: (e) => e, expected: 'quotrok unbanned TwitchDev' },
-    { action: 'untimeout', buildEvent: (e) => e, expected: 'quotrok removed timeout on TwitchDev' },
-    { action: 'delete', buildEvent: (e) => e, expected: "quotrok deleted TwitchDev's message" },
-    { action: 'warn', buildEvent: (e) => e, expected: 'quotrok warned TwitchDev' },
+    { action: 'ban', buildEvent: (e) => e, expected: 'modexample banned TwitchDev' },
+    { action: 'unban', buildEvent: (e) => e, expected: 'modexample unbanned TwitchDev' },
+    { action: 'untimeout', buildEvent: (e) => e, expected: 'modexample removed timeout on TwitchDev' },
+    { action: 'delete', buildEvent: (e) => e, expected: "modexample deleted TwitchDev's message" },
+    { action: 'warn', buildEvent: (e) => e, expected: 'modexample warned TwitchDev' },
     {
       action: 'shared_chat_ban',
       buildEvent: (e) => e,
-      expected: 'quotrok banned TwitchDev (shared chat: adflynn404)',
+      expected: 'modexample banned TwitchDev (shared chat: adflynn404)',
     },
     {
       action: 'shared_chat_unban',
       buildEvent: (e) => e,
-      expected: 'quotrok unbanned TwitchDev (shared chat: adflynn404)',
+      expected: 'modexample unbanned TwitchDev (shared chat: adflynn404)',
     },
     {
       action: 'shared_chat_timeout',
       buildEvent: (event) => withExpiresIn(event, 'shared_chat_timeout', 30),
-      expected: 'quotrok timed out TwitchDev (30s) (shared chat: adflynn404)',
+      expected: 'modexample timed out TwitchDev (30s) (shared chat: adflynn404)',
     },
     {
       action: 'shared_chat_untimeout',
       buildEvent: (e) => e,
-      expected: 'quotrok removed timeout on TwitchDev (shared chat: adflynn404)',
+      expected: 'modexample removed timeout on TwitchDev (shared chat: adflynn404)',
     },
     {
       action: 'shared_chat_delete',
       buildEvent: (e) => e,
-      expected: "quotrok deleted TwitchDev's message (shared chat: adflynn404)",
+      expected: "modexample deleted TwitchDev's message (shared chat: adflynn404)",
     },
   ])('$action maps to an attributed gray sys:"modact" row', ({ action, buildEvent, expected }) => {
     const { event: fixtureEvent } = MODERATE_FIXTURES[action];

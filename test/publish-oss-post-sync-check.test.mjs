@@ -7,12 +7,15 @@
 // (never a reimplementation) and proves: (a) a stale tracked file matching
 // a .oss-exclude .md entry still aborts, and (b) once removed from the
 // fake $DST's git index, the check passes clean.
-import { describe, it, expect, afterEach } from 'vitest';
-import { spawnSync, execFileSync, execSync } from 'node:child_process';
+import { describe, it, expect, afterEach, vi } from 'vitest';
+import { spawnSync, execFileSync } from 'node:child_process';
 import { mkdtempSync, mkdirSync, writeFileSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
+import { git, cleanEnv, OSS_TEST_TIMEOUT_MS } from './helpers/oss-fixtures.mjs';
+
+vi.setConfig({ testTimeout: OSS_TEST_TIMEOUT_MS });
 
 const DIR = path.dirname(fileURLToPath(import.meta.url));
 const SCRIPT = path.join(DIR, '..', 'tools', 'publish-oss.sh');
@@ -30,15 +33,13 @@ afterEach(() => {
 
 function makeFakeDst(trackedFiles) {
   const dst = makeTmpDir('publish-oss-dst-');
-  execSync('git init -q', { cwd: dst });
-  execSync('git config user.email test@example.com', { cwd: dst });
-  execSync('git config user.name test', { cwd: dst });
+  git(dst, ['init', '-q']);
   for (const name of trackedFiles) {
     writeFileSync(path.join(dst, name), 'content\n', 'utf8');
   }
   if (trackedFiles.length) {
-    execSync('git add -A', { cwd: dst });
-    execSync('git commit -q -m init', { cwd: dst });
+    git(dst, ['add', '-A']);
+    git(dst, ['commit', '-q', '-m', 'init']);
   }
   return dst;
 }
@@ -62,7 +63,7 @@ function runPostSyncCheck(dst, ossExcludeContent) {
     `#!/bin/bash\nset -euo pipefail\nSRC="${srcDir}/"\nDST="${dst}"\n${extracted}\nexit 0\n`,
     'utf8',
   );
-  return spawnSync('bash', [gateFile], { encoding: 'utf8' });
+  return spawnSync('bash', [gateFile], { encoding: 'utf8', env: cleanEnv() });
 }
 
 describe('publish-oss.sh post-sync stale-exclusion check', () => {

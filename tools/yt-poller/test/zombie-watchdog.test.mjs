@@ -119,7 +119,7 @@ describe('round-3 audit: threshold selection by liveness (never suppression)', (
     expect(triggered).toEqual(['zombie_watchdog_reconnect']);
   });
 
-  it('not_live + silent past REDISCOVERY_MIN (5 min) ⇒ triggers the yt_rediscovery path — this is a probe trigger, not an unconditional teardown or a suppression', () => {
+  it('not_live + silent past REDISCOVERY_MIN (2 min) ⇒ triggers the yt_rediscovery path — this is a probe trigger, not an unconditional teardown or a suppression', () => {
     const state = { liveChatSessionActive: true, zeroStreak: 0 };
     const triggered = [];
     for (let i = 1; i <= REDISCOVERY_CYCLES; i++) {

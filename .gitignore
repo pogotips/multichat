@@ -8,3 +8,4 @@ node_modules/
 wrangler.jsonc
 docker-compose.yml
 tools/yt-poller/docker-compose.yml
+tools/yt-poller/docker-compose.override.yml

@@ -227,13 +227,13 @@ describe('PWA client script wiring (source-level — no DOM/EventSource harness 
     }
   });
 
-  it('every manual trigger (button, pull) and every scheduled trigger reports a reconnect_attempt beacon', async () => {
+  it('every manual trigger (pull-to-refresh) and every scheduled trigger reports a reconnect_attempt beacon', async () => {
     const script = await getPwaScript();
     expect(script).toContain("reportReconnectAttempt('manual', reconnectAttempt, 0, es ? es.readyState : -1);");
     expect(script).toContain('reportReconnectAttempt(trigger, attemptNum, delay, es ? es.readyState : -1);');
-    // Must appear at both manual call sites: refresh button and pull-to-refresh.
+    // The topbar refresh button was removed; pull-to-refresh is now the only manual call site.
     const manualCount = script.split("reportReconnectAttempt('manual', reconnectAttempt, 0, es ? es.readyState : -1);").length - 1;
-    expect(manualCount).toBe(2);
+    expect(manualCount).toBe(1);
   });
 });
 

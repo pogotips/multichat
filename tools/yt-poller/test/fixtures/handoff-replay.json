@@ -1,0 +1,163 @@
+{
+  "_about": "Hand-reduced timelines for the 4 YT handoffs seen 2026-10-03..07. Relative seconds only; t=0 is the old stream's last chat message. Placeholder ids. 'assumed' marks a value not observed.",
+  "heartbeatSec": 15,
+  "probeSec": 0.2,
+  "heldIdOld": "stream-old",
+  "heldIdNew": "stream-new",
+  "handoffs": [
+    {
+      "n": 1,
+      "path": "error",
+      "oldChatDiedSec": 0,
+      "oldChatDiedAssumed": true,
+      "endToStartSec": 2.67,
+      "bLiveSec": null,
+      "bLiveNote": "go-live not in the audit and no raw capture of this new stream"
+    },
+    {
+      "n": 2,
+      "path": "rule",
+      "endToStartSec": 2.52,
+      "tickPhaseSec": 14.35,
+      "tickPhaseAssumed": true,
+      "oldNotLiveFromSec": 0,
+      "oldNotLiveAssumed": true,
+      "bLiveSec": null,
+      "bLiveNote": "go-live not in the audit and no raw capture of this new stream",
+      "bLiveBorrowedSec": 78.24,
+      "bLiveBorrowedNote": "not observed; borrowed from the 4th handoff only so candidate leave times can be compared. Never used for a blind figure."
+    },
+    {
+      "n": 3,
+      "path": "rule",
+      "endToStartSec": 2.82,
+      "tickPhaseSec": 14.35,
+      "tickPhaseAssumed": true,
+      "oldNotLiveFromSec": 0,
+      "oldNotLiveAssumed": true,
+      "bLiveSec": null,
+      "bLiveNote": "go-live not in the audit and no raw capture of this new stream",
+      "bLiveBorrowedSec": 78.24,
+      "bLiveBorrowedNote": "not observed; borrowed from the 4th handoff only so candidate leave times can be compared. Never used for a blind figure."
+    },
+    {
+      "n": 4,
+      "path": "rule",
+      "endToStartSec": 2.76,
+      "tickPhaseSec": 14.35,
+      "oldNotLiveFromSec": 0,
+      "oldNotLiveAssumed": true,
+      "oldChatClosedSec": 308.9,
+      "leaveObservedSec": 314.55,
+      "bStartObservedSec": 317.31,
+      "bLiveSec": 78.24,
+      "bLiveEarliestSec": 39.45,
+      "bLiveNote": "78.24 = first chat item on the new stream (latest possible go-live); 39.45 = earliest implied by the page's rounded 'started N minutes ago' text (inference)",
+      "bPreJoinItems": {
+        "count": 7,
+        "ageAtJoinFirstSec": 239.07,
+        "ageAtJoinLastSec": 112.08,
+        "interiorAgesSynthetic": true
+      }
+    }
+  ],
+  "rediscoveryRuns": {
+    "_about": "Probe-gate fires per attached not-live stretch: p=probe ran, t=skipped_too_soon, c=probe changed the id (handoff). intervalsSec = seconds between consecutive fires (log-line to log-line, so probe duration is baked in). Stretches with fewer than 3 fires omitted.",
+    "runs": [
+      {
+        "outcomes": "ptptptptpptppptppptpppp",
+        "intervalsSec": [
+          299.07,
+          301.19,
+          298.85,
+          300.82,
+          299.19,
+          301,
+          299.05,
+          300.89,
+          300.24,
+          298.89,
+          300.86,
+          299.79,
+          300.22,
+          299.18,
+          301,
+          299.61,
+          300.58,
+          298.89,
+          301.01,
+          300.15,
+          300.1,
+          299.55
+        ]
+      },
+      {
+        "outcomes": "ppp",
+        "intervalsSec": [
+          299.96,
+          300.02
+        ]
+      },
+      {
+        "outcomes": "pptp",
+        "intervalsSec": [
+          300.07,
+          299.19,
+          300.87
+        ]
+      },
+      {
+        "outcomes": "ppptpptpptpp",
+        "intervalsSec": [
+          299.87,
+          300.01,
+          299.33,
+          300.61,
+          300.58,
+          298.83,
+          300.76,
+          300.22,
+          299.1,
+          300.79,
+          300.09
+        ]
+      },
+      {
+        "outcomes": "ppc",
+        "intervalsSec": [
+          299.71,
+          7785.52
+        ]
+      },
+      {
+        "outcomes": "ptptpppptptppc",
+        "intervalsSec": [
+          299.07,
+          300.8,
+          299.19,
+          300.72,
+          300.07,
+          299.93,
+          300.09,
+          299.28,
+          300.93,
+          299.09,
+          301.01,
+          299.71,
+          9405.51
+        ]
+      },
+      {
+        "outcomes": "pppptpc",
+        "intervalsSec": [
+          299.98,
+          299.93,
+          300.27,
+          299.08,
+          300.54,
+          8280.33
+        ]
+      }
+    ]
+  }
+}

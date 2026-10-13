@@ -68,7 +68,8 @@ external renewal cron (optional, renewals) ────────────�
   authenticated with its own independent secret
   (`MULTICHAT_RAIDQ_INGEST_SECRET`, see §3). Entirely optional — leave the
   secret unset if you have no such cron. That cron's internal implementation
-  is out of scope for this doc.
+  is out of scope for this doc. (raidq stopped sending `member_renewed` on
+  2026-10-06; the kind stays accepted for compatibility.)
 - **Live counts (Twitch viewers/followers, YouTube viewers/likes)** — all
   four ride the same `status` SSE event and render into the tw/yt topbar
   chips, client-gated (only polled while ≥1 SSE client attached):
@@ -163,7 +164,7 @@ precedence comment, `src/worker.js:1825`).
 | `member_milestone` | YT `item.membership.milestone` | "member milestone" | text = `headerText — comment` when a comment exists |
 | `member_gift` | YT `item.membershipGift` (classic `liveChatSponsorshipsGiftPurchaseAnnouncementRenderer`) | "gifted memberships" | `amount` = `"<N> gift(s)"` |
 | `member_gift_received` | YT `item.membershipGiftReceived` | *(no label — excluded, see below)* | one row per redemption |
-| `member_renewed` | optional external renewal cron via YT Data API, **not** the poller/IRC | "renewed member" | see §1 tendril note |
+| `member_renewed` | optional external renewal cron via YT Data API (raidq stopped sending it 2026-10-06; still accepted), **not** the poller/IRC | "renewed member" | see §1 tendril note |
 | `yt_gift` | YT `item.giftMessage` (newer Jewels/animated-gift **ViewModel**, `giftMessageViewModel` — structurally distinct from `member_gift`, no `count` field) | "gift" | `amount` = `item.giftMessage.giftName`; **no `timestampUsec`**, unlike classic renderers — see §7 gift-timestamp caveat |
 
 **`member_gift_received` is deliberately excluded from vibrate/TTS eligibility**
@@ -189,9 +190,9 @@ string if unmapped).
 | `timeout` | `applyClearchat` — Twitch `CLEARCHAT` with a `ban-duration` tag | Gray row `"timeout: <login>, <N>s"` + same in-place `deleted` marking, matched by `login` (never display name — mod-action tags don't carry it). **Suppressed when `esModerateHealthy` is true** — `channel.moderate` (§3a) owns the attributed row instead; the strike-mark still always happens. |
 | `ban` | `applyClearchat` — `CLEARCHAT` without `ban-duration` | Gray row `"ban: <login>"` + same marking by `login`. Suppressed under the same `esModerateHealthy` rule as `timeout` above. |
 | `clear` | Bare `CLEARCHAT` (no trailing target — the "Clear Chat" button) | Gray row `"chat cleared"` **only** — never wipes the feed, never marks any row. **Never suppressed** — `channel.moderate` has no `clear`-equivalent action, so IRC keeps sole ownership regardless of `esModerateHealthy`. |
-| `modact` | Twitch EventSub `channel.moderate` v2 (§3a) — owns 11 of its ~30 possible `action` values | Standard gray info row, `"<mod> <verb> <user>[ (<dur>)][ (shared chat: <source>)]"` — e.g. `"quotrok timed out baduser (10m)"`. Renders **only** while `esModerateHealthy` is true; IRC's own `timeout`/`ban`/`deleted` rows above are this feature's fallback, not a second copy. |
+| `modact` | Twitch EventSub `channel.moderate` v2 (§3a) — owns 11 of its ~30 possible `action` values | Standard gray info row, `"<mod> <verb> <user>[ (<dur>)][ (shared chat: <source>)]"` — e.g. `"modexample timed out baduser (10m)"`. Renders **only** while `esModerateHealthy` is true; IRC's own `timeout`/`ban`/`deleted` rows above are this feature's fallback, not a second copy. |
 | `roomstate` | Non-first `ROOMSTATE` delta (`parseRoomstate`) — slow/subs-only/emote-only/followers-only/r9k | One gray row per changed setting's human-readable text. The **first** `ROOMSTATE` after each (re)connect is Twitch's full-state burst and is swallowed (`roomStateInit` flag, reset on every WS open) — never rendered. |
-| `redeem` | Twitch EventSub `channel.channel_points_custom_reward_redemption.add` (§3a) | **Distinct teal row** (`.msg.redeem`, `#1fd1b5`) — `"<user> redeemed <rewardTitle>: <userInput>"` (input omitted when empty, e.g. button-only rewards). `rewardTitle`/`userInput` are ellipsized (64/200 chars) *before* they ever reach `pushMessage`/the ring — viewer-controlled EventSub text is never stored uncapped. Silent by design: `emitCategory` only treats `kind` or `sys:'raid'` as non-silent, so redemptions never buzz or speak. |
+| `redeem` | Twitch EventSub `channel.channel_points_custom_reward_redemption.add` (§3a) | **Distinct teal row** (`.msg.redeem`, `#1fd1b5`) — `"<user> redeemed <rewardTitle>: <userInput>"` (input omitted when empty, e.g. button-only rewards). `rewardTitle`/`userInput` are ellipsized (64/200 chars) *before* they ever reach `pushMessage`/the ring — viewer-controlled EventSub text is never stored uncapped. Silent by design: `emitCategory` only treats `kind`, `readAloud` or `sys:'raid'` as non-silent, and this EventSub row carries none of them, so it never buzzes or speaks (it is a different row from the PRIVMSG Read-Out-Loud row, §5). |
 | `hype` | Twitch EventSub `channel.hype_train.begin`/`.progress`/`.end` (§3a) | Standard gray info row. `begin` and `end` always render; `progress` renders **only on a level-up** (DO tracks `hypeLevel`, reset on `end`) — every individual contribution otherwise fires `.progress`, which would flood the feed at exactly its busiest moments. The underlying bits/subs still render as their own gold IRC rows — nothing financial is lost by the suppression. |
 | `ad` | Twitch EventSub `channel.ad_break.begin` (§3a) | Standard gray info row, `"Ad break — <duration>s"` (+ `" (auto)"` suffix when Twitch-initiated rather than manual). |
 | `viewermilestone` | Twitch `USERNOTICE msg-id=viewermilestone` (`parseUsernotice`) — watch-streak notices | Standard gray info row, `system-msg` verbatim (e.g. `"<user> watched <N> consecutive streams and sparked a watch streak!"`). Rendered unconditionally off `msg-id`, not filtered on `msg-param-category`. Silent — not `sys:'raid'`, so `emitCategory` treats it as `'silent'`. |
@@ -204,6 +205,7 @@ string if unmapped).
 | `firstMsg` | Twitch `first-msg=1` tag | `✦` glyph prefix on an otherwise-normal row |
 | `isMod` | Twitch `mod=1` tag or `broadcaster` badge; YT `item.isModerator`/`item.isOwner` | Blue username (`--role-mod`, `.user.mod`) — highest color precedence, wins even inside a gold financial row |
 | `isMember` | Twitch `subscriber=1` tag **only** (a `founder` or `vip` badge alone grants no color); YT `item.isMembership` (badge-only signal, **not** a membership-money event — see the `member_*` kinds above for those) | Green username (`--role-member`, `.user.member`) — below a financial `kind`'s gold, above default |
+| `verified` | YT `item.isVerified` (the stock parser sets it from the `VERIFIED` author-badge icon); poller `normalize.mjs` forwards it as `verified: true`, strict boolean through `normalizeYt` and `pushMessage` (anything else is absent, i.e. false) | A small filled round badge (`span.verified`, an **empty** element — the check glyph is CSS `::before`, never text, so a `✓` typed into a display name stays plain name text and cannot imitate it, 2026-10-12; `role="img"` + `aria-label="Verified channel"` keep it announced now that there is no text) after the name inside `span.user`, built by the shared `buildRow` so the overlay shows it too. Display names are never rewritten. No color or precedence change; non-verified rows keep the single text-node shape. |
 
 Role color precedence (`roleClass()`, shared by both platforms): `isMod` > financial `kind` (gold) > `isMember` > default text color. Twitch's per-user `tags.color` is parsed nowhere and never applied — role color only, everyone else (including VIPs and founders with no independent subscription) renders in the page's default text color.
 | `emotes` | Twitch `emotes` tag (`parseEmotes`) — entries `{id,start,end}`. YouTube custom emojis (poller `normalize.mjs`, worker `sanitizeYtEmotes`) — entries `{url,alt,start,end}` | Shared `renderText()` walker, one array, two entry shapes: Twitch derives the CDN URL from `id` (`EMOTE_ID_RE`-anchored before touching `img.src`); YouTube uses `url` directly (worker-side host-allowlisted at ingest, client re-checks as defense in depth — see §3). Both: inline `<img class="emote">` at text height, `onerror` falls back to the original text/shortcode. **`start`/`end` are Unicode code-point offsets (`[...str]` semantics), end inclusive, on both the Twitch and YouTube paths** — the poller computes YT offsets the same way the client walks them, verified by a multibyte fixture (astral + CJK + ZWJ-sequence emoji before a custom emoji). Standard unicode emoji never get an entry — they're plain text. |
@@ -219,7 +221,7 @@ Role color precedence (`roleClass()`, shared by both platforms): `isMod` > finan
 |---|---|---|---|
 | `MULTICHAT_VIEW_SECRET` | `?t=` query param on `GET /events` | Viewer SSE feed | Query-string auth is unavoidable — `EventSource` can't set headers. Appears in Cloudflare's own `/events` access logs (account-private). Accepted risk, kept as its own secret specifically so a leaked viewer link can't forge chat via `/ingest/yt`. Read client-side from the URL **fragment** (`location.hash`, never sent to the server on `GET /`); `<meta name="referrer" content="no-referrer">` blocks Referer leakage too. |
 | `MULTICHAT_INGEST_SECRET` | `X-Multichat-Secret` header on `POST /ingest/yt` | yt-poller only | |
-| `MULTICHAT_RAIDQ_INGEST_SECRET` | `X-Multichat-Secret` header on `POST /ingest/yt` | optional external renewal cron only | `handleIngestYt` accepts **either** ingest secret (`safeEqual` OR), but they're distinct values so neither caller can impersonate the other — that's the whole reason for the split. The edge threads *which* secret matched to the DO via an internal `x-multichat-caller: poller\|raidq` header; the DO's `{type:'mod'}` branch (chat-moderation control messages) requires `caller === 'poller'` and 403s otherwise — the renewal cron's plain chat-shaped renewal POSTs are unaffected, but it never gains the poller's mod-action capability just because both callers share this route. |
+| `MULTICHAT_RAIDQ_INGEST_SECRET` | `X-Multichat-Secret` header on `POST /ingest/yt` | optional external renewal cron only (raidq no longer sends, 2026-10-06) | `handleIngestYt` accepts **either** ingest secret (`safeEqual` OR), but they're distinct values so neither caller can impersonate the other — that's the whole reason for the split. The edge threads *which* secret matched to the DO via an internal `x-multichat-caller: poller\|raidq` header; the DO's `{type:'mod'}` branch (chat-moderation control messages) requires `caller === 'poller'` and 403s otherwise — the renewal cron's plain chat-shaped renewal POSTs are unaffected, but it never gains the poller's mod-action capability just because both callers share this route. |
 | `TWITCH_USER_REFRESH_TOKEN` | never sent over the wire — read server-side only, from `env` or `ctx.storage` | `moderator:read:followers` scope, already user-consented | Seeds the follower-count refresh chain (§1, "Live counts"). Not compared via `safeEqual` — it's a credential the DO presents to Twitch, not an inbound auth check. `ctx.storage` (not this secret) is the live source of truth once the chain has run once, since Twitch rotates the refresh token on every use. |
 | `EVENTSUB_SECRET` | `Twitch-Eventsub-Message-Signature` header (HMAC-SHA256) on `POST /eventsub/callback` | Shared secret set on each subscription's `transport.secret` | The only auth on this route — **the first public unauthenticated route in this Worker**. See §3a for the full verification spec. Not compared with `safeEqual` directly against a header value (there's no plaintext secret to compare) — it keys an HMAC whose *digest* is then `safeEqual`-compared against the signature header. |
 
@@ -266,6 +268,12 @@ URL) — same "never trust the wire" posture as `sanitizeYtEmotes`. The client
 depth. The docs' URL-rendering contract ("must be rendered exactly as given,
 never modified") is honored throughout — accept/reject only ever decides
 whether `url` is kept, nothing ever rewrites it.
+
+**Intentional outbound target: `recent-messages.robotty.de`** (`src/worker.js:1681`,
+`recoverGap`) — a third-party community replay service the DO fetches on
+Twitch-IRC reconnect for gap recovery (§4). Not a leak or an accidental
+dependency; flagged here so a future outbound-target audit doesn't mistake
+it for one.
 
 **Capture files are untrusted chat-derived data.** Anything written to R2 via
 `flushCapture` (raw unclassified IRC lines) or the poller's
@@ -644,9 +652,8 @@ for both. **`moderator_user_id` is an authorization identity, not an actor
 filter** — Twitch's own docs example ("Payload Example - Adding a Moderator")
 subscribes with condition `{broadcaster_user_id: "1337"}` (no
 `moderator_user_id` at all) yet delivers an event whose `moderator_user_id`/
-`moderator_user_login` (`"424596340"/"quotrok"`) is a different party than
-the user acted on — proof the subscription isn't scoped to one moderator's
-actions. This matches the documented pattern for sibling condition-having
+`moderator_user_login` names a different party than the user acted on —
+proof the subscription isn't scoped to one moderator's actions. This matches the documented pattern for sibling condition-having
 types (`automod.message.hold`, `channel.unban_request.resolve`): "the ID in
 the `moderator_user_id` condition parameter must match the user ID in the
 access token" — i.e. it identifies whose grant authorizes the subscription,
@@ -894,7 +901,7 @@ is `config.tts`-driven).
 
 **localStorage: separate key, not a shared one.** The overlay writes exactly
 one key, `multichat-ov-spoken` — namespaced apart from the PWA's four
-(`multichat-fontsize-px`/`multichat-spoken`/`multichat-speak`/
+(`multichat-fontsize-px`/`multichat-spoken`/`multichat-tts-mode`/
 `multichat-token`) despite sharing an origin. Same origin + unnamespaced keys
 would let the two surfaces cross-suppress each other's spoken message ids.
 
@@ -906,6 +913,36 @@ strip and the `<2`-char guard, falling back de-`@` → original, never empty
 speech (`/(^|\s)@(\S)/` → `$1$2`) — an email address like `a@b.com` is
 untouched, since its `@` isn't preceded by whitespace/start-of-string.
 Display text is never touched by either — spoken output only.
+
+### 3b-ii. Tap-to-translate (PWA)
+
+`POST /translate?t=<MULTICHAT_VIEW_SECRET>` with `{ text }` translates one chat
+message to English for the phone PWA (tap the message text, in the feed or the
+name sheet). Auth is `requireViewToken` only: the overlay secret is rejected
+(401) because it lives in an OBS scene URL and must never unlock a Workers AI
+spend endpoint (added 2026-10-12).
+
+- **Caps:** body <= 2048 bytes (413), text clamped to 300 chars after URL and
+  control-char stripping, output clamped to 400 chars, `max_tokens` 120.
+- **Meter (ChatHub DO):** `/translate-allow` pre-charges an estimate in
+  neurons under `blockConcurrencyWhile`: 10 calls/min (in-memory bucket) and
+  8,000 neurons/day (`ctx.storage` key `translateDaily`, UTC day). The Worker
+  then calls Workers AI and `/translate-settle` swaps the estimate for real
+  usage (skipped if the UTC day rolled over). The pre-charge is priced at the
+  MAX of the two models' per-token rates (`NEURON_RATES` in `src/lib.js`), so
+  a fallback call can never exceed it; settle prices actual usage at the rate
+  of the model that served. A failed model call keeps the pre-charge (no
+  refund). Denied/bad requests and settle/meter errors each log one event
+  (error text is redacted if it echoes the message).
+- **Models:** `@cf/google/gemma-4-26b-a4b-it`, falling back once to
+  `@cf/meta/llama-3.1-8b-instruct-fp8-fast`. The system prompt treats the
+  message as untrusted text to translate, never instructions.
+- **Responses:** always 200 JSON `{ ok, text | same | reason }`; the client maps
+  every reason to a visible label (`translateLabel`).
+- **Logging privacy:** one `ev:'translate'` line per request (ok, reason, ms,
+  token counts, neurons) plus `translate_model_error` (model + message). The
+  message text, the translation and the prompt are never logged (2026-10-12:
+  chat text is third-party content and must not land in account logs).
 
 ## 3c. Live Reaction Bursts (YouTube heart/like fountain)
 
@@ -981,7 +1018,7 @@ guarantees nonzero-only), unlike the heartbeat's change-gated push.
 
 **PWA.** A `#reactions` cell in the existing `#chips` topbar grid — inline
 enum sibling of `#chip-tw`/`#chip-yt` — accumulates incoming bursts
-client-side over a rolling 10s window (`reactionEvents`, decayed by dropping
+client-side over a rolling 60s window (`reactionEvents`, decayed by dropping
 entries older than the window on every render tick, `setInterval` every 1s),
 shows the top 4 emoji by summed count, and adds a `.pulse` CSS class
 (400ms scale keyframe) when `intensity >= 0.75`. Empty/zero-width exactly
@@ -1242,7 +1279,15 @@ sweep and the transitive-interpolation-reference check both cover them.
   Worker answered every one in single-digit ms). Failed sends re-queue at the
   front (FIFO *enqueue* order preserved) with backoff
   (`RETRY_BACKOFF_INITIAL_MS` = 5s → `RETRY_BACKOFF_MAX_MS` = 60s, only
-  resetting to floor on a fully clean batch). That FIFO guarantee covers
+  resetting to floor on a fully clean batch). The exception is a payload
+  rejection — HTTP 400 or 413, answered from the body alone so a retry can
+  never succeed: `drainBatch` drops that item after one attempt with an
+  `ingest_dropped` log line (status, type, id — no body/URL/headers) so one
+  poisoned item can't block the chat queued behind it. 401/403/404 (secret
+  rotation, Worker not yet deployed), 408, 429, 5xx and network errors always
+  keep retrying. `sendOnce` records the status via `noteSendStatus`. A drop is
+  returned as `dropped` (not `sent`) and `drainLoop` backs off only when
+  `sent + dropped < attempted`, so a poisoned item never delays the chat behind it. That FIFO guarantee covers
   requeue-on-failure only — up to 4 items in a batch are sent concurrently via
   `Promise.all`, so there's no guarantee they *arrive* at the Worker in
   enqueue order; chat message ordering has never depended on that, but the
@@ -1252,7 +1297,7 @@ sweep and the transitive-interpolation-reference check both cover them.
 - **Poller heartbeat log (2026-07-28)**: every 15s heartbeat cycle
   (`poller.mjs`'s top-level `setInterval`, NOT live-gated — it runs
   identically whether a stream is live or not) logs one bounded line:
-  `{ev: 'poller_heartbeat', fetched, posted, failed, status, counts,
+  `{ev: 'poller_heartbeat', fetched, posted, failed, dropped, status, counts,
   rtt_buckets, rtt_max_ms, rtt_count, globalEmojiRenders}`.
   `globalEmojiRenders` (added 2026-08-20) is the non-sampled counterpart to
   `yt_global_emoji_render` above — a single cycle-scoped integer, no
@@ -1263,7 +1308,11 @@ sweep and the transitive-interpolation-reference check both cover them.
   `drainBatch`, never back through `post()`, so they can't inflate this past
   `fetched`); `failed` = `sendOnce` failures this cycle, which *does*
   include retry re-attempts (a retry storm this cycle is itself useful
-  signal); `status` = this cycle's own heartbeat `POST /ingest/yt` result
+  signal) but *never* a 400/413 payload rejection; `dropped` (added
+  2026-10-12) = 400/413 replies this cycle — those items are dropped on
+  first failure (`isPayloadRejection`, `retry-queue.mjs`), never retried,
+  and are counted here instead of in `failed` so a poison item is
+  distinguishable from a delivery problem; `status` = this cycle's own heartbeat `POST /ingest/yt` result
   (`res.ok`); `counts` = `'skip'` (no `YOUTUBE_API_KEY` or no live video id
   — feature not configured / nothing live, matches `fetchYtCounts`'s own
   no-op check), `'ok'` (counts fetched), or `'err'` (key + video id present
@@ -1280,8 +1329,9 @@ sweep and the transitive-interpolation-reference check both cover them.
 - **Stuck-session self-heal**: `youtube-chat`'s poll loop doesn't recover from
   a broken chat session on its own (stale continuation token) — the poller
   forces a reconnect after `MAX_CONSECUTIVE_ERRORS` = 8 consecutive `error`
-  events (`poller.mjs`). `stop()` has only two callers (this path and the
-  zombie watchdog) — there is no clean stream-ended signal from YouTube, so
+  events (`poller.mjs`). `stop()` has three callers (this path, the
+  rediscovery probe's videoId-changed teardown, and the zombie watchdog —
+  `poller.mjs` near :488 / :587 / :693) — there is no clean stream-ended signal from YouTube, so
   `MAX_CONSECUTIVE_ERRORS` is also the expected, ordinary death path for a
   normal end-of-broadcast, not just a failure path. `yt_session_end` (added
   2026-08-20) carries `{ev: 'yt_session_end', videoId, reason, lastErrors,
@@ -1295,6 +1345,42 @@ sweep and the transitive-interpolation-reference check both cover them.
   a claim either way). Added specifically so a following audit doesn't need
   to hand-cross-reference `poller_heartbeat` against Worker-side logs to
   answer this, as the 2026-08-20 round had to.
+- **Watchdog and liveness gate** (`watchdog.mjs`, `rediscovery.mjs`;
+  `WATCHDOG_LIVENESS_GATE`): `liveChatSessionActive` only means a chat session
+  attached, and YouTube grants that for waiting rooms that never go live, so
+  the empty-200 watchdog counts consecutive 15 s heartbeat cycles with
+  `fetched=0` (`zeroStreak`) and compares them to a threshold that liveness
+  *selects* but never suppresses (suppressing would leave a dead continuation
+  with no way back to `fetchLivePage`).
+  - **Thresholds**: `not_live` → `REDISCOVERY_MIN` = 2 min (8 cycles);
+    `live` / `unknown` → `ZOMBIE_WATCHDOG_MIN` = 15 min (60 cycles; an
+    ambiguous or stale (>`LIVENESS_MAX_AGE_MS`) read can only make the
+    watchdog more patient); gate off → `LEGACY_ZOMBIE_WATCHDOG_MIN` = 3 min.
+    `REDISCOVERY_MIN` is a literal in `watchdog.mjs`, not settable from env.
+  - **Leave rule**: a `live`/`unknown`/gate-off fire is a teardown
+    (`zombie_watchdog_reconnect`). A `not_live` fire is only a *probe*
+    (`yt_rediscovery`): a throwaway `LiveChat` resolves the channel's current
+    videoId and the real session is torn down only if that id differs from the
+    held one. A null probe (error, timeout, nothing live) reads as unchanged,
+    so a waiting room whose id has not changed is never torn down. A
+    `yt_rediscovery` line carries the liveness value resolved for that tick,
+    and (2026-10-12) every null probe says why: `reason` is `error_event` |
+    `timeout` | `start_rejected` | `empty_live_id`, with a capped `detail`
+    when the library gave a message, and `cleanupError` when the throwaway
+    probe's `stop()` threw during teardown (`probeCurrentLive`,
+    `rediscovery.mjs`) — a null is still "no change", never a silent one.
+  - **too_soon gate**: `createRediscoveryGate` enforces spacing between probes
+    independent of `zeroStreak` bookkeeping, plus single-flight (`in_flight`).
+    Its interval `REDISCOVERY_GATE_MS` is one heartbeat tick under the cadence
+    (105 s vs 120 s): equal to the cadence, tick jitter made a fire land early
+    and read `too_soon` (about 41% of fires in the replay model), pushing the
+    effective cadence back to ~4 min.
+  - **Kill switch**: `WATCHDOG_LIVENESS_GATE=off` takes the legacy 3 min
+    zombie path with zero probes — unchanged.
+  - **Blind window** (new stream live → new session attached, replayed handoff
+    #4; `test/handoff-replay.test.mjs`): 239-278 s with `REDISCOVERY_MIN` = 5
+    and a 300 s gate; 59-98 s with 2 min / 105 s. Cost: ~30 probes/h per
+    attached not-live hour (was ~7), one page fetch each.
 - **Stream-not-live retry cadence** (2026.07.20.3, TRIAGE remediation): the
   2026-07-20 incident's ~8-9 min stream-start ingest outage was
   `"Live Stream was not found"` repeating while `scheduleReconnect`'s normal
@@ -1307,6 +1393,15 @@ sweep and the transitive-interpolation-reference check both cover them.
   **not** grow `backoffMs` — a real error afterward still gets the full
   exponential ramp it needs. Idle poll cost on the poller host at 20s is trivial; this
   bounds discovery lag to roughly that plus YouTube's own propagation delay.
+
+- **48px custom emoji thumbnail**: the `youtube-chat` parser patch
+  (`patches/youtube-chat+2.2.0.patch`, `parseMessages`) now prefers the 48px
+  emoji thumbnail (by `width === 48`, else a `w48-h48` URL) and falls back to
+  the first thumbnail, instead of the stock first-entry (24px) pick.
+- **Capture volume override**: `docker-compose.override.yml` (host-only,
+  gitignored; `tools/yt-poller/docker-compose.override.yml.example` is checked
+  in) can bind-mount a host `./capture` directory to `/app/capture` so capture
+  files survive container recreation.
 
 ## 5. Client Features
 
@@ -1344,8 +1439,18 @@ All client behavior lives in the inline `<script>` inside `PAGE_HTML`
   own `gifAlt` config param (`OVERLAY_PARAM_SPEC`, default **on** — §2c/§3b)
   that forces alt-text-only rendering unless a scene operator explicitly
   sets `gifAlt=off` per scene; unrelated to and independent of this toggle.
-- **TTS read-aloud**: default-off `#speakToggle`
-  (🔊/🔇). Buzz and speak fire from **one shared gate**, `fireEmission(msg,
+- **TTS read-aloud**: gold alerts (financial rows) are spoken in every
+  state. The `#speakToggle` (🔊/📣) switches only whether plain live chat is
+  read too: Gold (default, alerts only) or All (alerts plus chat); the choice
+  is stored under `multichat-tts-mode` (`gold` / `all`). A tap while a line is
+  being read stops it and drops any queued chat (queued gold still speaks),
+  landing on Gold. A mod's `!tts off` returns to Gold, `!tts on` / `!tts all`
+  select All, and `!tts gold` is ignored; any switch to Gold (the command or a
+  plain tap) also drops queued chat without cutting the line being read. Spoken
+  names are never replaced when they contain no digit (`Ed` stays `Ed`; the
+  junk guard applies only to digit-bearing names), and the username curse
+  match runs per name segment (non-alphanumeric runs and camelCase humps), so
+  `ShitLord` is "someone" while `Michishita` is not. Buzz and speak fire from **one shared gate**, `fireEmission(msg,
   buzzPattern)`, which calls `isEmittable(msg, {floor, spokenIds, now})` —
   `emitCategory(msg) !== 'silent' && msg.id > floor && !spokenIds.has(msg.id)
   && now - msg.ts < EMIT_TTL_MS` (30 min). `emitCategory` decides the outputs:
@@ -1373,6 +1478,21 @@ All client behavior lives in the inline `<script>` inside `PAGE_HTML`
   (`enqueueCapped`, drop-oldest). A 10s pause/resume keepalive works around a
   Chrome long-utterance auto-pause bug; it restarts on page reload *and* on SSE
   reconnect (`3191b8a`, `4ae441c`).
+- **Read-Out-Loud redeem row**: a Twitch PRIVMSG carrying a
+  `custom-reward-id` tag has that id parsed as `rewardId` (`parsePrivmsg`).
+  `pushMessage` logs `{ev:'custom_reward_seen', rewardId, login}` for every
+  such message (id and login only, never the text, so the reward id can be
+  found in Workers Observability) and sets `readAloud: true` on the ring entry
+  only when the id equals the `MULTICHAT_TTS_REWARD_ID` var; `rewardId` itself
+  never reaches the ring or the SSE feed. With the var unset the feature is
+  not live and the message is plain chat. `emitCategory` returns `readout` for
+  a `readAloud` row: no buzz, spoken once through the same `fireEmission`
+  per-id gate as gold, using `formatChatUtterance` (so the mention, curse and
+  emote rules apply), skipping bot accounts. It renders as a teal `.msg.readout`
+  row and is excluded from the All-mode chat path so it is never spoken twice.
+  The overlay does not read `readAloud`. This is a different row from the
+  EventSub `sys:'redeem'` row (see the `redeem` entry in the sys table), which
+  stays silent.
 - **TTS audio unlock hardening A** (2026.07.20.3): a one-time `click`/`touchstart`
   listener (`unlockTts`, alongside the wake-lock re-acquire listeners) fires a
   silent zero-volume utterance inside the first user gesture when the toggle is
@@ -1383,7 +1503,7 @@ All client behavior lives in the inline `<script>` inside `PAGE_HTML`
   | Toggle | Key | Values |
   |---|---|---|
   | Font size | `multichat-fontsize` | `large` / (absent = normal) |
-  | TTS read-aloud | `multichat-speak` | `on` / `off` |
+  | TTS read-aloud mode | `multichat-tts-mode` | `gold` / `all` (absent or any other value, including an old `off`, reads as `gold`) |
   | Speak-once ledger | `multichat-spoken` | `{floor, lastMsgId, ids: [[id, ts], ...]}` — persisted on `pagehide`/hidden, restored on load (§5 TTS speak-once) |
   | View token | `multichat-token` | raw secret string (fragment-seeded, or manually re-entered via ⚿) |
 - **PWA installability, no service worker**: manifest +
@@ -1430,14 +1550,17 @@ All client behavior lives in the inline `<script>` inside `PAGE_HTML`
   `touchstart` on `#feed` bubbles to the document-level `unlockTts` listener
   unchanged (nothing here calls `stopPropagation`), so a pull also serves as
   the first-gesture iOS audio unlock like any other tap.
-- **Refresh button** (2026.07.30.2, haptics removed 2026-07-31): a `↻` button
-  in the top-right of `#topbar` is the only manual (non-gesture) refresh
-  affordance, on every platform — `⚿` moved to the far left of the row, and
-  the old `#status` connection dot was removed (the tw/yt chip liveness dots
-  and `#banner` already cover connection state, making the dot redundant).
-  `refreshReconnect()` is the shared reconnect core — the same `/api/version`
-  + `versionMismatch` + `connect()` logic `triggerPullRefresh` always used,
-  factored out so the button and pull gesture share one path and one
+- **Refresh button** (2026.07.30.2, haptics removed 2026-07-31, button removed
+  2026-09-22 in favor of pull-to-refresh alone — see the reactions-strip
+  changelog entry): a `↻` button in the top-right of `#topbar` was the manual
+  (non-gesture) refresh affordance, on every platform — `⚿` moved to the far
+  left of the row, and the old `#status` connection dot was removed (the
+  tw/yt chip liveness dots and `#banner` already cover connection state,
+  making the dot redundant). Pull-to-refresh is now the only manual trigger.
+  `refreshReconnect()` remains the shared reconnect core — the same
+  `/api/version` + `versionMismatch` + `connect()` logic `triggerPullRefresh`
+  always used, factored out so the (now-removed) button and pull gesture
+  could share one path and one
   in-flight guard (`refreshBusy`, distinct from pull's own `pullBusy`). A
   `pendingRefreshConfirm`/`refreshConfirmTimer` pair clears `refreshBusy`
   once the refresh actually resolves — consumed by the next SSE message
@@ -1450,6 +1573,31 @@ All client behavior lives in the inline `<script>` inside `PAGE_HTML`
   than a plain button on Android/desktop and a switch on iOS). Ordinary live
   messages never touch this path — only financial/raid rows keep their
   existing `fireEmission` buzz, which is a separate feature.
+
+- **Name-tap history sheet (PWA only, 2026-10-11)**: tapping a `span.user`
+  in the feed opens a bottom sheet listing every message from the same
+  platform account seen since page open, newest on top, struck in place when
+  a `mark` event deletes them, and prepended live while open. A bounded
+  in-memory store (`createMessageStore`, `src/lib.js`, capped at the last
+  2,000 messages overall across all accounts) is fed only by frames that
+  passed the seen-id gate; it is never rendered in the feed and is gone on
+  reload. Accounts are keyed by `userKeyOf`: `tw:<login>` or
+  `yt:<authorId>`, never by display name; rows with no stable id (and `sys`
+  rows) are not tappable. Dismissal is a backdrop tap, the close button, or
+  Escape. Sheet rows are built by `buildRow` directly: no seen-id gate, no
+  buzz, no TTS, no emission path. The overlay and config pages are untouched.
+  Polish (2026-10-12): while the sheet is open `body.sheet-open` freezes the
+  feed behind it (`#feed { overflow: hidden }`, plus `overscroll-behavior:
+  contain` on the list and backdrop and a `touchmove` guard on the dim area)
+  so iPhone cannot scroll the feed through the backdrop; `closeSheet` is the
+  single close path for all three dismissals, so the lock always releases.
+  Focus moves to the close button on open and returns to the previous
+  element on close. The pointer cursor is `#feed .user` only (sheet rows are
+  not tappable); sheet colors are `:root` tokens (`--sheet-bg`,
+  `--sheet-border`).
+- **Name/text spacing**: PWA `.user` carries `margin-right: 4px` (as the
+  overlay already did) so rows read "name: text" with a visible gap; the row
+  text itself is unchanged.
 
 ## 6. Deploy Runbook
 
@@ -1477,8 +1625,17 @@ All client behavior lives in the inline `<script>` inside `PAGE_HTML`
      host-only files (`docker-compose.yml` — see the protected-host-files
      list in `INSTALL.md`) that this repo has no other copy of; a tar taken
      *before* the touch is the only way back if the touch goes wrong.
+     `docker-compose.override.yml` (optional) is another host-only file the
+     rsync never touches.
      2026-08-20 incident: an `rsync --delete` wiped the host-only
      `docker-compose.yml` with no working backup on hand — see item below.
+     **The tar's own output destination must not be inside the stack
+     directory (or its parent).** The stack directory's parent is typically
+     root-owned on a compose host — `tar -czf` targeting a path under it
+     fails with `Permission denied` (confirmed 2026-09-23 on the poller
+     host). Write the tar to a user-writable directory instead — a
+     `~/backups/` (or similar) home-directory convention, not the stack
+     path itself — e.g. `tar -czf ~/backups/<stack-name>-backup-<timestamp>.tar.gz /path/to/your/stack`.
    - `rsync` the `tools/yt-poller/` contents to the stack directory on your
      compose host — e.g. `rsync -a --exclude=node_modules tools/yt-poller/ user@YOUR_POLLER_HOST:/path/to/your/stack`.
      The exclude matters: a bare `rsync -a` also syncs your local (gitignored)
@@ -1585,7 +1742,8 @@ All client behavior lives in the inline `<script>` inside `PAGE_HTML`
    - **If the old value still succeeds**, it was aliased to
      `MULTICHAT_RAIDQ_INGEST_SECRET` (the privilege-confusion bug the split is
      meant to prevent, §Setup) — stop, don't delete the rollback backup, and
-     rotate `MULTICHAT_RAIDQ_INGEST_SECRET` on both sides too.
+     rotate `MULTICHAT_RAIDQ_INGEST_SECRET` on both sides too (raidq no longer
+     reads it since 2026-10-06, so a leftover raidq copy is dead).
    - **Known gap (2026-08-20 incident): the `rtk` output-filter hook's
      redaction pattern only matched `KEY=value` and missed YAML's
      `KEY: "value"`** — two secrets printed in cleartext into local tee logs
@@ -1673,8 +1831,8 @@ All client behavior lives in the inline `<script>` inside `PAGE_HTML`
   `recovered` right after a poller reconnect when older items around it are.
 - **Raid-queue renewal tendril depends on your external cron's own health.**
   See §1 — the `member_renewed` ingest path exists and is wired (secret,
-  `VALID_KINDS` entry, TTS label), but whether it ever fires depends entirely
-  on that external cron reaching the YouTube Data API. Not a multichat-side
+  `VALID_KINDS` entry, TTS label), but raidq stopped sending it on 2026-10-06,
+  so it fires only if some other external cron posts it. Not a multichat-side
   concern; nothing to fix here.
 - **DO `console.log` flushes when the held Twitch WebSocket closes.**
   Verified 2026-07-21: entries

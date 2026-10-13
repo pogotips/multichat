@@ -4,6 +4,79 @@
 
 ## [Unreleased]
 
+### Fixed
+- Test-only (tools/tests, no release): the `publish-oss*` test files no longer depend on the developer's repo or tree. Fixtures scrub inherited `GIT_*` env (a hook-run `npm test` pointed fixture `git add/commit` at the real repo), the real-stage check reads the committed tree, fixtures spawn fewer git processes, and the spawn-heavy files carry a 60s per-file timeout (11 timeouts reproduced under 3x CPU load at the 5s default). `publish-oss.sh` itself is unchanged and still refuses a dirty tree for real publishes.
+
+## [2026.10.12.4]
+
+### Fixed
+- **Tap-to-translate works again (PWA).** Gemma 4 is a reasoning model; its thinking consumed the 120-token output cap and the translation came back empty, so every tap read "failed". Thinking is now disabled for the translate call, the output cap is a real 200 completion tokens, array/null model content is tolerated, and an empty answer logs the finish reason and token counts (never the text).
+- **TTS never reads Streamlabs or any listed bot (PWA).** The bot-skip check now strips a leading `@`, a verified tick and surrounding spaces and compares case-insensitively, on YT display names and Twitch logins alike.
+
+### Changed
+- **Spoken names cut at the first digit (PWA).** `RRR0O08B8` is read "RRR", `AIRBRAKE_88` is "AIRBRAKE"; names with fewer than three letters before the first digit keep the old trailing-digit strip, and a name left with under three letters or mostly digits is read "someone" (names without digits are never replaced). Display text is unchanged.
+- **@mentions in chat are read by the same rule (PWA).** "@RRR0O08B8 lol" is spoken "RRR lol"; emails and plain words are untouched.
+- **Curses are spoken as "bleep" (PWA).** One shared filter for chat, gold and redeem speech: a built-in word list with asterisk and simple leet variants, whole-word on the body; a username containing a strong curse is spoken "someone". Extra words come from the optional `MULTICHAT_TTS_EXTRA_CURSES` var (comma list). Display text is unchanged. The overlay's gold rows also speak a cursing username as "someone" (built-in list only).
+- **Gold always speaks (PWA).** The speaker button now toggles chat reading only, Gold ↔ All; there is no Off. A tap during speech stops the current line, drops queued chat, keeps queued gold and lands on Gold. `!tts off` → Gold, `!tts all`/`on` → All (the `gold` argument is gone). A saved Off mode from an older client migrates to Gold. The overlay's modes are unchanged.
+
+### Added
+- **"Read Out Loud" channel-point redeem (PWA).** When `MULTICHAT_TTS_REWARD_ID` names the reward, a Twitch chat message redeemed with it shows as a teal row and is spoken once (like gold, in every mode, through the bot-skip, spoken-name, mention and bleep rules) and is not read a second time as chat. Without the var, it is normal chat. The DO logs `custom_reward_seen` (reward id + login, never the text) for any custom-reward message.
+
+## [2026.10.12.3]
+
+### Fixed
+- **Tap-to-translate retries failed and limit-hit taps (PWA).** A "failed" or "limit hit" label is no longer cached; the next tap sends a new request. Only real translations and "already English" stay cached, and a tap while "translating…" is in flight still sends no second request.
+- **TTS speaker button: the mode announcement is not "speaking" (PWA).** Taps during "read alerts on" / "read all chat on" keep cycling Off → Gold → All, each announcing the new mode and cancelling the previous announcement. Stop + clear + Off fires only while a chat or gold line is being read.
+- **TTS skips 14 bot accounts and any name ending in "bot" (PWA).** Matched case-insensitively on Twitch login and YT display name (was 5 names); names with "bot" mid-word are still spoken. TTS only, the rows still display.
+
+## [2026.10.12.2]
+
+### Added
+- **Name sheet stats + @ copy button (PWA).** The name-tap sheet now opens with one stats line — message count, first seen "since open", and gold given listed per type and per currency (same-currency amounts are summed, nothing is ever converted or summed across currencies) — plus a button that copies `@name` (Twitch uses the login, any leading `@` is stripped) with a ✓ for about 1.5 s. Clipboard via `navigator.clipboard.writeText` with a textarea fallback. Computed from the existing 2,000-message in-memory list (`sheetStats`, `summarizeGold`, `copyHandle`, `writeClipboard` in `src/lib.js`); `buildRow` and the golden fixture are untouched; the feed gains no vertical space.
+- **Phone TTS modes Off → Gold → All.** The speaker button cycles three modes (Gold = the previous "on" behavior; a fresh install stays Off; an existing `multichat-speak=on` migrates to Gold; mode persists in `localStorage` `multichat-tts-mode`). In All, each new chat line is spoken within about 20 s of arrival or skipped. Never spoken: replay/recovered rows, commands (leading `!`), bots (`TTS_BOT_NAMES`: Nightbot, StreamElements, Moobot, Fossabot, Streamlabs), rows containing links, emote-only rows, the broadcaster's own lines, deleted rows — a mark on a queued or in-flight row drops it mid-speech (`markMatchesQueueItem`, now used by the PWA as well as the overlay). Gold rows jump the queue; queue cap 5; spoken chat capped at 200 chars with emote ranges stripped (`stripEmoteRanges`) and the spoken-name cleanup reused. A tap while speaking cancels, clears the queue and sets Off; a tap while silent cycles. Raid rows stay buzz-only. Overlay untouched.
+- **`!tts off|on|gold|all` chat command (PWA only).** Sent by the broadcaster or a mod on either platform (the `isMod` flag the blue mod coloring already uses), it changes that phone's TTS mode within about 2 s. Live rows only (replay/recovered and rows older than 20 s are ignored; deduped by message id); unknown arguments ignored; `on` restores the last non-Off mode (default Gold). The command row still displays but is never spoken; applying shows one local gray row "TTS <mode> by <name>" that never buzzes, speaks, or enters the seen-id gate.
+- **Tap-to-translate (PWA).** Tapping a message's text (never the name) shows its English under that row, in the feed and in the name sheet, from one in-memory cache per message id, or a visible label: "translating…", "already English", "nothing to translate", "limit hit", "failed". Emote-only and GIF-only rows are a no-op. New `POST /translate` (view secret ONLY — the overlay secret is rejected because it lives in an OBS scene URL), JSON `{text}`, 2 KB body cap, 300-char input cap after stripping emotes/links/control chars; empty input never calls Workers AI. The `ChatHub` DO meters it like `/tts` with its own keys: 10/min in-memory, 8,000 neurons/day persisted (`translateDaily`, UTC-midnight reset), an estimate pre-charged under `blockConcurrencyWhile` and settled from the response's usage tokens (chars/4 when absent). Model `@cf/google/gemma-4-26b-a4b-it` with `@cf/meta/llama-3.1-8b-instruct-fp8-fast` as fallback, strict translate-only system prompt, chat text passed as the user message, `max_tokens` 120, output trimmed and capped at 400 chars; a normalized match with the input reports "already English". The client renders `textContent` only, labeled "translated", appended outside `buildRow`. Log line `ev:translate {ok, reason, ms, inTok, outTok, neuronsEst}` — never the input or output text.
+
+## [2026.10.12.1]
+
+### Changed
+- **Verified tick is a CSS-drawn badge, not a text glyph.** `span.verified` (shared `buildRow`) is now an empty element rendered as a filled round badge with the check as `::before` content, on the PWA, the overlay and the config preview. A `✓` typed into a display name stays plain name text — no element, no badge — so it cannot imitate the real tick. Display names are never rewritten.
+- **Name-tap sheet polish (PWA).** While the sheet is open the feed behind it is frozen (`body.sheet-open`, `overscroll-behavior: contain`, a touchmove guard on the dim area) so iPhone cannot scroll the feed through the backdrop; the lock releases on every close path (backdrop tap, close button, Escape all route through `closeSheet`). Focus moves into the dialog and is restored on close. Pointer cursor is feed-only (`#feed .user`); sheet colors are `:root` tokens.
+
+### Fixed
+- **yt-poller: `poller_heartbeat` counts 400/413 drops as `dropped`, never `failed`.** New per-cycle `dropped` field next to `failed`; `failed` is now only real delivery failures.
+- **yt-poller: every rediscovery probe that returns no videoId logs its reason.** `yt_rediscovery` lines carry `reason` (`error_event` | `timeout` | `start_rejected` | `empty_live_id`), a capped `detail`, and `cleanupError` when the probe's `stop()` threw (`probeCurrentLive`, `rediscovery.mjs`).
+
+## [2026.10.11.1]
+
+### Added
+- **PWA name-tap history sheet.** Tapping a username in the feed opens a bottom sheet with every message from that same platform account seen since page open, newest on top, deleted rows struck, updating live, closed by a backdrop tap, the close button or Escape. Backed by two new `src/lib.js` helpers: `userKeyOf` (key is `tw:<login>` or `yt:<authorId>`, never the display name; `sys` rows and accounts with no stable id are not tappable) and `createMessageStore` (bounded in-memory list, last 2,000 messages overall, fed only by frames that passed the seen-id gate, gone on reload). Sheet rows go through `buildRow` directly, so nothing new buzzes, speaks or enters TTS. PWA only; overlay untouched.
+- **YouTube verified tick.** Verified channels show a small tick after the name, inside `span.user`, rendered by the shared `buildRow` so the overlay shows it too. The poller forwards the stock parser's `isVerified` as `verified`, and `normalizeYt` / `pushMessage` accept a strict boolean `true` only. No color or precedence change.
+- **Poller `docker-compose.override.yml.example`** for a host-persisted `/app/capture` volume, so capture files survive a container recreate.
+
+### Changed
+- **PWA `.user` gets `margin-right: 4px`**, so feed rows read "name: text" with a visible gap (the overlay already had it). No text change.
+- **YouTube custom emoji uses the 48px thumbnail**, falling back to the first thumbnail when none is 48px (new hunk in `patches/youtube-chat+2.2.0.patch`).
+
+### Fixed
+- **yt-poller: a 400 or 413 ingest reply never blocks chat.** Such a reply drops that item on its first failure (`isPayloadRejection`, `retry-queue.mjs`) and logs `ingest_dropped` with no body. A batch whose only non-sent items were dropped no longer doubles the drain backoff, so a poison item never holds chat.
+- **yt-poller: back-to-back handoff is blind under 100 s with no `too_soon` skips.** `REDISCOVERY_MIN` 5 → 2, and the probe gate `REDISCOVERY_GATE_MS` sits one heartbeat tick under the cadence (105 s / 120 s). Rediscovery log lines now carry the resolved liveness instead of a `not_live` literal.
+
+## [2026.09.23.1]
+
+### Changed
+- **Inline Twitch emotes render at the 2.0 CDN tier (was 1.0)** — crisper on 3x/HiDPI screens, displayed size unchanged (`.emote { height: 1.4em }` already pins render height regardless of the source image's pixel density). Twitch only; YouTube custom-emoji rendering is untouched. Gigantify's dedicated 3.0-scale image (`.emote.gigantify`) is unaffected — this only touches the plain-inline emote path in `renderText` (`src/lib.js`).
+
+## [2026.09.22.1]
+
+### Changed
+- **Reactions strip persists 60s (was 10s).** `REACTIONS_WINDOW_MS` on the PWA topbar bumped from `10_000` to `60_000` so a burst stays visible longer after it fades — the YT-not-live hide path and `YT_REACTIONS_STALE_MS` (server-side decay, unrelated) are untouched, they were already independent of the client window.
+- **Reaction counts now format as `1.2k`/`1M`** via the existing `formatCount` helper (already interpolated into the PWA script for the chip counts), instead of raw integers, so a large burst doesn't blow out the topbar row.
+- **Topbar refresh button (`↻`) removed.** Pull-to-refresh is now the only manual reconnect trigger on the PWA; `refreshReconnect()` and the shared reconnect core are unchanged. Overlay, overlay-config, poller, and DO untouched.
+
+### Fixed
+- `#reactions` gets `min-width: 0; overflow: hidden` so a full 4-emoji strip can never push the viewer/likes/followers chips off a 390px viewport.
+
 ## [2026.09.15.1]
 
 ### Fixed

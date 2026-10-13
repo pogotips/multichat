@@ -4,9 +4,10 @@
 // probe re-spacing independent of caller bookkeeping, single-flight, and
 // probe robustness (rejection/timeout never surfacing as an unhandled
 // rejection or a stuck in-flight guard).
+import { readFileSync } from 'node:fs';
 import { describe, it, expect, vi } from 'vitest';
 import { EventEmitter } from 'node:events';
-import { probeCurrentLiveId, createRediscoveryGate, resolveRediscoveryOutcome, DEFAULT_PROBE_TIMEOUT_MS } from '../rediscovery.mjs';
+import { probeCurrentLiveId, createRediscoveryGate, resolveRediscoveryOutcome, formatRediscoveryLog, DEFAULT_PROBE_TIMEOUT_MS } from '../rediscovery.mjs';
 
 // Minimal LiveChat-shaped fake — only what probeCurrentLiveId touches:
 // constructor(id), on(event, cb), start(), stop(reason), removeAllListeners().
@@ -287,5 +288,20 @@ describe('probe/real-session isolation (LOW)', () => {
       .filter((ev) => ev === 'yt_session_start' || ev === 'yt_session_end');
     expect(sessionEvents).toEqual([]);
     logSpy.mockRestore();
+  });
+});
+
+describe('yt_rediscovery log liveness', () => {
+  it('formatRediscoveryLog logs the liveness it is given, never a constant', () => {
+    for (const liveness of ['not_live', 'unknown', 'live', 'gate_off']) {
+      expect(JSON.parse(formatRediscoveryLog(liveness, { changed: false, outcome: 'skipped_too_soon' })))
+        .toEqual({ ev: 'yt_rediscovery', liveness, changed: false, outcome: 'skipped_too_soon' });
+    }
+  });
+  it('poller.mjs passes the resolved liveness through: no hardcoded liveness literal on any rediscovery log line', () => {
+    const src = readFileSync(new URL('../poller.mjs', import.meta.url), 'utf8');
+    expect(src).not.toMatch(/ev: 'yt_rediscovery'/);
+    expect(src.match(/formatRediscoveryLog\(liveness,/g)).toHaveLength(4);
+    expect(src).toContain('runRediscoveryProbe(liveness).catch(');
   });
 });

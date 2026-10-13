@@ -72,6 +72,13 @@ describe('parsePrivmsg', () => {
     expect(parsed.text).toBe('Kappa 🎉 héllo');
   });
 
+  it('carries custom-reward-id as rewardId, and omits the key without it', () => {
+    const withId = '@custom-reward-id=abc-123;display-name=Foo :foo!foo@foo.tmi.twitch.tv PRIVMSG #chan :read me';
+    expect(parsePrivmsg(withId).rewardId).toBe('abc-123');
+    const without = '@display-name=Foo :foo!foo@foo.tmi.twitch.tv PRIVMSG #chan :read me';
+    expect(parsePrivmsg(without)).not.toHaveProperty('rewardId');
+  });
+
   it('returns null for malformed or non-PRIVMSG lines', () => {
     expect(parsePrivmsg('not an irc line')).toBeNull();
     expect(parsePrivmsg(':foo!foo@foo.tmi.twitch.tv JOIN #chan')).toBeNull();

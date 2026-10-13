@@ -24,7 +24,14 @@
 		// Chat display-name for self-mention highlighting. Independent of
 		// TWITCH_CHANNEL (that's the login, this is the display name used in
 		// chat). Leave blank to disable highlighting.
-		"MULTICHAT_MY_NAME": ""
+		"MULTICHAT_MY_NAME": "",
+		// Optional. Extra words the phone TTS speaks as "bleep", comma-separated
+		// (whole-word in chat text, substring in usernames — keep them unambiguous).
+		// Empty = built-in list only.
+		"MULTICHAT_TTS_EXTRA_CURSES": "",
+		// Optional. Twitch channel-point reward id whose chat message the phone
+		// reads aloud once (teal row). Empty = off, the message is normal chat.
+		"MULTICHAT_TTS_REWARD_ID": ""
 	},
 	"durable_objects": {
 		"bindings": [

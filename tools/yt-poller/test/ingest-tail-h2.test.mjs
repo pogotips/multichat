@@ -42,9 +42,9 @@ async function drainLoopMirror(queue, sendFn, initialBackoffMs, maxBackoffMs) {
     return sendFn(item);
   };
   while (queue.length > 0) {
-    const { attempted, sent } = await drainBatch(queue, timedSendFn, SEND_CONCURRENCY);
+    const { attempted, sent, dropped } = await drainBatch(queue, timedSendFn, SEND_CONCURRENCY);
     if (attempted === 0) break;
-    if (sent < attempted) {
+    if (sent + dropped < attempted) {
       retryBackoffMs = Math.min(retryBackoffMs * 2, maxBackoffMs);
       await sleep(retryBackoffMs);
     } else {

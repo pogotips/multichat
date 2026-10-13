@@ -49,3 +49,11 @@ MULTICHAT_OVERLAY_SECRET="replace-with-random-string"
 # `wrangler dev`. Independent of TWITCH_CHANNEL (that's the login, this is
 # the display name used in chat). Unset/blank disables highlighting.
 MULTICHAT_MY_NAME=""
+
+# Optional. Extra words the phone TTS speaks as "bleep", comma-separated
+# (whole-word in chat text, substring in usernames). Blank = built-in list only.
+MULTICHAT_TTS_EXTRA_CURSES=""
+
+# Optional. Twitch channel-point reward id whose chat message the phone reads
+# aloud once (teal row). Blank = off, the message is normal chat.
+MULTICHAT_TTS_REWARD_ID=""

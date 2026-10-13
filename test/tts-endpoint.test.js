@@ -291,7 +291,7 @@ describe('POST /overlay/admin — auth restored, shares MULTICHAT_OVERLAY_SECRET
     expect(res.status).toBe(401);
   });
 
-  it('the ingest secret has NO authority here (R2) — vid poller value, rotated after a leak, must not gain kill-switch authority', async () => {
+  it('the ingest secret has NO authority here (R2) — poller-host value, rotated after a leak, must not gain kill-switch authority', async () => {
     const env = makeTtsEnv({ MULTICHAT_INGEST_SECRET: 'ingest-secret-test' });
     const res = await postAdmin(env, { op: 'tts_kill', on: true }, 'ingest-secret-test');
     expect(res.status).toBe(401);

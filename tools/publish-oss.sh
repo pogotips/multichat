@@ -3,21 +3,28 @@
 # Overwrite-only: monorepo multichat/ is the source of truth, ~/multichat-oss
 # is the publish target. This script never pushes — it stops after commit.
 #
-# Usage: publish-oss.sh [--yes] [commit message]
-#   --yes   skip the interactive confirm and commit immediately.
-#           Without it, non-interactive stdin (no tty) refuses to commit
-#           (exit 2) instead of silently aborting — DST stays staged either way.
+# Usage: publish-oss.sh [--yes] [--stage-only] [commit message]
+#   --yes         skip the interactive confirm and commit immediately.
+#                 Without it, non-interactive stdin (no tty) refuses to
+#                 commit (exit 2) BEFORE anything is written to DST.
+#   --stage-only  run staging + every gate, then exit — never syncs into
+#                 or otherwise touches DST. Exit status reflects the gates
+#                 (0 = all clear, 1 = a gate failed).
 set -euo pipefail
 
 SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
 SRC="$(dirname -- "$SCRIPT_DIR")/"
 DST="${HOME}/multichat-oss"
 
+source "${SCRIPT_DIR}/oss-forbidden-patterns.sh"
+
 YES=0
+STAGE_ONLY=0
 args=()
 for arg in "$@"; do
   case "$arg" in
     --yes) YES=1 ;;
+    --stage-only) STAGE_ONLY=1 ;;
     *) args+=("$arg") ;;
   esac
 done
@@ -42,23 +49,12 @@ trap 'rm -rf "$STAGE"' EXIT
 rsync -a --exclude-from="${SRC}.oss-exclude" "$SRC" "$STAGE/"
 
 # --- Sweep gate: scan the STAGE for private strings before touching $DST ---
+# FORBIDDEN / FORBIDDEN_WORDS come from oss-forbidden-patterns.sh (sourced
+# above) — kept out of publish-oss.sh itself because this script IS
+# published (see .oss-exclude); an inline list would ship the very
+# literals it exists to block.
 
-FORBIDDEN=(
-  '87f04ad1710df9279714f094339c3b2d'
-  '192.168.'
-  'term@'
-  '/opt/stacks'
-  'pogo-raid-queue'
-  'tips@warner.me'
-  'multichat.pogo.tips'
-  'ingest-tail-findings'
-  'superpowers'
-  'TRIAGE_'
-  'GLITCH_AUDIT'
-  'BACKLOG.md'
-)
-
-grep_args=(-rIn --exclude-dir=.git --exclude-dir=node_modules --exclude-dir=.wrangler --exclude=publish-oss.sh --exclude=oss-filename-leak-check.mjs --exclude=oss-filename-leak-check.test.mjs --exclude=publish-oss-forbidden-gate.test.mjs --exclude=publish-oss-post-sync-check.test.mjs -i)
+grep_args=(-rIn --exclude-dir=.git --exclude-dir=node_modules --exclude-dir=.wrangler --exclude=publish-oss.sh --exclude=oss-filename-leak-check.mjs --exclude=oss-filename-leak-check.test.mjs --exclude=publish-oss-forbidden-gate.test.mjs --exclude=publish-oss-post-sync-check.test.mjs --exclude=publish-oss-e2e.test.mjs -i)
 for term in "${FORBIDDEN[@]}"; do
   grep_args+=(-F -e "$term")
 done
@@ -70,8 +66,26 @@ if [ -n "$forbidden_hits" ]; then
   exit 1
 fi
 
-# pogotips / pogo.tips allowed only at LICENSE:3 and README.md:66
-brand_hits="$(grep -rIn --exclude-dir=.git --exclude-dir=node_modules --exclude-dir=.wrangler --exclude=publish-oss.sh -i -F -e 'pogotips' -e 'pogo.tips' "$STAGE" || true)"
+# Whole-word forbidden literals (short strings that would false-positive as
+# plain substrings, e.g. a short word inside "video"/"provide") — same exclude
+# list, `-w` added so only a standalone-word match trips it.
+word_grep_args=(-rIn -w --exclude-dir=.git --exclude-dir=node_modules --exclude-dir=.wrangler --exclude=publish-oss.sh --exclude=oss-filename-leak-check.mjs --exclude=oss-filename-leak-check.test.mjs --exclude=publish-oss-forbidden-gate.test.mjs --exclude=publish-oss-post-sync-check.test.mjs --exclude=publish-oss-word-forbidden-gate.test.mjs --exclude=publish-oss-e2e.test.mjs -i)
+for term in "${FORBIDDEN_WORDS[@]}"; do
+  word_grep_args+=(-F -e "$term")
+done
+
+forbidden_word_hits="$(grep "${word_grep_args[@]}" "$STAGE" || true)"
+if [ -n "$forbidden_word_hits" ]; then
+  echo "abort: forbidden private words found in staged export — fix before publishing ($DST untouched):" >&2
+  printf '%s\n' "$forbidden_word_hits" >&2
+  exit 1
+fi
+
+# The two brand strings (built below so this published script carries neither
+# literal) are allowed only at LICENSE:3 and README.md:66
+BRAND_A="pogo""tips"
+BRAND_B="pogo"".tips"
+brand_hits="$(grep -rIn --exclude-dir=.git --exclude-dir=node_modules --exclude-dir=.wrangler --exclude=publish-oss.sh -i -F -e "$BRAND_A" -e "$BRAND_B" "$STAGE" || true)"
 brand_violations=""
 if [ -n "$brand_hits" ]; then
   while IFS= read -r hit; do
@@ -91,7 +105,7 @@ if [ -n "$brand_hits" ]; then
 fi
 
 if [ -n "$brand_violations" ]; then
-  echo "abort: pogotips/pogo.tips found outside the allowed LICENSE:3 / README.md:66 lines ($DST untouched):" >&2
+  echo "abort: brand strings found outside the allowed LICENSE:3 / README.md:66 lines ($DST untouched):" >&2
   printf '%s' "$brand_violations" >&2
   exit 1
 fi
@@ -107,32 +121,18 @@ if ! node "${SCRIPT_DIR}/oss-filename-leak-check.mjs" "$STAGE"; then
   exit 1
 fi
 
-# --- Gate cleared — now, and only now, sync into $DST ---
-
-# --exclude-from is REQUIRED here, not just on the SRC->STAGE pass above.
-# (2026-08-08 incident: this rsync ran with --delete and no exclude-from —
-# STAGE never contains .git since it's excluded on the first pass, so
-# --delete read that as "DST/.git isn't in the source, remove it" and wiped
-# the target repo's git history. rsync only protects a destination path
-# from --delete when that path also matches an active exclude pattern; drop
-# this flag and DST/.git is unprotected again.)
-rsync -a --delete --exclude-from="${SRC}.oss-exclude" "$STAGE/" "$DST"
-
-test -d "$DST/.git" || {
-  echo "abort: $DST/.git is missing after sync — the publish step just" >&2
-  echo "destroyed the target repo's git history. Do not proceed. Re-clone" >&2
-  echo "$DST from its remote before running this script again." >&2
-  exit 1
-}
-
 # --- Post-sync check: rsync --delete --exclude-from protects an excluded
-# path in $DST from deletion the same way it protects $DST/.git above — so a
+# path in $DST from deletion the same way it protects $DST/.git below — so a
 # doc that becomes newly excluded never actually leaves $DST on its own.
 # (2026-09-19: FASTFOLLOW_BATCH.md sat tracked and pushed in the public repo
 # for weeks after being added to .oss-exclude, because this sync only ever
 # adds/updates, never prunes an excluded destination path.) Abort here so a
 # stale excluded doc forces an explicit `git rm` in $DST before the publish
-# can complete, rather than silently staying public forever.
+# can complete, rather than silently staying public forever. This reads
+# $DST's existing tracked file list only — it needs no sync to have run
+# (rsync never changes what's tracked; only `git add`/`commit` below does),
+# so it's safe to run before ever touching $DST, ahead of --stage-only and
+# the pre-write tty guard.
 stale_hits=""
 while IFS= read -r pattern; do
   case "$pattern" in
@@ -157,6 +157,36 @@ if [ -n "$stale_hits" ]; then
   exit 1
 fi
 
+# --- Gates cleared ---
+
+if [ "$STAGE_ONLY" -eq 1 ]; then
+  echo "stage-only: all gates passed, $DST untouched"
+  exit 0
+fi
+
+if [ "$YES" -ne 1 ] && [ ! -t 0 ]; then
+  echo "publish-oss: non-interactive and no --yes, refusing to commit ($DST untouched)" >&2
+  exit 2
+fi
+
+# --- Now, and only now, sync into $DST ---
+
+# --exclude-from is REQUIRED here, not just on the SRC->STAGE pass above.
+# (2026-08-08 incident: this rsync ran with --delete and no exclude-from —
+# STAGE never contains .git since it's excluded on the first pass, so
+# --delete read that as "DST/.git isn't in the source, remove it" and wiped
+# the target repo's git history. rsync only protects a destination path
+# from --delete when that path also matches an active exclude pattern; drop
+# this flag and DST/.git is unprotected again.)
+rsync -a --delete --exclude-from="${SRC}.oss-exclude" "$STAGE/" "$DST"
+
+test -d "$DST/.git" || {
+  echo "abort: $DST/.git is missing after sync — the publish step just" >&2
+  echo "destroyed the target repo's git history. Do not proceed. Re-clone" >&2
+  echo "$DST from its remote before running this script again." >&2
+  exit 1
+}
+
 # --- Commit in DST ---
 
 cd "$DST"
@@ -171,9 +201,6 @@ git diff --stat --cached
 
 if [ "$YES" -eq 1 ]; then
   confirm=y
-elif [ ! -t 0 ]; then
-  echo "publish-oss: non-interactive and no --yes, refusing to commit" >&2
-  exit 2
 else
   read -r -p "publish? [y/N] " confirm
 fi
@@ -183,6 +210,7 @@ if [ "$confirm" != "y" ] && [ "$confirm" != "Y" ]; then
   exit 0
 fi
 
-commit_msg="${args[0]:-sync from private}"
+SRC_SHA="$(git -C "$SRC" rev-parse --short HEAD)"
+commit_msg="${args[0]:-sync from private ${SRC_SHA}}"
 git commit -m "$commit_msg"
 echo "now run: git push"

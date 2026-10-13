@@ -103,6 +103,7 @@ wrangler secret put MULTICHAT_OVERLAY_SECRET   # optional — OBS overlay, /tts,
 > | `wrangler.jsonc` | your local checkout | `wrangler.jsonc.example` |
 > | `.dev.vars` | your local checkout | `.dev.vars.example` |
 > | `docker-compose.yml` (poller stack dir on the poller host) | the poller host | `tools/yt-poller/docker-compose.yml.example` |
+> | `docker-compose.override.yml` (poller stack dir on the poller host) | the poller host | `tools/yt-poller/docker-compose.override.yml.example` |
 >
 > None of these are reachable by `rsync`, `git checkout`, or any rollback
 > tag — the poller host's `docker-compose.yml` in particular is never

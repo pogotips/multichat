@@ -205,6 +205,7 @@ export function normalizeChatItem(item) {
   if (amount) msg.amount = amount;
   if (item.isModerator || item.isOwner) msg.isMod = true;
   if (item.isMembership) msg.isMember = true;
+  if (item.isVerified === true) msg.verified = true;
   if (item.author?.channelId) msg.authorId = item.author.channelId;
   // Only attach emotes when finalText is exactly the plain-message text —
   // member_milestone concatenates a header ("Member for N months — ..."),

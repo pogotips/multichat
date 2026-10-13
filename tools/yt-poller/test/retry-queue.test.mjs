@@ -1,7 +1,8 @@
-import { describe, it, expect } from 'vitest';
+import { readFileSync } from 'node:fs';
+import { describe, it, expect, vi, afterEach } from 'vitest';
 import {
   enqueueRetry, drainBatch, isRetryable, RETRY_QUEUE_MAX, SEND_CONCURRENCY, nextAttempt,
-  formatIngestFailureLog, formatIngestErrorLog,
+  formatIngestFailureLog, formatIngestErrorLog, noteSendStatus, isPayloadRejection,
 } from '../retry-queue.mjs';
 
 describe('nextAttempt', () => {
@@ -113,7 +114,7 @@ describe('drainBatch', () => {
     }, 4);
     expect(sent.sort()).toEqual(['a', 'b', 'c']);
     expect(queue).toEqual([]);
-    expect(result).toEqual({ attempted: 3, sent: 3 });
+    expect(result).toEqual({ attempted: 3, sent: 3, dropped: 0 });
   });
 
   it('only claims `concurrency` items when the queue is larger', async () => {
@@ -144,7 +145,7 @@ describe('drainBatch', () => {
   it('requeues failures at the front, preserving their relative order', async () => {
     const queue = ['a', 'b', 'c'];
     const result = await drainBatch(queue, async (item) => item !== 'a' && item !== 'c', 4);
-    expect(result).toEqual({ attempted: 3, sent: 1 });
+    expect(result).toEqual({ attempted: 3, sent: 1, dropped: 0 });
     expect(queue).toEqual(['a', 'c']); // failures back in original relative order
   });
 
@@ -161,12 +162,127 @@ describe('drainBatch', () => {
   it('no-ops on an empty queue', async () => {
     const queue = [];
     const result = await drainBatch(queue, async () => true, 4);
-    expect(result).toEqual({ attempted: 0, sent: 0 });
+    expect(result).toEqual({ attempted: 0, sent: 0, dropped: 0 });
   });
 
   it('defaults concurrency to SEND_CONCURRENCY', async () => {
     const queue = Array.from({ length: SEND_CONCURRENCY + 2 }, (_, i) => i);
     const result = await drainBatch(queue, async () => true);
     expect(result.attempted).toBe(SEND_CONCURRENCY);
+  });
+});
+
+// Poison-message handling: sendOnce (poller.mjs) records the HTTP status of a
+// failed send via noteSendStatus; drainBatch drops an item whose status is a
+// payload rejection (400/413 — decided by the body alone, so a retry can never
+// change the answer) and keeps retrying everything else. Concurrency 1 here
+// makes the head-of-line block observable: a poisoned head item that is put
+// back every round starves everything queued behind it.
+describe('drainBatch poison handling', () => {
+  afterEach(() => vi.restoreAllMocks());
+
+  // Mirrors sendOnce: record the status for the message, return falsy.
+  const failWith = (msg, status) => {
+    noteSendStatus(msg, status);
+    return false;
+  };
+
+  it('drops a payload-rejected head item after one attempt; the item behind it delivers in the same drain', async () => {
+    const log = vi.spyOn(console, 'log').mockImplementation(() => {});
+    const poison = { type: 'bogus_type', ytId: 'yt-poison' };
+    const good = { user: 'Alice', text: 'hi', ytId: 'yt-good' };
+    const queue = [poison, good];
+    const delivered = [];
+    const attempts = new Map();
+    const sendFn = async (m) => {
+      attempts.set(m, (attempts.get(m) || 0) + 1);
+      if (m === poison) return failWith(m, 400);
+      delivered.push(m);
+      return true;
+    };
+    // Same loop shape as poller.mjs drainLoop, bounded so unfixed code can't hang.
+    for (let i = 0; i < 3 && queue.length > 0; i++) await drainBatch(queue, sendFn, 1);
+    expect(delivered).toEqual([good]);
+    expect(queue).toEqual([]);
+    expect(attempts.get(poison)).toBe(1);
+    const lines = log.mock.calls.map((c) => JSON.parse(c[0])).filter((l) => l.ev === 'ingest_dropped');
+    expect(lines).toEqual([{ ev: 'ingest_dropped', status: 400, type: 'bogus_type', id: 'yt-poison' }]);
+  });
+
+  it('drops a 413 too, and the log line carries no body, url or headers', async () => {
+    const log = vi.spyOn(console, 'log').mockImplementation(() => {});
+    const msg = { user: 'Bob', text: 'SECRET-BODY-TEXT', authorId: 'author-1' };
+    const queue = [msg];
+    await drainBatch(queue, async (m) => failWith(m, 413), 1);
+    expect(queue).toEqual([]);
+    const out = log.mock.calls.map((c) => c[0]).join('\n');
+    expect(out).toContain('"status":413');
+    expect(out).toContain('author-1');
+    expect(out).not.toContain('SECRET-BODY-TEXT');
+  });
+
+  it.each([401, 403, 404, 408, 429, 500, 502, 503])('%i keeps retrying — requeued at the front, never dropped', async (status) => {
+    const log = vi.spyOn(console, 'log').mockImplementation(() => {});
+    const msg = { user: 'Alice', text: 'hi' };
+    const queue = [msg];
+    const result = await drainBatch(queue, async (m) => failWith(m, status), 1);
+    expect(result).toEqual({ attempted: 1, sent: 0, dropped: 0 });
+    expect(queue).toEqual([msg]);
+    expect(log).not.toHaveBeenCalled();
+  });
+
+  it('reports drops separately from sent, so a drainLoop backoff check of sent + dropped < attempted ignores them', async () => {
+    vi.spyOn(console, 'log').mockImplementation(() => {});
+    const a = { type: 'bogus', ytId: 'a' };
+    const b = { type: 'bogus', ytId: 'b' };
+    const c = { user: 'Alice', text: 'hi' };
+    const queue = [a, b, c];
+    const result = await drainBatch(queue, async (m) => (m === c ? true : failWith(m, 400)), 4);
+    expect(result).toEqual({ attempted: 3, sent: 1, dropped: 2 });
+    expect(result.sent + result.dropped < result.attempted).toBe(false);
+    const transient = await drainBatch([{ user: 'Bob', text: 'x' }], async (m) => failWith(m, 503), 4);
+    expect(transient.sent + transient.dropped < transient.attempted).toBe(true);
+  });
+
+  it('a network error (no status recorded) keeps retrying', async () => {
+    const msg = { user: 'Alice', text: 'hi' };
+    const queue = [msg];
+    await drainBatch(queue, async () => false, 1);
+    expect(queue).toEqual([msg]);
+  });
+
+  it('sendOnce clears the recorded status on a network error, so an earlier status never lingers', async () => {
+    const msg = { user: 'Alice', text: 'hi' };
+    const queue = [msg];
+    await drainBatch(queue, async (m) => failWith(m, 503), 1); // attempt 1: 503 recorded
+    await drainBatch(queue, async (m) => { noteSendStatus(m, undefined); return false; }, 1); // attempt 2: network error
+    expect(queue).toEqual([msg]);
+    await drainBatch(queue, async (m) => { noteSendStatus(m, undefined); return true; }, 1);
+    expect(queue).toEqual([]);
+  });
+});
+
+describe('isPayloadRejection', () => {
+  it('is true only for 400 and 413', () => {
+    expect(isPayloadRejection(400)).toBe(true);
+    expect(isPayloadRejection(413)).toBe(true);
+    for (const s of [200, 401, 403, 404, 408, 429, 500, 503, undefined, null]) {
+      expect(isPayloadRejection(s)).toBe(false);
+    }
+  });
+});
+
+// sendOnce lives in poller.mjs, which is not import-safe in a test process, so
+// pin the wiring by source: both failure paths must record the status that
+// drainBatch reads, or poison items silently go back to being retried forever.
+describe('poller.mjs wiring of the poison-drop status', () => {
+  const src = readFileSync(new URL('../poller.mjs', import.meta.url), 'utf8');
+  const sendOnce = src.slice(src.indexOf('async function sendOnce'), src.indexOf('async function drainLoop'));
+  it('sendOnce records the HTTP status on a non-ok response and clears it on a network error', () => {
+    expect(sendOnce).toContain('noteSendStatus(msg, res.ok ? undefined : res.status);');
+    expect(sendOnce).toMatch(/catch \(err\) \{[\s\S]*noteSendStatus\(msg, undefined\);/);
+  });
+  it('drainLoop backs off only for failures that are neither sent nor dropped', () => {
+    expect(src).toContain('sent + dropped < attempted');
   });
 });

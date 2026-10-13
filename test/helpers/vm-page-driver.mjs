@@ -85,6 +85,12 @@ export function driveClientScriptSession(scriptSrc, opts = {}) {
     location: locationOverrides = {},
     localStorage: initialLocalStorage = {},
     fetch: fetchImpl = () => Promise.reject(new Error('no network in vm-page-driver')),
+    // Optional fake window.speechSynthesis + SpeechSynthesisUtterance for TTS tests.
+    speechSynthesis: speechSynthesisImpl,
+    SpeechSynthesisUtterance: utteranceImpl,
+    // Extra sandbox globals (e.g. the vitest SSR import binding an interpolated
+    // worker.js helper still references when run unbundled).
+    extraGlobals = {},
   } = opts;
   FakeEventSource.lastInstance = null;
   const feed = new FakeElement('div');
@@ -116,7 +122,7 @@ export function driveClientScriptSession(scriptSrc, opts = {}) {
   const sandbox = {
     document: fakeDocument,
     window: {
-      speechSynthesis: undefined,
+      speechSynthesis: speechSynthesisImpl,
       addEventListener: () => {},
       removeEventListener: () => {},
       location,
@@ -136,6 +142,7 @@ export function driveClientScriptSession(scriptSrc, opts = {}) {
     location,
     history: { replaceState: () => {} },
     fetch: fetchImpl,
+    SpeechSynthesisUtterance: utteranceImpl,
     setInterval: () => 0,
     clearInterval: () => {},
     setTimeout: () => 0,
@@ -149,6 +156,7 @@ export function driveClientScriptSession(scriptSrc, opts = {}) {
     JSON,
     Set,
     Map,
+    ...extraGlobals,
   };
   sandbox.globalThis = sandbox;
   vm.createContext(sandbox);

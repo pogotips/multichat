@@ -73,27 +73,118 @@ export const TTS_LABELS = {
 // recent can still fire. Shared by the client predicate and its test.
 export const EMIT_TTL_MS = 30 * 60_000;
 
-// Spoken-name cleanup for TTS only — see the internal dry-run notes
-// (2026-08-05) for the approved regex and the deferred Step2 (separator-segment strip,
-// e.g. darc-ttv -> darc) this deliberately does NOT implement yet. Strips a
-// trailing digit run, absorbing one immediately-preceding `_`/`-` in the same
-// match so `cool_guy_99` -> `cool_guy` rather than leaving a dangling
-// separator. Guards against over-stripping an identity down to nothing or
-// near-nothing (an all-digit name, or a 1-char remainder) by returning the
-// original name unchanged in that case.
+// Spoken-name cleanup for TTS only (rule of 2026-10-12; supersedes the
+// 2026-08-05 trailing-digit-only Step1, the deferred Step2 separator-segment
+// strip e.g. darc-ttv -> darc is still NOT implemented). Rules, in order:
+//  1. Leading @s are stripped (a raw "@Jon_123" in msg.user must not be read
+//     as "at Jon underscore..."); a bare "@" falls back to the raw name.
+//  2. If the name has at least 3 letters BEFORE its first digit, cut at that
+//     first digit and drop a dangling _ - . or whitespace run:
+//     RRR0O08B8 -> RRR, wiccedrasta9981 -> wiccedrasta, cool_guy_99 -> cool_guy.
+//  3. Otherwise only a trailing digit run (plus one preceding _/-) is
+//     stripped, as before: "2pac" and "l33thax0r" keep their digits.
+//  4. Junk guard, ONLY for names that contained a digit: fewer than 3 letters
+//     in the result, or more digits than letters, is not pronounceable as a
+//     name -> "someone" (x9z8, 12345, A1, Jo_5). A name with no digit at all
+//     is returned as-is (Ed, Al, a bare "@x" -> "x"), never replaced.
+// Non-Latin names (\p{L}) with no digits pass through untouched. Flat:
+// interpolated into the PWA and the overlay (no nested named functions).
 export function cleanSpokenName(name) {
-  // Leading-@ strip runs FIRST, before the digit strip and before the
-  // <2-char guard below -- so a chat client that carries a raw "@Jon_123"
-  // into msg.user (rather than "Jon_123") still ends up read aloud as
-  // "Jon", not "at Jon underscore one two three". Never returns empty:
-  // deAt falls back to the ORIGINAL name if stripping leading @s alone
-  // would empty the string (a bare "@"), and the final guard falls back to
-  // deAt (not all the way to the un-stripped name) once deAt is known
-  // non-empty -- so "@x" cleans to "x", not "@x".
-  const deAt = name.replace(/^@+/, '');
-  const base = deAt.length > 0 ? deAt : name;
-  const cleaned = base.replace(/[_-]?\d+$/, '');
-  return cleaned.length < 2 ? base : cleaned;
+  const raw = String(name || '');
+  const deAt = raw.replace(/^@+/, '');
+  const base = deAt.length > 0 ? deAt : raw;
+  const idx = base.search(/\p{Nd}/u);
+  if (idx === -1) return base;
+  const lead = idx === -1 ? 0 : (base.slice(0, idx).match(/\p{L}/gu) || []).length;
+  const cleaned = idx !== -1 && lead >= 3
+    ? base.slice(0, idx).replace(/[_\-.\s]+$/u, '')
+    : base.replace(/[_-]?\p{Nd}+$/u, '');
+  const letters = (cleaned.match(/\p{L}/gu) || []).length;
+  const digits = (cleaned.match(/\p{Nd}/gu) || []).length;
+  if (letters < 3 || digits > letters) return 'someone';
+  return cleaned;
+}
+
+// "@RRR0O08B8 lol" is spoken "RRR lol": a word that starts with @ at a word
+// boundary (start of text or after whitespace) is replaced by its spoken
+// name (cleanSpokenName rule above). Emails (a@b.com) and plain words are
+// untouched. Flat: interpolated into the PWA.
+export function cleanSpokenMentions(text, extra) {
+  return String(text || '').replace(/(^|\s)@([\p{L}\p{N}_]+)/gu, (m, pre, handle) => pre + spokenNameFor(handle, extra));
+}
+
+// ── Spoken-text curse filter ───────────────────────────────────────────
+// Whole-word body list (keys are lowercase letters only, after the leet map
+// below). Includes slurs on purpose: this is what must never be read aloud.
+export const SPOKEN_CURSE_WORDS = [
+  'fuck','fucker','fuckers','fucking','fucked','motherfucker','motherfucking',
+  'shit','shitty','shits','bullshit','horseshit','cunt','cunts','bitch','bitches',
+  'asshole','assholes','ass','arse','arsehole','dick','dickhead','cock','cocksucker',
+  'pussy','twat','wanker','bastard','goddamn','piss','pissed','whore','slut',
+  'nigger','niggers','nigga','niggas','faggot','faggots','fag','fags',
+  'retard','retarded','retards','kike','spic','chink','wetback','tranny','dyke',
+  'cum','jizz','tits','titties','dildo','rape','rapist',
+];
+// Unambiguous strong subset: matched at the START or END of a username
+// SEGMENT (names split on non-alphanumerics and camelCase humps, so
+// "ShitLord" and "bigshit" hit but "YoshiTheDino"/"Michishita" do not), and as
+// a PREFIX of body words only when the rest is a real inflection ("fucking",
+// "shitty", "bitches"; not "niggling"). Deliberately excludes anything that
+// appears inside ordinary words/names (ass, cock, dick, cunt -> Scunthorpe,
+// rapist -> therapist).
+export const SPOKEN_CURSE_STRONG = ['fuck','shit','nigg','fagg','bitch','whore','retard','kike','tranny'];
+
+// Lowercase, undo common leet substitutions, keep letters plus a '*'
+// wildcard ('@' and '*' both stand for one unknown letter: f@ck, f*ck).
+// Flat: interpolated into the PWA and the overlay.
+export function spokenCurseKey(word) {
+  return String(word || '').toLowerCase()
+    .replace(/0/g, 'o').replace(/1/g, 'i').replace(/3/g, 'e').replace(/4/g, 'a')
+    .replace(/5/g, 's').replace(/7/g, 't').replace(/\$/g, 's')
+    .replace(/@/g, '*')
+    .replace(/[^\p{L}*]/gu, '');
+}
+
+// extra: optional array of additional whole-word keys (server var).
+export function isSpokenCurse(word, extra) {
+  if (!/\p{L}/u.test(String(word || ''))) return false; // digit-only tokens ("455") are numbers, not leet
+  const k = spokenCurseKey(word);
+  if (!/\p{L}/u.test(k)) return false;
+  const list = Array.isArray(extra) ? SPOKEN_CURSE_WORDS.concat(extra) : SPOKEN_CURSE_WORDS;
+  if (k.includes('*')) {
+    const re = new RegExp('^' + k.replace(/\*/g, '.') + '$', 'u');
+    return list.some((w) => re.test(w));
+  }
+  return list.includes(k) || SPOKEN_CURSE_STRONG.some((w) => k.startsWith(w)
+    && /^(s|es|er|ers|ed|ing|in|y|ty|ier|iest|head|heads|face|faces|hole|holes|wit|wad|bag|bags|storm|show|ass|ard|ards|ery|ish)$/.test(k.slice(w.length)));
+}
+
+export function bleepSpokenText(text, extra) {
+  return String(text || '').replace(/\S+/gu, (tok) => (isSpokenCurse(tok, extra) ? 'bleep' : tok));
+}
+
+// Usernames: per-segment match. Segments split on non-alphanumeric runs and
+// lower->upper camel humps; each is leet-mapped, and a hit is a segment equal
+// to, starting with or ending with a strong word (or an extra of 3+ letters).
+export function isCurseName(name, extra) {
+  const segs = String(name || '').replace(/(\p{Ll})(\p{Lu})/gu, '$1 $2').split(/[^\p{L}\p{N}]+/u)
+    .map((seg) => spokenCurseKey(seg).replace(/\*/g, ''));
+  return segs.some((k) => SPOKEN_CURSE_STRONG.some((w) => k === w || k.startsWith(w) || k.endsWith(w))
+    || (Array.isArray(extra) && extra.some((w) => w.length >= 3 && (k === w || k.startsWith(w) || k.endsWith(w)))));
+}
+
+export function spokenNameFor(name, extra) {
+  return isCurseName(name, extra) ? 'someone' : cleanSpokenName(name);
+}
+
+// Server-side only (not interpolated): MULTICHAT_TTS_EXTRA_CURSES -> keys.
+export function parseExtraCurses(raw) {
+  const out = [];
+  String(raw || '').split(',').forEach((part) => {
+    const k = spokenCurseKey(part).replace(/\*/g, '');
+    if (k.length >= 3 && /\p{L}/u.test(k) && !out.includes(k)) out.push(k);
+  });
+  return out;
 }
 
 // Spoken-output-only mention normalization: strips the '@' off an in-text
@@ -127,6 +218,20 @@ export function stripControlChars(text) {
 // smuggling arbitrary spoken-looking content into a donation message.
 export function stripUrls(text) {
   return text.replace(/\b(?:https?:\/\/|www\.)\S+/gi, '').replace(/\s{2,}/g, ' ').trim();
+}
+
+// Blank every Twitch emote / GIF range (code-point offsets, end inclusive --
+// same convention as renderText) so only the typed words remain. Malformed
+// entries are skipped, never thrown on. Flat: interpolated into the PWA.
+export function stripEmoteRanges(text, emotes, gifs) {
+  const cps = Array.from(typeof text === 'string' ? text : '');
+  const ranges = [].concat(Array.isArray(emotes) ? emotes : [], Array.isArray(gifs) ? gifs : []);
+  for (const r of ranges) {
+    if (!r || !Number.isInteger(r.start) || !Number.isInteger(r.end)) continue;
+    if (r.start < 0 || r.start > r.end || r.end >= cps.length) continue;
+    for (let i = r.start; i <= r.end; i++) cps[i] = ' ';
+  }
+  return cps.join('').replace(/\s+/g, ' ').trim();
 }
 
 // "soooooo good" -> "sooo good". Caps a repeated-character run at 3 so a
@@ -190,6 +295,334 @@ export function markMatchesQueueItem(mark, item) {
 export function detectReplayGap(lastEventId, ringFloor) {
   if (lastEventId == null) return false;
   return ringFloor === null || lastEventId < ringFloor;
+}
+
+// Stable per-account key for the PWA name-tap sheet: platform + Twitch login
+// or YouTube authorId. Display name is never a key (names collide across and
+// within platforms; see pushMessage's own "never match by display name" rule).
+// sys rows (raid/redeem/info...) are not keyed. No stable id => null => not tappable.
+export function userKeyOf(msg) {
+  if (!msg || msg.sys) return null;
+  if (msg.platform === 'tw') return typeof msg.login === 'string' && msg.login ? 'tw:' + msg.login : null;
+  if (msg.platform === 'yt') return typeof msg.authorId === 'string' && msg.authorId ? 'yt:' + msg.authorId : null;
+  return null;
+}
+
+// Bounded in-memory list of message objects for the PWA name-tap sheet.
+// Fed only by frames that passed the seen-id gate; never rendered in the
+// feed; gone on reload. applyMark mirrors the PWA 'mark' SSE handler's
+// matching rules and mutates the stored objects in place so a later sheet
+// render shows the struck/removed state.
+export function createMessageStore(cap) {
+  const items = [];
+  return {
+    push(msg) {
+      items.push(msg);
+      while (items.length > cap) items.shift();
+    },
+    applyMark(m) {
+      if (!m) return;
+      for (const it of items) {
+        if (m.action === 'delete') {
+          if (m.targetId && (m.platform === 'yt' ? it.ytId === m.targetId : it.twId === m.targetId)) it.deleted = true;
+        } else if (m.action === 'author_delete') {
+          if (m.authorId && it.authorId === m.authorId) it.deleted = true;
+        } else if (m.action === 'supersede') {
+          if (m.targetId && it.twId === m.targetId) it.superseded = true;
+        } else if (m.login && it.login === m.login) {
+          it.deleted = true;
+        }
+      }
+    },
+    forKey(key) {
+      const out = [];
+      for (let i = items.length - 1; i >= 0; i--) {
+        if (userKeyOf(items[i]) === key) out.push(items[i]);
+      }
+      return out;
+    },
+    size() { return items.length; },
+  };
+}
+
+// ── Name-tap sheet: stats line + copy buttons ───────────────────────────────
+// All helpers are interpolated into the PWA page via Function.prototype
+// .toString(): keep them flat (no nested named closures -- esbuild keepNames
+// would inject __name wrappers the page does not define).
+
+// Single numeric run -> number, else null (zero or 2+ runs is ambiguous).
+export function parseAmountNumber(str) {
+  if (typeof str !== 'string') return null;
+  const runs = str.match(/\d[\d.,]*/g);
+  if (!runs || runs.length !== 1) return null;
+  const run = runs[0];
+  if (/^\d{1,3}(,\d{3})+(\.\d+)?$/.test(run)) return Number(run.replace(/,/g, ''));
+  if (/^\d+,\d{1,2}$/.test(run)) return Number(run.replace(',', '.'));
+  if (/^\d+(\.\d+)?$/.test(run)) return Number(run);
+  return null;
+}
+
+// Split "CA$12.50" / "5,00 €" into currency prefix/suffix around the number.
+export function splitAmountCurrency(str) {
+  if (typeof str !== 'string') return { prefix: '', suffix: '', num: null, decimals: 0 };
+  const m = str.match(/\d[\d.,]*/);
+  if (!m) return { prefix: '', suffix: '', num: null, decimals: 0 };
+  const run = m[0];
+  const prefix = str.slice(0, m.index).trim();
+  const suffix = str.slice(m.index + run.length).trim();
+  const dm = run.match(/[.,](\d+)$/);
+  const isDecimal = dm && !(/^\d{1,3}(,\d{3})+$/.test(run));
+  return { prefix, suffix, num: parseAmountNumber(str), decimals: isDecimal ? dm[1].length : 0 };
+}
+
+// Per-kind gold totals for the sheet's stats line. Deterministic order;
+// currencies are never summed across groups or converted.
+export function summarizeGold(msgs) {
+  const out = [];
+  const list = Array.isArray(msgs) ? msgs.filter((m) => m && m.kind && m.kind !== 'member_gift_received') : [];
+  const order = ['cheer', 'power_up', 'sub', 'giftsub', 'superchat', 'supersticker', 'member_new', 'member_milestone', 'member_gift', 'member_renewed', 'yt_gift'];
+  for (const kind of order) {
+    const rows = list.filter((m) => m.kind === kind);
+    if (!rows.length) continue;
+    const n = rows.length;
+    const label = TTS_LABELS[kind] || kind;
+    if (kind === 'cheer' || kind === 'power_up') {
+      const bits = rows.reduce((a, m) => a + (parseAmountNumber(m.amount) || 0), 0);
+      out.push(n + '× ' + label + ' (' + bits + ' bits)');
+    } else if (kind === 'giftsub' || kind === 'member_gift') {
+      const gifts = rows.reduce((a, m) => {
+        const v = parseAmountNumber(m.amount);
+        return a + (v === null ? 1 : v);
+      }, 0);
+      out.push(n + '× ' + label + ' (' + gifts + ' gifts)');
+    } else if (kind === 'superchat' || kind === 'supersticker') {
+      const groups = new Map();
+      for (const m of rows) {
+        const raw = typeof m.amount === 'string' ? m.amount : '';
+        const p = splitAmountCurrency(raw);
+        const gk = p.prefix + '|' + p.suffix;
+        let g = groups.get(gk);
+        if (!g) { g = { prefix: p.prefix, suffix: p.suffix, n: 0, sum: 0, dec: 0, ok: true, raws: [] }; groups.set(gk, g); }
+        g.n++;
+        g.raws.push(raw);
+        if (p.num === null) g.ok = false; else { g.sum += p.num; if (p.decimals > g.dec) g.dec = p.decimals; }
+      }
+      for (const g of groups.values()) {
+        out.push(g.n + '× ' + label + ' (' + (g.ok ? g.prefix + g.sum.toFixed(g.dec) + g.suffix : g.raws.join(' + ')) + ')');
+      }
+    } else if (kind === 'yt_gift') {
+      const names = [];
+      for (const m of rows) {
+        const nm = typeof m.amount === 'string' ? m.amount.trim() : '';
+        if (nm && !names.includes(nm)) names.push(nm);
+      }
+      const shown = names.slice(0, 3);
+      if (names.length > 3) shown.push('…');
+      out.push(n + '× ' + label + (shown.length ? ' (' + shown.join(', ') + ')' : ''));
+    } else {
+      out.push(n + '× ' + label);
+    }
+  }
+  return out;
+}
+
+// Pure stats for the sheet (the page formats the time -- locale dependent).
+export function sheetStats(msgs) {
+  const list = Array.isArray(msgs) ? msgs : [];
+  let firstTs = null;
+  for (const m of list) {
+    if (m && Number.isFinite(m.ts) && (firstTs === null || m.ts < firstTs)) firstTs = m.ts;
+  }
+  return { count: list.length, firstTs, gold: summarizeGold(list) };
+}
+
+// Chat handle for the @ copy button. '' when unknown.
+export function copyHandle(platform, login, user) {
+  if (platform === 'tw') return String(login || '').toLowerCase().replace(/^@+/, '');
+  if (platform === 'yt') return String(user || '').replace(/^@+/, '').trim();
+  return '';
+}
+
+// Clipboard write with execCommand fallback. Never throws.
+export async function writeClipboard(text, nav, doc) {
+  try {
+    await nav.clipboard.writeText(text);
+    return true;
+  } catch {}
+  try {
+    const ta = doc.createElement('textarea');
+    ta.value = text;
+    doc.body.appendChild(ta);
+    ta.select();
+    const ok = doc.execCommand('copy');
+    if (ta.remove) ta.remove();
+    return !!ok;
+  } catch {
+    return false;
+  }
+}
+
+// ── Phone TTS modes (Gold <-> All; gold alerts always speak) ────────────────────────────────────
+// Pure helpers interpolated into the PWA; keep flat (no nested named closures).
+export const TTS_MODES = ['gold', 'all'];
+export const TTS_MODE_KEY = 'multichat-tts-mode';
+// Array (not Set) so jsonForScript can inject it unchanged; helpers use .includes.
+// Lowercase; matched against the Twitch login and the YT display name. Any name
+// ending in "bot" is also skipped (isTtsBotName). TTS only -- rows still display.
+export const TTS_BOT_NAMES = [
+  'nightbot', 'streamelements', 'streamlabs', 'moobot', 'fossabot', 'wizebot', 'sery_bot', 'phantombot',
+  'botisimo', 'deepbot', 'coebot', 'soundalerts', 'kofistreambot', 'pokemoncommunitygame',
+];
+export const TTS_CHAT_MAX_AGE_MS = 20_000;
+export const TTS_QUEUE_CAP = 5;
+export const TTS_CHAT_TEXT_MAX = 200;
+export const TTS_MODE_ICONS = { gold: '🔊', all: '📣' };
+
+export function nextTtsMode(mode) {
+  return mode === 'gold' ? 'all' : 'gold';
+}
+
+// True for a listed bot account or any name ending in "bot" (case-insensitive;
+// "Bottle" is fine, "Robot" is not). The name is normalized first: leading
+// @s stripped (YouTube handles arrive as "@Streamlabs"), verified-tick glyphs
+// (U+2713, U+2714, U+2705) removed, trimmed, lowercased. Interpolated into
+// the PWA (keep flat).
+export function isTtsBotName(name) {
+  const n = String(name || '').trim().replace(/^@+/, '').replace(/[\u2713\u2714\u2705]/g, '').trim().toLowerCase();
+  return TTS_BOT_NAMES.includes(n) || n.endsWith('bot');
+}
+
+// Why a plain chat message must NOT be read aloud in All mode; null = speak.
+export function chatSpeakSkipReason(msg, opts) {
+  const o = opts || {};
+  const now = o.now;
+  const myName = typeof o.myName === 'string' ? o.myName : '';
+  if (msg.sys) return 'sys';
+  if (msg.kind) return 'gold';
+  if (msg.readAloud) return 'readout';
+  if (msg.replay || msg.recovered) return 'replay';
+  if (msg.deleted || msg.superseded) return 'deleted';
+  if (!Number.isFinite(msg.ts) || now - msg.ts > o.maxAgeMs) return 'stale';
+  const login = String(msg.login || '').toLowerCase();
+  const user = String(msg.user || '').toLowerCase();
+  if (myName && (msg.login === myName || user === myName)) return 'self';
+  if (isTtsBotName(login) || isTtsBotName(user)) return 'bot';
+  if (typeof msg.text !== 'string') return 'emote_only';
+  if (msg.text.trimStart().startsWith('!')) return 'command';
+  if (/\b(?:https?:\/\/|www\.)\S+/i.test(msg.text)) return 'link';
+  if (stripEmoteRanges(msg.text, msg.emotes, msg.gifs) === '') return 'emote_only';
+  return null;
+}
+
+export function formatChatUtterance(msg, extra) {
+  const body = bleepSpokenText(cleanSpokenMentions(stripUrls(stripControlChars(stripEmoteRanges(msg.text, msg.emotes, msg.gifs))), extra), extra).slice(0, TTS_CHAT_TEXT_MAX).trim();
+  return spokenNameFor(msg.user || msg.login || '', extra) + ', ' + body;
+}
+
+// Read-Out-Loud redeem line: same body as formatChatUtterance, but an empty
+// body (emote-only, URL-only) yields '' so nothing is spoken. Flat: PWA.
+export function readoutUtterance(msg, extra) {
+  const body = bleepSpokenText(cleanSpokenMentions(stripUrls(stripControlChars(stripEmoteRanges(msg.text, msg.emotes, msg.gifs))), extra), extra).slice(0, TTS_CHAT_TEXT_MAX).trim();
+  return body ? spokenNameFor(msg.user || msg.login || '', extra) + ', ' + body : '';
+}
+
+// Gold items jump ahead of pending chat (but stay behind earlier gold); over
+// cap, the oldest chat item is dropped first. Returns a NEW array.
+export function enqueueSpeechItem(queue, item, cap) {
+  const next = queue.slice();
+  if (item.gold) {
+    let at = next.findIndex((q) => !q.gold);
+    if (at === -1) at = next.length;
+    next.splice(at, 0, item);
+  } else {
+    next.push(item);
+  }
+  if (next.length > cap) {
+    const drop = next.findIndex((q) => !q.gold);
+    next.splice(drop === -1 ? 0 : drop, 1);
+  }
+  return next;
+}
+
+// '!tts off|on|all' from a live (non-replay, fresh) mod/broadcaster row.
+export function parseTtsCommand(msg, opts) {
+  const o = opts || {};
+  if (!msg || msg.sys || msg.isMod !== true || msg.replay || msg.recovered) return null;
+  if (!Number.isFinite(msg.ts) || o.now - msg.ts > o.maxAgeMs) return null;
+  if (typeof msg.text !== 'string') return null;
+  const m = msg.text.match(/^!tts\s+(off|on|all)\s*$/i);
+  return m ? m[1].toLowerCase() : null;
+}
+
+// '!tts off' returns to Gold (alerts keep speaking); 'on' and 'all' read all chat.
+export function applyTtsCommand(arg) {
+  return arg === 'off' ? 'gold' : 'all';
+}
+
+// ── Tap-to-translate ────────────────────────────────────────────────────────
+// translateRequestText / translateLabel are interpolated into the PWA (keep
+// flat); the rest are server-side only (POST /translate in worker.js).
+export const TRANSLATE_TEXT_MAX = 300;
+// Workers AI neuron pricing for TRANSLATE_MODEL (per million tokens).
+export const NEURONS_PER_M_IN = 9091;
+export const NEURONS_PER_M_OUT = 27273;
+
+export function estimateTokens(str) {
+  const s = String(str || '');
+  return s.length === 0 ? 0 : Math.max(1, Math.ceil(s.length / 4));
+}
+
+// Per-model neuron rates (per million tokens), Workers AI pricing page, verified 2026-10-12.
+export const NEURON_RATES = {
+  '@cf/google/gemma-4-26b-a4b-it': { in: 9091, out: 27273 },
+  '@cf/meta/llama-3.1-8b-instruct-fp8-fast': { in: 4119, out: 34868 },
+};
+
+export function neuronsFor(inTok, outTok, rates) {
+  const i = Number.isFinite(inTok) ? inTok : 0;
+  const o = Number.isFinite(outTok) ? outTok : 0;
+  const r = rates || { in: NEURONS_PER_M_IN, out: NEURONS_PER_M_OUT };
+  return (i * r.in + o * r.out) / 1e6;
+}
+
+export function normalizeForCompare(s) {
+  return String(s || '').normalize('NFKC').toLowerCase().replace(/[^\p{L}\p{N}]+/gu, '');
+}
+
+export function extractModelText(out) {
+  let t = '';
+  if (out && typeof out.response === 'string') t = out.response;
+  else {
+    const c = out && out.choices && out.choices[0] && out.choices[0].message ? out.choices[0].message.content : null;
+    if (typeof c === 'string') t = c;
+    else if (Array.isArray(c)) {
+      for (let i = 0; i < c.length; i++) {
+        const p = c[i];
+        if (p && typeof p.text === 'string') t += p.text;
+      }
+    }
+  }
+  return t.replace(/<think>[\s\S]*?<\/think>/gi, '').trim();
+}
+
+export function translateLabel(reason) {
+  if (reason === 'translating') return 'translating…';
+  if (reason === 'same') return 'already English';
+  if (reason === 'empty') return 'nothing to translate';
+  if (reason === 'minute' || reason === 'budget') return 'limit hit';
+  return 'failed';
+}
+
+// True for a settled entry that must NOT stick in the PWA cache: a "failed" or
+// "limit hit" label retries on the next tap. Only a real translation, "already
+// English" ('same') and "nothing to translate" ('empty', no network) are final.
+// Interpolated into the PWA (keep flat).
+export function translateRetryable(entry) {
+  return !!entry && entry.state === 'label' && entry.reason !== 'same' && entry.reason !== 'empty';
+}
+
+export function translateRequestText(text, emotes, gifs) {
+  return stripUrls(stripControlChars(stripEmoteRanges(text, emotes, gifs))).trim().slice(0, TRANSLATE_TEXT_MAX);
 }
 
 // ── Overlay param validation ────────────────────────────────────────────────
@@ -540,7 +973,7 @@ export function renderText(container, text, emotes, { myName, doc, gifs, gifsEna
       const img = doc.createElement('img');
       img.className = 'emote';
       img.alt = token;
-      img.src = 'https://static-cdn.jtvnw.net/emoticons/v2/' + id + '/default/dark/1.0';
+      img.src = 'https://static-cdn.jtvnw.net/emoticons/v2/' + id + '/default/dark/2.0';
       img.onerror = () => { img.replaceWith(doc.createTextNode(token)); };
       container.append(img);
     } else {
@@ -609,7 +1042,7 @@ export function buildRow(msg, opts) {
     return row;
   }
 
-  row.className = 'msg' + (msg.kind ? ' paid' : '') + (msg.pointsGigantify ? ' points-gigantify' : '') + (msg.rewardGift ? ' reward-gift' : '') + (msg.recovered ? ' recovered' : '') + (msg.deleted ? ' deleted' : '');
+  row.className = 'msg' + (msg.kind ? ' paid' : '') + (msg.pointsGigantify ? ' points-gigantify' : '') + (msg.rewardGift ? ' reward-gift' : '') + (msg.recovered ? ' recovered' : '') + (msg.deleted ? ' deleted' : '') + (msg.readAloud ? ' readout' : '');
   if (msg.firstMsg) {
     const glyph = doc.createElement('span');
     glyph.className = 'firstmsg';
@@ -622,7 +1055,28 @@ export function buildRow(msg, opts) {
   const user = doc.createElement('span');
   const rc = roleClass(msg);
   user.className = 'user' + (rc ? ' ' + rc : '');
-  user.textContent = msg.user + ':';
+  if (msg.verified === true) {
+    // YouTube verified channel: tick after the name, inside span.user so the
+    // overlay (same buildRow) shows it too. Non-verified rows keep the single
+    // text-node shape the golden fixture pins. The tick is an EMPTY element
+    // drawn entirely by CSS (.verified::before, a filled round badge),
+    // never a text glyph, so a check mark typed into a display name stays
+    // plain name text and can't imitate it (2026-10-12). Display names are
+    // never rewritten. role/aria-label keep it announced by assistive tech
+    // now that there is no text; setAttribute is guarded because the unit
+    // tests' fake doc has none (real DOM and the vm driver both do).
+    user.textContent = msg.user;
+    const tick = doc.createElement('span');
+    tick.className = 'verified';
+    tick.title = 'Verified channel';
+    if (tick.setAttribute) {
+      tick.setAttribute('role', 'img');
+      tick.setAttribute('aria-label', 'Verified channel');
+    }
+    user.append(tick, ':');
+  } else {
+    user.textContent = msg.user + ':';
+  }
   const text = doc.createElement('span');
   renderText(text, msg.text, msg.emotes, { myName, doc, gifs: msg.gifs, gifsEnabled: opts.gifsEnabled, gifsAsAlt: opts.gifsAsAlt });
   row.append(badge, user);

@@ -1,4 +1,4 @@
-// PWA topbar reactions strip — rolling 10s window, sort-by-count, hide-when-
+// PWA topbar reactions strip — rolling 60s window, sort-by-count, hide-when-
 // quiet/not-live, pulse-on-high-intensity. Drives the real extracted PWA
 // <script> via test/helpers/vm-page-driver.mjs (same approach as
 // test/debug-row.test.js) so this exercises the actual client code path, not
@@ -52,7 +52,7 @@ describe('PWA reactions strip', () => {
     expect(getElementById('reactions').textContent).toBe('');
   });
 
-  it('clears immediately once YT liveness is lost, even if inside the 10s window', () => {
+  it('clears immediately once YT liveness is lost, even if inside the 60s window', () => {
     const { getElementById, fireEvent } = driveClientScriptSession(script);
     fireEvent('status', statusFrame({ reactions: { emoji: { '❤': 9 }, intensity: 0.2, ts: 1 } }));
     expect(getElementById('reactions').textContent).toBe('❤9');
@@ -76,16 +76,24 @@ describe('PWA reactions strip', () => {
     expect(getElementById('reactions').classList.contains('pulse')).toBe(true);
   });
 
+  it('formats counts >= 1000 as compact k-style, reusing the shared count formatter', () => {
+    const { getElementById, fireEvent } = driveClientScriptSession(script);
+    fireEvent('status', statusFrame({
+      reactions: { emoji: { '❤': 1234, '🔥': 999 }, intensity: 0.1, ts: 1 },
+    }));
+    expect(getElementById('reactions').textContent).toBe('❤1.2k 🔥999');
+  });
+
   describe('rolling-window decay', () => {
     beforeEach(() => vi.useFakeTimers());
     afterEach(() => vi.useRealTimers());
 
-    it('drops a burst once real time advances past the 10s window (checked on the next status push)', () => {
+    it('drops a burst once real time advances past the 60s window (checked on the next status push)', () => {
       vi.setSystemTime(0);
       const { getElementById, fireEvent } = driveClientScriptSession(script);
       fireEvent('status', statusFrame({ reactions: { emoji: { '❤': 9 }, intensity: 0.2, ts: 1 } }));
       expect(getElementById('reactions').textContent).toBe('❤9');
-      vi.setSystemTime(11_000); // past REACTIONS_WINDOW_MS (10s)
+      vi.setSystemTime(61_000); // past REACTIONS_WINDOW_MS (60s)
       // A later status broadcast with no new burst (e.g. an unrelated viewer-
       // count change) still re-renders and must flush the now-stale entry.
       fireEvent('status', statusFrame({ reactions: null }));

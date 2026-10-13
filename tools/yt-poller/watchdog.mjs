@@ -32,8 +32,16 @@ export const ZOMBIE_WATCHDOG_CYCLES = (ZOMBIE_WATCHDOG_MIN * 60_000) / HEARTBEAT
 // re-resolves the channel's current live videoId and compares it to the one
 // the current run() is holding; the real session is only ever torn down if
 // that id genuinely changed.
-export const REDISCOVERY_MIN = 5;
+export const REDISCOVERY_MIN = 2;
 export const REDISCOVERY_CYCLES = (REDISCOVERY_MIN * 60_000) / HEARTBEAT_INTERVAL_MS;
+
+// Minimum spacing the probe gate (rediscovery.mjs createRediscoveryGate)
+// enforces between probes. One heartbeat tick under the cadence on purpose:
+// with the gate equal to the cadence, any fire landing a hair early (tick
+// jitter) read as too_soon and the effective cadence fell back to ~4 min. This
+// still holds a floor against a zeroStreak bookkeeping bug (double fire inside
+// the gate window) — it is only one tick looser than the cadence.
+export const REDISCOVERY_GATE_MS = (REDISCOVERY_CYCLES - 1) * HEARTBEAT_INTERVAL_MS;
 
 // Legacy single threshold, used only when the liveness gate is off (FIX 3)
 // — byte-for-byte the pre-round-3-audit behavior, so flipping the kill

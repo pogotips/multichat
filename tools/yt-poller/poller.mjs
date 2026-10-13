@@ -26,17 +26,17 @@ import { LiveChat } from 'youtube-chat';
 import { normalizeChatItem, takeGlobalEmojiRenderCount } from './normalize.mjs';
 import { classifyYtItem } from './recovery.mjs';
 import {
-  enqueueRetry, drainBatch, isRetryable, RETRY_QUEUE_MAX, SEND_CONCURRENCY, nextAttempt,
-  formatIngestFailureLog, formatIngestErrorLog,
+  enqueueRetry, drainBatch, isRetryable, RETRY_QUEUE_MAX, SEND_CONCURRENCY, nextAttempt, noteSendStatus,
+  formatIngestFailureLog, formatIngestErrorLog, isPayloadRejection,
 } from './retry-queue.mjs';
 import {
   bumpCount, appendCapture, CAPTURE_DIR, CAPTURE_FILE, CAPTURE_MAX_BYTES, REACTIONS_CAPTURE_FILE,
   reactionCaptureLine, aggregateReactionBuckets, shouldPostReaction, reactionPostPayload,
 } from './capture.mjs';
 import { createVideoIdTracker, fetchYtVideoState } from './yt-counts.mjs';
-import { probeCurrentLiveId, createRediscoveryGate, resolveRediscoveryOutcome } from './rediscovery.mjs';
+import { probeCurrentLive, createRediscoveryGate, resolveRediscoveryOutcome, formatRediscoveryLog } from './rediscovery.mjs';
 import {
-  HEARTBEAT_INTERVAL_MS, REDISCOVERY_MIN, resolveLiveness, selectWatchdogThreshold, watchdogTick,
+  HEARTBEAT_INTERVAL_MS, REDISCOVERY_GATE_MS, resolveLiveness, selectWatchdogThreshold, watchdogTick,
 } from './watchdog.mjs';
 
 const { YT_CHANNEL_ID, MULTICHAT_URL, MULTICHAT_INGEST_SECRET, YOUTUBE_API_KEY, WATCHDOG_LIVENESS_GATE: WATCHDOG_LIVENESS_GATE_RAW } =
@@ -134,6 +134,10 @@ let retryBackoffMs = RETRY_BACKOFF_INITIAL_MS;
 // drainBatch), never back through post(), so they can't inflate this past
 // cycleFetched. cycleFailed counts sendOnce failures and does include retry
 // re-attempts, since a retry storm this cycle is itself useful signal.
+// cycleDropped (2026-10-12) counts 400/413 payload rejections separately —
+// those items are dropped on first failure (isPayloadRejection,
+// retry-queue.mjs), never retried, and are not a delivery failure of the
+// ingest path, so they must never inflate `failed`.
 //
 // Change 3 (round-3 audit — do NOT rename `fetched`, it ships in the
 // /ingest/yt heartbeat body and is logged Worker-side as
@@ -148,6 +152,7 @@ let retryBackoffMs = RETRY_BACKOFF_INITIAL_MS;
 let cycleFetched = 0;
 let cyclePosted = 0;
 let cycleFailed = 0;
+let cycleDropped = 0;
 // Drained from normalize.mjs's non-sampled counter each cycle — see
 // takeGlobalEmojiRenderCount there for why this exists alongside the
 // existing 2%-sampled yt_global_emoji_render log.
@@ -192,7 +197,7 @@ let sessionGeneration = 0;
 // nothing else guaranteed probe spacing if the zeroStreak reset around the
 // no-teardown path were ever wrong in a future edit — this gate makes
 // spacing correct on its own, independent of that bookkeeping.
-const rediscoveryGate = createRediscoveryGate({ minIntervalMs: REDISCOVERY_MIN * 60_000 });
+const rediscoveryGate = createRediscoveryGate({ minIntervalMs: REDISCOVERY_GATE_MS });
 
 let lastLiveness = { state: 'unknown', at: 0 };
 
@@ -252,13 +257,24 @@ async function sendOnce(msg) {
       signal: AbortSignal.timeout(10_000),
     });
     recordRtt(performance.now() - rttStart);
+    noteSendStatus(msg, res.ok ? undefined : res.status);
     if (!res.ok) {
-      console.error(formatIngestFailureLog(res.status, await res.text(), attempt));
-      if (msg.type !== 'heartbeat') cycleFailed++;
+      // A 400/413 is a payload rejection: the item is dropped, not retried
+      // (drainBatch), so it counts as `dropped`, never `failed`. Counted
+      // BEFORE reading the body: if res.text() threw, the catch below would
+      // otherwise book a drop as a failure.
+      if (msg.type !== 'heartbeat') {
+        if (isPayloadRejection(res.status)) cycleDropped++; else cycleFailed++;
+      }
+      // Non-throwing body read: the catch below is for transport errors only,
+      // so a failed body read can never book this response a second time.
+      const body = await res.text().catch((err) => `[body read failed: ${err && err.message}]`);
+      console.error(formatIngestFailureLog(res.status, body, attempt));
     }
     return res.ok;
   } catch (err) {
     recordRtt(performance.now() - rttStart);
+    noteSendStatus(msg, undefined);
     console.error(formatIngestErrorLog(err.message, attempt));
     if (msg.type !== 'heartbeat') cycleFailed++;
     return false;
@@ -276,9 +292,11 @@ async function drainLoop() {
   draining = true;
   try {
     while (retryQueue.length > 0) {
-      const { attempted, sent } = await drainBatch(retryQueue, sendOnce, SEND_CONCURRENCY);
+      const { attempted, sent, dropped } = await drainBatch(retryQueue, sendOnce, SEND_CONCURRENCY);
       if (attempted === 0) break;
-      if (sent < attempted) {
+      // A dropped payload rejection is not a transient failure: no backoff for it,
+      // so the chat queued behind it goes out on the next batch immediately.
+      if (sent + dropped < attempted) {
         // Any failure in the batch backs off before the next one — a steady
         // partial-failure state (some succeed, some fail every round) would
         // otherwise retry with zero delay between batches and hammer a
@@ -552,15 +570,24 @@ async function run() {
 // and so can never itself produce a yt_session_start/yt_session_end line;
 // those remain bound exclusively to the real session's own handlers in
 // run(), above.
-async function runRediscoveryProbe() {
+async function runRediscoveryProbe(liveness) {
   const gate = rediscoveryGate.tryStart();
   if (!gate.allowed) {
-    console.log(JSON.stringify({ ev: 'yt_rediscovery', liveness: 'not_live', changed: false, outcome: `skipped_${gate.reason}` }));
+    console.log(formatRediscoveryLog(liveness, { changed: false, outcome: `skipped_${gate.reason}` }));
     return;
   }
   try {
     const generationAtStart = sessionGeneration;
-    const probedVideoId = await probeCurrentLiveId(LiveChat, YT_CHANNEL_ID);
+    const probe = await probeCurrentLive(LiveChat, YT_CHANNEL_ID);
+    const probedVideoId = probe.videoId;
+    // Every null probe names its reason (2026-10-12): timeout / error_event /
+    // start_rejected / empty_live_id (+ detail when the library said why),
+    // and a swallowed stop() throw rides along as cleanupError — a null is
+    // still "no change", but never a silent one.
+    const why = {
+      ...(probedVideoId ? {} : { reason: probe.reason, ...(probe.detail ? { detail: probe.detail } : {}) }),
+      ...(probe.cleanupError ? { cleanupError: probe.cleanupError } : {}),
+    };
     // Re-read AFTER the await, not a pre-probe snapshot — see
     // resolveRediscoveryOutcome's comment in rediscovery.mjs for why: the
     // real session can swap (end + new start) during this up-to-8s wait, and
@@ -574,15 +601,15 @@ async function runRediscoveryProbe() {
       probedVideoId,
     });
     if (outcome.action === 'discarded') {
-      console.log(JSON.stringify({ ev: 'yt_rediscovery', liveness: 'not_live', changed: false, discarded: true, probedVideoId: probedVideoId || null }));
+      console.log(formatRediscoveryLog(liveness, { changed: false, discarded: true, probedVideoId: probedVideoId || null, ...why }));
       return;
     }
     if (outcome.action === 'no_session') {
-      console.log(JSON.stringify({ ev: 'yt_rediscovery', liveness: 'not_live', changed: false, outcome: 'skipped_no_session', probedVideoId: probedVideoId || null }));
+      console.log(formatRediscoveryLog(liveness, { changed: false, outcome: 'skipped_no_session', probedVideoId: probedVideoId || null, ...why }));
       return;
     }
     const changed = outcome.action === 'changed';
-    console.log(JSON.stringify({ ev: 'yt_rediscovery', liveness: 'not_live', changed, probedVideoId: probedVideoId || null }));
+    console.log(formatRediscoveryLog(liveness, { changed, probedVideoId: probedVideoId || null, ...why }));
     if (changed) {
       currentLiveChat?.stop('liveness rediscovery: videoId changed, sustained fetched=0');
     }
@@ -654,6 +681,7 @@ setInterval(async () => {
     fetched: cycleFetched,
     posted: cyclePosted,
     failed: cycleFailed,
+    dropped: cycleDropped,
     status,
     counts: countsOutcome,
     liveness,
@@ -685,9 +713,9 @@ setInterval(async () => {
     if (tick.event === 'yt_rediscovery') {
       // fire-and-forget: logs its own outcome, tears down currentLiveChat
       // itself only if the videoId genuinely changed. runRediscoveryProbe
-      // is not expected to ever reject (probeCurrentLiveId never does),
+      // is not expected to ever reject (probeCurrentLive never does),
       // but this must never surface as an unhandled rejection regardless.
-      runRediscoveryProbe().catch((err) => console.error(`rediscovery probe failed: ${err.message}`));
+      runRediscoveryProbe(liveness).catch((err) => console.error(`rediscovery probe failed: ${err.message}`));
     } else {
       console.log(JSON.stringify({ ev: 'zombie_watchdog_reconnect', zeroStreakMin: watchdogThresholdMin, liveness }));
       currentLiveChat?.stop('zombie watchdog: sustained fetched=0');
@@ -696,6 +724,7 @@ setInterval(async () => {
   cycleFetched = 0;
   cyclePosted = 0;
   cycleFailed = 0;
+  cycleDropped = 0;
   cycleRttBuckets = freshRttBuckets();
   cycleRttMaxMs = 0;
   cycleRttCount = 0;

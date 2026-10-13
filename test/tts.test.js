@@ -101,6 +101,10 @@ describe('formatUtterance', () => {
     expect(formatUtterance({ user: 'Jayden', kind: 'sub' })).toBe('Jayden, sub');
   });
 
+  it('speaks a cursing username as someone (item 5)', () => {
+    expect(formatUtterance({ user: 'FuckFace', kind: 'cheer', amount: '100 bits' }).startsWith('someone, ')).toBe(true);
+  });
+
   it('formats a kind with an amount', () => {
     expect(formatUtterance({ user: 'GoldenTrainer', kind: 'superchat', amount: '$5.00' }))
       .toBe('GoldenTrainer, superchat, $5.00');
@@ -112,7 +116,7 @@ describe('formatUtterance', () => {
   });
 
   it('falls back to the raw kind string when unmapped', () => {
-    expect(formatUtterance({ user: 'X', kind: 'mystery_kind' })).toBe('X, mystery_kind');
+    expect(formatUtterance({ user: 'Xavier', kind: 'mystery_kind' })).toBe('Xavier, mystery_kind');
   });
 
   // Privacy guard: chat bodies are never read aloud, only user + kind +
@@ -215,12 +219,12 @@ describe('cleanSpokenName', () => {
     expect(cleanSpokenName('RajGotcha')).toBe('RajGotcha');
   });
 
-  it('guards an all-digit name — stripping to empty returns the original', () => {
-    expect(cleanSpokenName('12345')).toBe('12345');
+  it('guards an all-digit name — junk, spoken as "someone"', () => {
+    expect(cleanSpokenName('12345')).toBe('someone');
   });
 
-  it('guards a 1-char remainder — returns the original, not the truncated stub', () => {
-    expect(cleanSpokenName('A1')).toBe('A1');
+  it('guards a 1-char remainder — junk, spoken as "someone"', () => {
+    expect(cleanSpokenName('A1')).toBe('someone');
   });
 
   it('leaves unicode/emoji names with no trailing digits untouched', () => {
@@ -246,13 +250,14 @@ describe('cleanSpokenName: leading-@ strip', () => {
     expect(cleanSpokenName('@Jon_123')).toBe('Jon');
   });
 
-  it('a 1-char de-@ remainder returns the de-@ name, not the truncated stub or the raw @-name', () => {
+  it('a digit-free de-@ remainder is kept, even 1 char', () => {
     expect(cleanSpokenName('@x')).toBe('x');
   });
 
   it('a bare @ alone never produces an empty string', () => {
     const out = cleanSpokenName('@');
     expect(out.length).toBeGreaterThan(0);
+    expect(out).toBe('@');
   });
 
   it('leaves a name with no leading @ behaving exactly as before', () => {
@@ -280,6 +285,28 @@ describe('normalizeSpokenMentions', () => {
 
   it('leaves text with no @ untouched', () => {
     expect(normalizeSpokenMentions('no mentions here')).toBe('no mentions here');
+  });
+});
+
+describe('cleanSpokenName (2026-10-12 rule)', () => {
+  it.each([
+    ['RRR0O08B8', 'RRR'],
+    ['wiccedrasta9981', 'wiccedrasta'],
+    ['AIRBRAKE_88', 'AIRBRAKE'],
+    ['Wicit_fn', 'Wicit_fn'],
+    ['cool_guy_99', 'cool_guy'],
+    ['さくら', 'さくら'],
+    ['田中太郎', '田中太郎'],
+    ['x9z8', 'someone'],
+    ['@RRR0O08B8', 'RRR'],
+    ['12345', 'someone'],
+    ['Jon_123', 'Jon'],
+    ['Ed', 'Ed'],
+    ['Al', 'Al'],
+    ['田中', '田中'],
+    ['Jo_5', 'someone'],
+  ])('%s -> %s', (input, expected) => {
+    expect(cleanSpokenName(input)).toBe(expected);
   });
 });
 
