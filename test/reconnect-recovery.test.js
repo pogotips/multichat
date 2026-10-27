@@ -290,15 +290,19 @@ describe('detectReplayGap', () => {
 // real captured 'status' listener (not buildRow/addRow called directly), so
 // this exercises the same wiring a browser would.
 describe('replay-gap gray row (vm-page-driver, real status listener)', () => {
-  function seededScript(seedLastMsgId) {
+  // A page load restores its last-seen high-water mark from the feed cursor
+  // ('multichat-feed' {hi, ts}, see test/reload-replay.test.js) — the connect
+  // then asks for the whole ring (lastEventId=0) and the gap decision runs
+  // against the stored hi. The seeded id below is that hi.
+  function seededScript(seedHi) {
     return getPwaScript().then((script) => driveClientScriptSession(script, {
-      localStorage: seedLastMsgId ? { 'multichat-spoken': JSON.stringify({ lastMsgId: seedLastMsgId }) } : {},
+      localStorage: seedHi ? { 'multichat-feed': JSON.stringify({ hi: seedHi, ts: Date.now() }) } : {},
     }));
   }
 
-  it('gap: lastEventId below ringFloor inserts exactly one gray info row on the first status frame', async () => {
+  it('gap: stored hi below ringFloor inserts exactly one gray info row on the first status frame', async () => {
     const { feed, fireEvent, getConnectUrl } = await seededScript(100);
-    expect(getConnectUrl()).toContain('lastEventId=100');
+    expect(getConnectUrl()).toContain('lastEventId=0');
     const fired = fireEvent('status', { tw: null, yt: null, ringFloor: 150 });
     expect(fired).toBe(true); // proves the listener is actually wired, not silently skipped
     expect(feed.children.length).toBe(1);
@@ -307,13 +311,13 @@ describe('replay-gap gray row (vm-page-driver, real status listener)', () => {
     expect(row.textContent).toBe('reconnected, some messages may be missing');
   });
 
-  it('anchored: lastEventId equal to ringFloor inserts nothing', async () => {
+  it('anchored: stored hi equal to ringFloor inserts nothing', async () => {
     const { feed, fireEvent } = await seededScript(100);
     fireEvent('status', { tw: null, yt: null, ringFloor: 100 });
     expect(feed.children.length).toBe(0);
   });
 
-  it('no lastEventId (fresh connect) inserts nothing, even if ringFloor looks gap-shaped', async () => {
+  it('no stored cursor (fresh connect) inserts nothing, even if ringFloor looks gap-shaped', async () => {
     const { feed, fireEvent, getConnectUrl } = await seededScript(0);
     expect(getConnectUrl()).not.toContain('lastEventId');
     fireEvent('status', { tw: null, yt: null, ringFloor: 150 });
@@ -332,7 +336,7 @@ describe('replay-gap gray row (vm-page-driver, real status listener)', () => {
     const { feed, fireEvent, fire } = await seededScript(100);
     fireEvent('status', { tw: null, yt: null, ringFloor: 150 });
     expect(feed.children.length).toBe(1);
-    fire({ id: 5, platform: 'tw', user: 'Alice', text: 'hi' }); // lower than seeded lastMsgId 100
+    fire({ id: 5, platform: 'tw', user: 'Alice', text: 'hi' }); // lower than the seeded hi 100
     expect(feed.children.length).toBe(2);
   });
 });

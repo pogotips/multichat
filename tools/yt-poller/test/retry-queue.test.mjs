@@ -286,3 +286,96 @@ describe('poller.mjs wiring of the poison-drop status', () => {
     expect(src).toContain('sent + dropped < attempted');
   });
 });
+
+describe('enqueueRetry overflow eviction', () => {
+  it('evicts the oldest N past the cap, calls onEvict per item, keeps the newest maxSize', () => {
+    const q = [];
+    const evicted = [];
+    for (let i = 1; i <= 5; i++) enqueueRetry(q, { i }, 3, (x) => evicted.push(x));
+    expect(evicted).toEqual([{ i: 1 }, { i: 2 }]);
+    expect(q).toEqual([{ i: 3 }, { i: 4 }, { i: 5 }]);
+  });
+
+  it('without onEvict behaves exactly as before and returns the queue', () => {
+    const q = [];
+    let ret;
+    for (let i = 1; i <= 5; i++) ret = enqueueRetry(q, i, 3);
+    expect(ret).toBe(q);
+    expect(q).toEqual([3, 4, 5]);
+    const q2 = [];
+    for (let i = 1; i <= RETRY_QUEUE_MAX + 2; i++) enqueueRetry(q2, i);
+    expect(q2).toHaveLength(RETRY_QUEUE_MAX);
+    expect(q2[0]).toBe(3);
+  });
+
+  it('does not call onEvict when under the cap', () => {
+    const onEvict = vi.fn();
+    enqueueRetry([], 'a', 3, onEvict);
+    expect(onEvict).not.toHaveBeenCalled();
+  });
+});
+
+// drainBatch's re-queue unshifts failures onto the FRONT; anything enqueued
+// while the batch was in flight already sits behind them, so the queue can
+// exceed its bound right there. It must trim with enqueueRetry's policy
+// (oldest-first from the front, each reported to onEvict), never grow past max.
+describe('drainBatch re-queue respects the queue bound', () => {
+  it('evicts the oldest failed items first when in-flight enqueues filled the queue', async () => {
+    const queue = ['a', 'b', 'c'];
+    const evicted = [];
+    const result = await drainBatch(queue, async (item) => {
+      if (item === 'a') { queue.push('d', 'e'); } // lands behind the in-flight batch
+      return false; // a and b both fail transiently
+    }, 2, 3, (item) => evicted.push(item));
+    expect(queue.length).toBeLessThanOrEqual(3);
+    expect(queue).toEqual(['c', 'd', 'e']);
+    expect(evicted).toEqual(['a', 'b']);
+    // evicted failures are still failures for the caller's backoff: attempted, not sent, not payload-dropped
+    expect(result).toEqual({ attempted: 2, sent: 0, dropped: 0 });
+  });
+
+  it('uses the same eviction order and count as enqueueRetry', async () => {
+    const viaEnqueue = ['c', 'd', 'e'];
+    const enqueueEvicted = [];
+    enqueueRetry(viaEnqueue, 'f', 3, (x) => enqueueEvicted.push(x));
+    const viaDrain = ['b', 'c', 'd', 'e']; // b is claimed, fails, comes back at the front: 4 items, max 3
+    const drainEvicted = [];
+    await drainBatch(viaDrain, async () => false, 1, 3, (x) => drainEvicted.push(x));
+    expect(viaEnqueue).toEqual(['d', 'e', 'f']);
+    expect(enqueueEvicted).toEqual(['c']);
+    expect(viaDrain).toEqual(['c', 'd', 'e']);
+    expect(drainEvicted).toEqual(['b']);
+  });
+
+  it('defaults the bound to RETRY_QUEUE_MAX', async () => {
+    const queue = Array.from({ length: RETRY_QUEUE_MAX }, (_, i) => `m${i}`);
+    const evicted = [];
+    await drainBatch(queue, async (item) => {
+      if (item === 'm0') queue.push('late1', 'late2');
+      return false;
+    }, 2, undefined, (x) => evicted.push(x));
+    expect(queue).toHaveLength(RETRY_QUEUE_MAX);
+    expect(evicted).toEqual(['m0', 'm1']);
+  });
+
+  it('no eviction and no onEvict call when the re-queue fits', async () => {
+    const queue = ['a', 'b'];
+    const evicted = [];
+    await drainBatch(queue, async () => false, 2, 5, (x) => evicted.push(x));
+    expect(queue).toEqual(['a', 'b']);
+    expect(evicted).toEqual([]);
+  });
+
+  it('onEvict is optional on the re-queue path', async () => {
+    const queue = ['a', 'b'];
+    await expect(drainBatch(queue, async () => { queue.push('c'); return false; }, 1, 2)).resolves.toBeDefined();
+    expect(queue).toEqual(['b', 'c']);
+  });
+
+  it('poller drainLoop passes RETRY_QUEUE_MAX and the cycleEvicted counter to drainBatch', async () => {
+    const { readFileSync } = await import('node:fs');
+    const src = readFileSync(new URL('../poller.mjs', import.meta.url), 'utf8');
+    expect(src).toContain('await drainBatch(retryQueue, sendOnce, SEND_CONCURRENCY, RETRY_QUEUE_MAX, () => { cycleEvicted++; });');
+    expect(src.match(/cycleEvicted\+\+/g)).toHaveLength(2);
+  });
+});

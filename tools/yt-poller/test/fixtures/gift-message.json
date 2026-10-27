@@ -5,7 +5,7 @@
       "styleRuns": [{ "startIndex": 0, "length": 14 }]
     },
     "authorName": {
-      "content": "@Jaydengames017 ",
+      "content": "@viewer_example ",
       "styleRuns": [{ "startIndex": 0, "length": 16 }]
     },
     "id": "ChwKGkNMMjF4ZkRtM0pVREZVZXd3Z0VkOEZRYUhn",
@@ -14,12 +14,12 @@
         "image": {
           "sources": [
             {
-              "url": "https://yt4.ggpht.com/QnlwN8SOrV22iLXrQqHBHukFT9Dx3nCWDXz2tcjVrULZdfxeJvu6NLc1iE6IpgGr0cbgvxNzTA=s32-c-k-c0x00ffffff-no-rj",
+              "url": "https://yt4.ggpht.com/fakeavatar=s32-c-k-c0x00ffffff-no-rj",
               "width": 32,
               "height": 32
             },
             {
-              "url": "https://yt4.ggpht.com/QnlwN8SOrV22iLXrQqHBHukFT9Dx3nCWDXz2tcjVrULZdfxeJvu6NLc1iE6IpgGr0cbgvxNzTA=s64-c-k-c0x00ffffff-no-rj",
+              "url": "https://yt4.ggpht.com/fakeavatar=s64-c-k-c0x00ffffff-no-rj",
               "width": 64,
               "height": 64
             }
@@ -43,7 +43,7 @@
         }
       ]
     },
-    "giftImageA11yLabel": "@Jaydengames017 sent a gift, Gold coin",
+    "giftImageA11yLabel": "@viewer_example sent a gift, Gold coin",
     "rendererContext": {
       "loggingContext": {
         "loggingDirectives": {

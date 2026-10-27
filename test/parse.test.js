@@ -839,7 +839,7 @@ describe('normalizeYt', () => {
   // is what the former standalone acceptance test asserted.
   it('yt_gift is accepted and carries the gift name in amount', () => {
     const result = normalizeYt({
-      user: 'Jaydengames017',
+      user: 'viewer_example',
       text: 'sent Gold coin',
       kind: 'yt_gift',
       amount: 'Gold coin',
@@ -1063,7 +1063,7 @@ describe('addToBoundedSet', () => {
   it('a gift item with an already-seen ytId is dropped by the worker dedupe set', () => {
     const recentYtIds = new Set();
     const first = normalizeYt({
-      user: 'Jaydengames017',
+      user: 'viewer_example',
       text: 'sent Gold coin',
       kind: 'yt_gift',
       amount: 'Gold coin',
@@ -1073,7 +1073,7 @@ describe('addToBoundedSet', () => {
     addToBoundedSet(recentYtIds, first.ytId, 200);
 
     const duplicate = normalizeYt({
-      user: 'Jaydengames017',
+      user: 'viewer_example',
       text: 'sent Gold coin',
       kind: 'yt_gift',
       amount: 'Gold coin',

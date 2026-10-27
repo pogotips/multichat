@@ -6,6 +6,7 @@ node_modules/
 # The .example variants are committed; these real ones stay local.
 .dev.vars
 wrangler.jsonc
+wrangler.jsonc.bak-*
 docker-compose.yml
 tools/yt-poller/docker-compose.yml
 tools/yt-poller/docker-compose.override.yml

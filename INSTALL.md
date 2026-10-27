@@ -73,7 +73,7 @@ The Durable Object (`ChatHub`) and its SQLite migration are declared in `wrangle
 npm install && (cd tools/yt-poller && npm install) && npm test && npm run test:gate
 ```
 
-Expect `1059 passed` from `npm test` and `2 passed` from `npm run test:gate`. Both need `wrangler.jsonc` present (step 1 above) — without it, `npm test` fails one suite and `npm run test:gate` fails with a raw parse error instead of a clear message.
+Expect `1794 passed | 23 skipped` from `npm test` and `2 passed` from `npm run test:gate`, with `wrangler.jsonc` copied from the example (step 1 above); 23 tests skip without the private forbidden-patterns list (`tools/oss-forbidden-patterns.sh`, never published). Without `wrangler.jsonc`, `npm test` fails one suite and `npm run test:gate` fails with a raw parse error instead of a clear message.
 
 ### 3. Set secrets
 
@@ -89,6 +89,8 @@ wrangler secret put TWITCH_CLIENT_ID
 wrangler secret put TWITCH_CLIENT_SECRET
 wrangler secret put TWITCH_USER_REFRESH_TOKEN
 wrangler secret put MULTICHAT_OVERLAY_SECRET   # optional — OBS overlay, /tts, /overlay/config
+wrangler secret put MULTICHAT_TTS_REWARD_ID     # optional — Read Out Loud reward id; a secret, never a wrangler.jsonc var
+wrangler secret put MULTICHAT_TTS_SAY_AS        # optional — spoken word map, JSON object word -> spoken form; a secret, never a wrangler.jsonc var
 ```
 
 **Required:** `MULTICHAT_VIEW_SECRET` (gates the viewer link) and `MULTICHAT_INGEST_SECRET` (gates the YouTube poller's POST). Everything else is optional and degrades to "feature off" when unset — see the comments in `.dev.vars.example` for exactly what each one enables. Generate the `*_SECRET` values as opaque random strings, e.g. `openssl rand -hex 32`.
@@ -150,7 +152,7 @@ The Worker never polls YouTube. YouTube live chat is consumed by scraping the li
 
 ### Run with Docker Compose
 
-Create a `docker-compose.yml` in `tools/yt-poller/` (an example block lives in that directory's README) with your values, then:
+Copy the example compose file in `tools/yt-poller/` and fill in your values (`cp docker-compose.yml.example docker-compose.yml`; optionally `cp docker-compose.override.yml.example docker-compose.override.yml` to persist the capture dir), then:
 
 **Linux** — Docker Engine:
 ```bash

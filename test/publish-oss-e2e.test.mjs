@@ -11,7 +11,7 @@
 // real ~/multichat-oss.
 import { describe, it, expect, afterEach, vi } from 'vitest';
 import { spawnSync } from 'node:child_process';
-import { mkdtempSync, mkdirSync, writeFileSync, copyFileSync, rmSync, readFileSync } from 'node:fs';
+import { mkdtempSync, mkdirSync, writeFileSync, copyFileSync, rmSync, readFileSync, existsSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
@@ -23,6 +23,8 @@ const DIR = path.dirname(fileURLToPath(import.meta.url));
 const REPO_ROOT = path.join(DIR, '..');
 const REAL_SCRIPT = path.join(REPO_ROOT, 'tools', 'publish-oss.sh');
 const REAL_PATTERNS = path.join(REPO_ROOT, 'tools', 'oss-forbidden-patterns.sh');
+// Skipped when the private forbidden-patterns list (tools/oss-forbidden-patterns.sh, never published) is absent — e.g. in a clone of the public repo.
+const HAS_PATTERNS = existsSync(REAL_PATTERNS);
 const REAL_LEAK_CHECK = path.join(REPO_ROOT, 'tools', 'oss-filename-leak-check.mjs');
 
 // FORBIDDEN literals are built at runtime: this file is exempt from the publish
@@ -92,7 +94,7 @@ function runPublish(src, home, args, opts = {}) {
   });
 }
 
-describe('publish-oss.sh --stage-only', () => {
+describe.skipIf(!HAS_PATTERNS)('publish-oss.sh --stage-only', () => {
   it('exits 0 on a clean tree without ever writing to $DST', () => {
     const src = makeFakeSrc();
     const { home, dst } = makeFakeHomeWithDst(['README.md']);
@@ -136,7 +138,7 @@ describe('publish-oss.sh --stage-only', () => {
   });
 });
 
-describe('publish-oss.sh non-interactive refusal happens before any $DST write', () => {
+describe.skipIf(!HAS_PATTERNS)('publish-oss.sh non-interactive refusal happens before any $DST write', () => {
   it('exits 2 with no tty and no --yes, and $DST is untouched', () => {
     const src = makeFakeSrc();
     const { home, dst } = makeFakeHomeWithDst(['README.md']);
@@ -149,7 +151,7 @@ describe('publish-oss.sh non-interactive refusal happens before any $DST write',
   });
 });
 
-describe('publish-oss.sh commit subject stamps the source sha', () => {
+describe.skipIf(!HAS_PATTERNS)('publish-oss.sh commit subject stamps the source sha', () => {
   it('refuses to publish from a dirty source tree', () => {
     const src = makeFakeSrc({ dirty: true });
     const { home } = makeFakeHomeWithDst(['README.md']);

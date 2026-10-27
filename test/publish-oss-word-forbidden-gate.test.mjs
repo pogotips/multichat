@@ -10,7 +10,7 @@
 // sweep is clean against a fresh STAGE of this repo's own tree.
 import { describe, it, expect, afterEach, vi } from 'vitest';
 import { spawnSync, execFileSync } from 'node:child_process';
-import { mkdtempSync, writeFileSync, rmSync } from 'node:fs';
+import { mkdtempSync, writeFileSync, rmSync, existsSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
@@ -21,6 +21,8 @@ vi.setConfig({ testTimeout: OSS_TEST_TIMEOUT_MS });
 const DIR = path.dirname(fileURLToPath(import.meta.url));
 const SCRIPT = path.join(DIR, '..', 'tools', 'publish-oss.sh');
 const PATTERNS_FILE = path.join(DIR, '..', 'tools', 'oss-forbidden-patterns.sh');
+// Skipped when the private forbidden-patterns list (tools/oss-forbidden-patterns.sh, never published) is absent — e.g. in a clone of the public repo.
+const HAS_PATTERNS = existsSync(PATTERNS_FILE);
 const REPO_ROOT = path.join(DIR, '..');
 
 // Built at runtime so this file (gate-exempt, but still published) carries no
@@ -42,6 +44,7 @@ afterEach(() => {
 function runWordGate(scanRoot) {
   const extracted = [
     ...execFileSync('sed', ['-n', '/^FORBIDDEN_WORDS=(/,/^)/p', PATTERNS_FILE], { encoding: 'utf8' }).split('\n'),
+    ...execFileSync('sed', ['-n', '/^FORBIDDEN_EXCLUDES=(/,/^)/p', SCRIPT], { encoding: 'utf8' }).split('\n'),
     ...execFileSync('sed', ['-n', '/^word_grep_args=(/,/^done$/p', SCRIPT], { encoding: 'utf8' }).split('\n'),
   ].join('\n');
   const gateFile = path.join(makeTmpDir('publish-oss-word-gate-script-'), 'gate.sh');
@@ -53,7 +56,7 @@ function runWordGate(scanRoot) {
   return spawnSync('bash', [gateFile], { encoding: 'utf8' });
 }
 
-describe('publish-oss.sh whole-word FORBIDDEN gate', () => {
+describe.skipIf(!HAS_PATTERNS)('publish-oss.sh whole-word FORBIDDEN gate', () => {
   it('trips on the standalone short word (first entry)', () => {
     const scanRoot = makeTmpDir('publish-oss-word-gate-');
     writeFileSync(path.join(scanRoot, 'notes.md'), `ssh ${WORD_A} for logs\n`, 'utf8');
@@ -93,8 +96,10 @@ describe('publish-oss.sh whole-word FORBIDDEN gate', () => {
 
   it('word_grep_args declaration carries -w and the same exclude list as grep_args, plus itself', () => {
     const src = execFileSync('cat', [SCRIPT], { encoding: 'utf8' });
-    const declLine = src.split('\n').find((l) => l.startsWith('word_grep_args=('));
-    expect(declLine).toContain('-w');
+    const wordDecl = src.split('\n').find((l) => l.startsWith('word_grep_args=('));
+    expect(wordDecl).toContain('-w');
+    expect(wordDecl).toContain('"${FORBIDDEN_EXCLUDES[@]}"');
+    const declLine = execFileSync('sed', ['-n', '/^FORBIDDEN_EXCLUDES=(/,/^)/p', SCRIPT], { encoding: 'utf8' });
     expect(declLine).toContain('--exclude=publish-oss.sh');
     expect(declLine).toContain('--exclude=oss-filename-leak-check.mjs');
     expect(declLine).toContain('--exclude=oss-filename-leak-check.test.mjs');

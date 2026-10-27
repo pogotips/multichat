@@ -33,7 +33,7 @@ describe('poller.mjs / watchdog.mjs heartbeat cadence', () => {
   it('the setInterval driving counts/liveness/heartbeat is parameterized by the named constant, not a bare literal', () => {
     // Guards against a future edit re-introducing `}, 15_000);` directly —
     // that would silently desync the interval from every derived threshold.
-    expect(POLLER_SOURCE).toMatch(/}, HEARTBEAT_INTERVAL_MS\);/);
+    expect(POLLER_SOURCE).toMatch(/setInterval\(heartbeatRunner, HEARTBEAT_INTERVAL_MS\);/);
     expect(POLLER_SOURCE).not.toMatch(/}, 15_000\);/);
   });
 

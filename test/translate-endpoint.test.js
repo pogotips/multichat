@@ -146,6 +146,14 @@ describe('POST /translate failures', () => {
     const j = await (await setup().post('hola')).json();
     expect(j).toEqual({ ok: false, reason: 'failed' });
   });
+  it('no AI binding -> the DO meter is never called or charged', async () => {
+    const s = setup();
+    const hubFetch = vi.spyOn(s.hub, 'fetch');
+    const j = await (await s.post('hola')).json();
+    expect(j).toEqual({ ok: false, reason: 'failed' });
+    expect(hubFetch).not.toHaveBeenCalled();
+    expect(await s.hub.ctx.storage.get('translateDaily')).toBeUndefined();
+  });
 });
 
 describe('POST /translate limits', () => {

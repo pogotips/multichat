@@ -19,8 +19,8 @@ import { fileURLToPath } from 'node:url';
 //
 // M3 fix (2026-09-12 review, round 2): exact (non-wildcard) entries were
 // previously assumed "already covered by their shared convention token" —
-// false whenever an exact-name doc (FASTFOLLOW_BATCH.md, BACKLOG.md,
-// CONSENT_DAY_RUNBOOK.md) doesn't share a wildcard's naming convention at
+// false whenever an exact-name doc (the fast-follow list, the backlog doc,
+// the consent-day runbook) doesn't share a wildcard's naming convention at
 // all. Every non-wildcard, non-comment line now also contributes its
 // basename as a literal pattern (case-sensitive) — scoped to `.md` entries
 // specifically, matching this tool's own stated scope (internal DOC
@@ -91,7 +91,7 @@ if (isMain) {
     // subject matter (glob source, denylist definitions, unit-test
     // fixtures) — not real leaks of an excluded doc's existence. The last
     // two are the publish-oss.sh gate's own regression tests (2026-09-19),
-    // which legitimately write BACKLOG.md/FASTFOLLOW_BATCH.md as fixture
+    // which legitimately write the backlog doc/fast-follow list as fixture
     // content to prove those literals still trip the gate elsewhere.
     excludeFiles: [
       '.oss-exclude',

@@ -581,3 +581,114 @@ describe('sendToController replay tagging (OBS overlay item 8)', () => {
     for (const f of frames) if (f) expect(f.replay).toBeUndefined();
   });
 });
+
+describe('handleIrcData per-line isolation (J15)', () => {
+  it('a throw on one line does not abort the rest of the frame; logs one irc_line_error', () => {
+    const { hub } = makeHub();
+    const mk = (n) => `@display-name=Alice;id=m${n} :alice!alice@alice.tmi.twitch.tv PRIVMSG #testchannel :line ${n}`;
+    const real = hub.pushMessage.bind(hub);
+    let calls = 0;
+    hub.pushMessage = (...args) => {
+      calls++;
+      if (calls === 2) throw new Error('boom');
+      return real(...args);
+    };
+    const spy = vi.spyOn(console, 'log').mockImplementation(() => {});
+    try {
+      hub.handleIrcData([mk(1), mk(2), mk(3)].join('\r\n'));
+      const errs = logEvents(spy, 'irc_line_error');
+      expect(errs).toHaveLength(1);
+      expect(errs[0].message).toBe('boom');
+      expect(JSON.stringify(spy.mock.calls)).not.toContain('line 2');
+    } finally {
+      spy.mockRestore();
+    }
+    expect(hub.ring.map((m) => m.text)).toEqual(['line 1', 'line 3']);
+    expect(hub.ircMsgCount).toBe(3);
+  });
+});
+
+// J15 coverage beyond PRIVMSG: every dispatch branch inside handleIrcData's
+// per-line try must be isolated. Each case sabotages exactly one branch's
+// handler for the first matching call, then proves (a) one irc_line_error,
+// (b) the following PRIVMSG in the same frame still lands, (c) the failing
+// line's text never reaches the log.
+describe('handleIrcData per-line isolation, every dispatch branch (J15)', () => {
+  const boom = () => { throw new Error('boom'); };
+  const sentinel = 'SENTINEL_CHAT_TEXT';
+  const follower = '@display-name=Bob;id=after :bob!bob@bob.tmi.twitch.tv PRIVMSG #testchannel :after line';
+  const cases = [
+    {
+      label: 'PING reply send throws',
+      line: 'PING :tmi.twitch.tv',
+      sabotage: (hub) => { hub.socket = { send: boom, close() {} }; },
+    },
+    {
+      label: 'USERNOTICE pushMessage throws',
+      line: `@display-name=ronni;login=ronni;msg-id=sub;system-msg=ronni\\ssubscribed! :tmi.twitch.tv USERNOTICE #testchannel :${sentinel}`,
+      sabotage: (hub) => {
+        const real = hub.pushMessage.bind(hub);
+        let first = true;
+        hub.pushMessage = (...a) => { if (first) { first = false; boom(); } return real(...a); };
+      },
+    },
+    {
+      label: 'CLEARMSG applyClearmsg throws',
+      line: `@login=baduser;target-msg-id=abc-123 :tmi.twitch.tv CLEARMSG #testchannel :${sentinel}`,
+      sabotage: (hub) => { hub.applyClearmsg = boom; },
+    },
+    {
+      label: 'CLEARCHAT applyClearchat throws',
+      line: `@ban-duration=600 :tmi.twitch.tv CLEARCHAT #testchannel :${sentinel}`,
+      sabotage: (hub) => { hub.applyClearchat = boom; },
+    },
+    {
+      label: 'ROOMSTATE applyRoomstate throws',
+      line: '@emote-only=1 :tmi.twitch.tv ROOMSTATE #testchannel',
+      sabotage: (hub) => { hub.applyRoomstate = boom; },
+    },
+    {
+      label: 'unclassified line pushCapture throws',
+      line: `@foo=bar :tmi.twitch.tv ZZZUNKNOWN #testchannel :${sentinel}`,
+      sabotage: (hub) => { hub.pushCapture = boom; },
+    },
+    {
+      label: 'PRIVMSG post-push gigantify consume throws',
+      line: `@display-name=Alice;id=m1 :alice!alice@alice.tmi.twitch.tv PRIVMSG #testchannel :${sentinel}`,
+      sabotage: (hub) => {
+        const real = hub.consumePendingGigantify.bind(hub);
+        let first = true;
+        hub.consumePendingGigantify = (...a) => { if (first) { first = false; boom(); } return real(...a); };
+      },
+    },
+  ];
+
+  it.each(cases)('$label: one irc_line_error, next line still lands, no chat text logged', ({ line, sabotage }) => {
+    const { hub } = makeHub();
+    sabotage(hub);
+    const spy = vi.spyOn(console, 'log').mockImplementation(() => {});
+    try {
+      hub.handleIrcData([line, follower].join('\r\n'));
+      const errs = logEvents(spy, 'irc_line_error');
+      expect(errs).toHaveLength(1);
+      expect(errs[0].message).toBe('boom');
+      expect(JSON.stringify(spy.mock.calls)).not.toContain(sentinel);
+    } finally {
+      spy.mockRestore();
+    }
+    expect(hub.ring.map((m) => m.text)).toContain('after line');
+    expect(hub.ircMsgCount).toBe(2);
+  });
+
+  it('a healthy frame of every branch type logs no irc_line_error', () => {
+    const { hub } = makeHub();
+    hub.socket = { send() {}, close() {} };
+    const spy = vi.spyOn(console, 'log').mockImplementation(() => {});
+    try {
+      hub.handleIrcData([...cases.map((c) => c.line), follower].join('\r\n'));
+      expect(logEvents(spy, 'irc_line_error')).toHaveLength(0);
+    } finally {
+      spy.mockRestore();
+    }
+  });
+});

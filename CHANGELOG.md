@@ -4,8 +4,80 @@
 
 ## [Unreleased]
 
+## [2026.10.21.1]
+
 ### Fixed
+- **PWA reload replays no longer read as a replay gap in `sse_replay_result`.** A full-ring reload replay (`lastEventId=0`) now logs `kind: 'ring'` and `gap: null` instead of `gap: true`; every other replay line is unchanged (no `kind`, real `gap`). Gap queries need no `lastId: 0` exclusion any more. DO-side only: takes effect after DO adoption.
+
+## [2026.10.20.1]
+
+### Added
+- **Spoken @mentions and spoken word map (PWA + overlay).** A body `@mention` is now spoken exactly like that name as a sender: the whole handle after the `@` (`-` and `.` included) goes through the same spoken-name rule (`spokenNameFor`: curse check, then `cleanSpokenName`), trailing punctuation is peeled first and put back after (`@Name_42!` is spoken `Name!`), and only an `@` at the start of a word counts (emails and mid-word `@` are untouched, `well-known` stays whole). The overlay's sender name and `@mention`s now take the same path as the PWA, so overlay speech matches PWA speech (the overlay also gets the curse-name check on senders, and `MULTICHAT_TTS_EXTRA_CURSES` for it). New optional wrangler secret `MULTICHAT_TTS_SAY_AS` (JSON object, word to spoken form, never a `vars` entry): a case-insensitive whole-word match on sender names, `@mentions` and message text, speech only, applied to the PWA chat/gold/Read-Out-Loud lines and the overlay's chat and `ttsBody` lines (the overlay's `/tts` receives the same text). Unset or invalid JSON is an empty map and a no-op; invalid JSON logs one `tts_say_as_bad_config {reason}` per isolate and never the value. Display text is never rewritten. New helpers `applySpokenWordMap`, `spokenSenderName`, `formatOverlayChatUtterance` (interpolated; also covered by the bundle test) and server-only `parseSayAsMap`; `sanitizeSpokenBody` now uses `cleanSpokenMentions` instead of the `@`-strip-only `normalizeSpokenMentions`.
+
+### Changed
+- **PWA long sender names (CSS only).** The platform badge and the sender name always share a line. Non-gold rows cap the name at 60% of the row width on one line and end an overlong name in an ellipsis (the full name is still in the name-tap sheet; the verified tick and colon are clipped along with the overlong tail); gold rows (`paid`, gigantify) keep the full name and let it wrap with the badge glued to its first characters instead of leaving the badge alone on a line. No DOM change, `buildRow` and the golden fixture untouched, overlay layout untouched.
+
+## [2026.10.18.2]
+
+### Added
+- **YT chip forced reconnect (PWA + overlay).** When the YT chip has been red for a minute or more while frames are still arriving (a Durable Object moved or restarted mid-stream leaves the open stream pinned to the old instance: Twitch flows, YouTube is dead), the client opens a fresh connection on its own, which lands on the live instance, so YouTube rows come back without pull-to-refresh. YouTube rows return in about 2.5-3 minutes. At most one forced reconnect per 5 minutes per client, so a real poller outage doesn't loop. The PWA beacons it as `reconnect_attempt` trigger `yt_stale` (the overlay beacons the same, under its own 10-per-session budget); the 60s silence watchdog is unchanged. The usual gray "some messages may be missing" row after a reconnect is expected.
+- **Superseded-DO self-close.** A `ChatHub` instance that stops receiving alarms for more than 3 intervals (180s) while SSE clients are attached, on two consecutive heartbeat ticks, logs `do_superseded_suspect`; the second strike confirms with a storage read, and only a failing read logs `do_superseded_close` (about 3.5 minutes after its last alarm), closes its SSE streams and IRC socket (no IRC reconnect) and stops its loop. A healthy read logs `do_superseded_false_alarm` and closes nothing. Kill switch: var `MULTICHAT_SUPERSEDED_DETECT="off"` (default on; documented in `wrangler.jsonc.example`).
+
+## [2026.10.18.1]
+
+### Added
+- **PWA reload keeps the feed.** A reload (pull-to-refresh version mismatch, iOS killing and reviving the installed app, a manual refresh) within 30 minutes of the last rendered message now brings back the messages that were on screen — as many as the DO ring holds (200) — instead of an empty feed. The page keeps a small feed cursor (`multichat-feed`: highest rendered id + when it last advanced, written at most every 5 s and on hide/unload) and asks the hub for the whole ring on load; the stored id drives the existing "reconnected, some messages may be missing" decision, so a ring that rolled past it still shows that one gray row and a ring that still holds it replays silently. Replayed rows never buzz or speak: buzz and TTS already share the persisted-floor + 30-minute age gate, so only a gold/raid row that arrived while the app was dead, and is under 30 minutes old, fires — once. More than 30 minutes after the last message (or with nothing stored) the app starts clean, with no gray row — the old `multichat-spoken.lastMsgId` restore, which had no expiry and produced that gray row on next-day opens, is gone. OBS overlay unchanged (never carries the helpers; a scene-switch reload still gets zero ring rows).
+
+## [2026.10.13.3]
+
+### Added
+- **TTS mute button (PWA).** A 🔔/🔕 toggle in the topbar, immediately left of the speaker button, silences all phone speech (alerts, chat, Read Out Loud, mode announcement) and cancels the line being read. Buzz and the Gold/All speaker mode are untouched, and the speaker button still cycles. Saved under its own key (`multichat-tts-muted`), so it survives a reload. While muted the spoken-id floor and spoken set still advance, so unmuting never reads a backlog. The overlay is unchanged.
+
+### Changed
+- `MULTICHAT_TTS_REWARD_ID` is a wrangler secret (`wrangler secret put`), no longer a `wrangler.jsonc.example` var; a `vars` entry of that name would shadow the secret. The Worker reads `env.MULTICHAT_TTS_REWARD_ID` either way.
+
+### Fixed
+- "Read Out Loud" redeem rows (PWA) now buzz once like other gold-class rows; the row call site used to pass no buzz pattern for them. Spoken-once and the per-id gate are unchanged. Not live until `MULTICHAT_TTS_REWARD_ID` is set.
+
+## [Poller 2026-10-13] — poller only, no RELEASE_VERSION bump
+
+### Fixed
+- Poller: no log line can carry a secret value. Every error-text log path (`yt counts fetch failed`, ingest errors, capture writes, live-chat errors, rediscovery probe, `yt_session_end` `lastErrors`) now masks via one shared `describeErr`/`maskSecrets` (ingest secret, `YOUTUBE_API_KEY`, percent-encoded forms, `key=` values), including a `videos.list` error whose message holds the key-bearing URL.
+- Poller: a hung heartbeat tick can no longer silence the poller. The in-flight guard releases after `TICK_CEILING_MS` (60s) with one `poller_tick_ceiling_release` line and runs the watchdog; the stale tick can neither clear the newer tick's guard nor post its heartbeat or write state (`poller_tick_stale_dropped`, once). Poller-only; no Worker change.
+
+## [2026.10.13.2]
+
+### Changed
+- Poller heartbeat log gains `evicted` (retry-queue evictions this cycle) and an `unknownRenderers` top-10 summary. Both are log-only, not on the heartbeat wire.
+
+### Fixed
+- **`irc_line_error` redaction works.** The per-line catch now passes the line to `redactErr`, so an error that echoes any 24-char window of the line logs `[redacted]`.
+- **`irc_line_error` is capped.** 20 per minute per hub; the overflow is counted and the next window opens with one `irc_line_error_suppressed` summary.
+- **A failing gigantify step keeps the plain row.** If the dedupe step throws after the row landed, the row is restored to its plain state and logged as `irc_line_error` with `stage: 'gigantify'`.
+- **JSON.parse SyntaxErrors no longer carry chat text to `/client-error`.** The PWA and overlay beacon `SyntaxError at position N` only, and the server reduces the same shape from older clients.
+- Poller: `drainBatch`'s re-queue now respects `RETRY_QUEUE_MAX` (evicts oldest-first, counted in `evicted`, not `dropped`).
+- Poller: a throwing heartbeat tick logs `poller_heartbeat_tick_error` and the interval keeps running, instead of an unhandled rejection killing the process.
+- Poller: tick errors mask the ingest secret and API key (exact values), not just `key=` query values.
+- Poller: the zombie watchdog and per-cycle counter resets run in a `finally`, so a throw mid-tick no longer skips them.
+- Poller: a heartbeat tick that starts while the previous is still running skips with `poller_heartbeat_tick_skipped`.
 - Test-only (tools/tests, no release): the `publish-oss*` test files no longer depend on the developer's repo or tree. Fixtures scrub inherited `GIT_*` env (a hook-run `npm test` pointed fixture `git add/commit` at the real repo), the real-stage check reads the committed tree, fixtures spawn fewer git processes, and the spawn-heavy files carry a 60s per-file timeout (11 timeouts reproduced under 3x CPU load at the 5s default). `publish-oss.sh` itself is unchanged and still refuses a dirty tree for real publishes.
+
+## [2026.10.13.1]
+
+### Fixed
+- **Overlay-config preview matches the overlay.** The font preview now uses all six real font stacks (it only knew mono and serif), and the sample rows carry the real platform value so their badges read "tw".
+- **A TTS meter storage error no longer resets the hub.** The metering step logs `tts_meter_error` and answers as a failed generation instead of throwing; chat is untouched.
+- **Malformed `null` bodies get the documented answer.** `/tts` and `/tts-allow` treat a literal `null` body as a no-op (204/400), `/overlay/admin` answers 400 — none of them 500s.
+- **Non-401 Helix errors (429/5xx) on the viewer and follower counts are logged once.** One `counts_update` error line per distinct `http_N`, then quiet until recovery (which already logged ok).
+- **No AI binding no longer burns translate/TTS budget.** The binding is checked before the daily meter is charged.
+
+### Changed
+- Overlay: the unused spoken-curse word list is no longer shipped in the overlay page, and its reconnect backoff uses the shared curve (same 1s doubling to 30s cap).
+- Hub: the TTS kill flag is read once and kept in memory; the EventSub moderate-health flag and translate settle only write storage when the value changes.
+- PWA: the redeem and Read Out Loud row styles are one CSS rule (no visual change).
+- `GET /` memoizes the rendered page per isolate (keyed on the owner name and extra-curse list).
+- Internal consolidation, no behavior change: moderation mark/delete helpers, hub timer teardown, YouTube ingest branches, shared request-body cap and token gate, IRC line parsing.
+- Docs now cite code by symbol rather than line number.
 
 ## [2026.10.12.4]
 
@@ -34,7 +106,7 @@
 ### Added
 - **Name sheet stats + @ copy button (PWA).** The name-tap sheet now opens with one stats line — message count, first seen "since open", and gold given listed per type and per currency (same-currency amounts are summed, nothing is ever converted or summed across currencies) — plus a button that copies `@name` (Twitch uses the login, any leading `@` is stripped) with a ✓ for about 1.5 s. Clipboard via `navigator.clipboard.writeText` with a textarea fallback. Computed from the existing 2,000-message in-memory list (`sheetStats`, `summarizeGold`, `copyHandle`, `writeClipboard` in `src/lib.js`); `buildRow` and the golden fixture are untouched; the feed gains no vertical space.
 - **Phone TTS modes Off → Gold → All.** The speaker button cycles three modes (Gold = the previous "on" behavior; a fresh install stays Off; an existing `multichat-speak=on` migrates to Gold; mode persists in `localStorage` `multichat-tts-mode`). In All, each new chat line is spoken within about 20 s of arrival or skipped. Never spoken: replay/recovered rows, commands (leading `!`), bots (`TTS_BOT_NAMES`: Nightbot, StreamElements, Moobot, Fossabot, Streamlabs), rows containing links, emote-only rows, the broadcaster's own lines, deleted rows — a mark on a queued or in-flight row drops it mid-speech (`markMatchesQueueItem`, now used by the PWA as well as the overlay). Gold rows jump the queue; queue cap 5; spoken chat capped at 200 chars with emote ranges stripped (`stripEmoteRanges`) and the spoken-name cleanup reused. A tap while speaking cancels, clears the queue and sets Off; a tap while silent cycles. Raid rows stay buzz-only. Overlay untouched.
-- **`!tts off|on|gold|all` chat command (PWA only).** Sent by the broadcaster or a mod on either platform (the `isMod` flag the blue mod coloring already uses), it changes that phone's TTS mode within about 2 s. Live rows only (replay/recovered and rows older than 20 s are ignored; deduped by message id); unknown arguments ignored; `on` restores the last non-Off mode (default Gold). The command row still displays but is never spoken; applying shows one local gray row "TTS <mode> by <name>" that never buzzes, speaks, or enters the seen-id gate.
+- **`!tts off|on|all` chat command (PWA only).** Sent by the broadcaster or a mod on either platform (the `isMod` flag the blue mod coloring already uses), it changes that phone's TTS mode within about 2 s: `off` goes to Gold, `on` and `all` go to All. Live rows only (replay/recovered and rows older than 20 s are ignored; deduped by message id); unknown arguments (including `gold`) ignored. The command row still displays but is never spoken; applying shows one local gray row "TTS <mode> by <name>" that never buzzes, speaks, or enters the seen-id gate.
 - **Tap-to-translate (PWA).** Tapping a message's text (never the name) shows its English under that row, in the feed and in the name sheet, from one in-memory cache per message id, or a visible label: "translating…", "already English", "nothing to translate", "limit hit", "failed". Emote-only and GIF-only rows are a no-op. New `POST /translate` (view secret ONLY — the overlay secret is rejected because it lives in an OBS scene URL), JSON `{text}`, 2 KB body cap, 300-char input cap after stripping emotes/links/control chars; empty input never calls Workers AI. The `ChatHub` DO meters it like `/tts` with its own keys: 10/min in-memory, 8,000 neurons/day persisted (`translateDaily`, UTC-midnight reset), an estimate pre-charged under `blockConcurrencyWhile` and settled from the response's usage tokens (chars/4 when absent). Model `@cf/google/gemma-4-26b-a4b-it` with `@cf/meta/llama-3.1-8b-instruct-fp8-fast` as fallback, strict translate-only system prompt, chat text passed as the user message, `max_tokens` 120, output trimmed and capped at 400 chars; a normalized match with the input reports "already English". The client renders `textContent` only, labeled "translated", appended outside `buildRow`. Log line `ev:translate {ok, reason, ms, inTok, outTok, neuronsEst}` — never the input or output text.
 
 ## [2026.10.12.1]

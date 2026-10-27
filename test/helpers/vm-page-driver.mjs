@@ -56,15 +56,24 @@ class FakeElement {
   click() { this._listeners?.click?.(); }
   setAttribute() {}
   querySelector() { return null; }
+  querySelectorAll() { return []; } // mark path: no row matching in the fake DOM, but must not throw
   get offsetHeight() { return 0; }
 }
 
 class FakeEventSource {
-  constructor(url) { this._onmessage = null; this._listeners = {}; this.url = url; FakeEventSource.lastInstance = this; }
+  constructor(url) {
+    this._onmessage = null; this._onerror = null; this._onopen = null; this._listeners = {}; this.url = url;
+    FakeEventSource.lastInstance = this;
+    FakeEventSource.instances.push(this);
+  }
   set onmessage(fn) { this._onmessage = fn; }
   get onmessage() { return this._onmessage; }
-  set onerror(_fn) {}
-  set onopen(_fn) {}
+  // Kept (not discarded) so a test can drive the real onerror → reconnect
+  // path; fireError()/fireOpen() on the session object dispatch them.
+  set onerror(fn) { this._onerror = fn; }
+  get onerror() { return this._onerror; }
+  set onopen(fn) { this._onopen = fn; }
+  get onopen() { return this._onopen; }
   // Keyed by type (not an array) — every real addEventListener call site in
   // this codebase attaches exactly one handler per event type on a given
   // socket, same simplifying assumption FakeElement's own listener map makes.
@@ -88,11 +97,14 @@ export function driveClientScriptSession(scriptSrc, opts = {}) {
     // Optional fake window.speechSynthesis + SpeechSynthesisUtterance for TTS tests.
     speechSynthesis: speechSynthesisImpl,
     SpeechSynthesisUtterance: utteranceImpl,
+    // Optional navigator.vibrate stub (default no-op) so buzz tests can record patterns.
+    vibrate: vibrateImpl = () => {},
     // Extra sandbox globals (e.g. the vitest SSR import binding an interpolated
     // worker.js helper still references when run unbundled).
     extraGlobals = {},
   } = opts;
   FakeEventSource.lastInstance = null;
+  FakeEventSource.instances = [];
   const feed = new FakeElement('div');
   const elementsById = new Map([['feed', feed]]);
   const getOrCreate = (id) => {
@@ -105,33 +117,46 @@ export function driveClientScriptSession(scriptSrc, opts = {}) {
     setItem: (k, v) => localStorageStore.set(k, String(v)),
     removeItem: (k) => localStorageStore.delete(k),
   };
+  // window/document listeners are recorded per type as ARRAYS (the PWA
+  // registers several 'visibilitychange' handlers) so dispatchWindow /
+  // dispatchDocument can drive the real pagehide / hidden persistence paths.
+  const windowListeners = {};
+  const documentListeners = {};
+  const record = (map) => (type, handler) => { (map[type] ??= []).push(handler); };
+  const unrecord = (map) => (type, handler) => { if (map[type]) map[type] = map[type].filter((h) => h !== handler); };
+  const dispatch = (map) => (type, ev = {}) => { for (const h of map[type] || []) h(ev); return (map[type] || []).length; };
   const fakeDocument = {
     createElement: (tag) => new FakeElement(tag),
     createTextNode: (text) => new FakeTextNode(text),
     getElementById: (id) => getOrCreate(id),
-    addEventListener: () => {},
-    removeEventListener: () => {},
+    addEventListener: record(documentListeners),
+    removeEventListener: unrecord(documentListeners),
     visibilityState: 'visible',
     documentElement: { style: {} },
     body: { style: {} },
     querySelectorAll: () => [],
   };
   const sentBeacons = [];
+  let pendingTimers = [];
+  let timerSeq = 0;
+  // setInterval callbacks are recorded (never auto-fired), same as timers;
+  // runIntervals(ms) fires every one registered with that period once.
+  const intervals = [];
   const baseLocation = { origin: 'https://x', hash: '#t=x', pathname: '/', search: '', href: 'https://x/#t=x', reload: () => {} };
   const location = { ...baseLocation, ...locationOverrides };
   const sandbox = {
     document: fakeDocument,
     window: {
       speechSynthesis: speechSynthesisImpl,
-      addEventListener: () => {},
-      removeEventListener: () => {},
+      addEventListener: record(windowListeners),
+      removeEventListener: unrecord(windowListeners),
       location,
       matchMedia: () => ({ matches: false, addEventListener: () => {} }),
     },
     localStorage: fakeLocalStorage,
     EventSource: FakeEventSource,
     navigator: {
-      vibrate: () => {},
+      vibrate: vibrateImpl,
       serviceWorker: undefined,
       onLine: true,
       // Blob body content is read synchronously here (fake Blob, see below)
@@ -143,10 +168,14 @@ export function driveClientScriptSession(scriptSrc, opts = {}) {
     history: { replaceState: () => {} },
     fetch: fetchImpl,
     SpeechSynthesisUtterance: utteranceImpl,
-    setInterval: () => 0,
+    setInterval: (fn, ms) => { intervals.push({ fn, ms }); return intervals.length; },
     clearInterval: () => {},
-    setTimeout: () => 0,
-    clearTimeout: () => {},
+    // Timers are recorded, never auto-fired (same observable behavior as the
+    // old no-op stubs); runTimers() on the session object fires the pending
+    // set once, in registration order, so a test can drive a scheduled
+    // reconnect or a trailing throttled write deterministically.
+    setTimeout: (fn, ms) => { pendingTimers.push({ id: ++timerSeq, fn, ms }); return timerSeq; },
+    clearTimeout: (id) => { pendingTimers = pendingTimers.filter((t) => t.id !== id); },
     requestAnimationFrame: () => 0,
     console,
     URL,
@@ -155,6 +184,8 @@ export function driveClientScriptSession(scriptSrc, opts = {}) {
     Date,
     JSON,
     Set,
+    // CSS.escape shim: without it every mark handler threw ReferenceError and the bare catch hid it.
+    CSS: { escape: (s) => String(s).replace(/[^\w-]/g, (c) => '\\' + c) },
     Map,
     ...extraGlobals,
   };
@@ -165,24 +196,53 @@ export function driveClientScriptSession(scriptSrc, opts = {}) {
   if (!FakeEventSource.lastInstance) {
     throw new Error('EventSource was never constructed — connect() did not run');
   }
-  const es = FakeEventSource.lastInstance;
+  // Always the CURRENT socket: a reconnect driven via fireError()+runTimers()
+  // constructs a new one, and fire/fireEvent/getConnectUrl must follow it the
+  // way the page's own `es` binding does. Single-socket tests are unaffected.
+  const es = () => FakeEventSource.lastInstance;
   return {
     feed,
     sentBeacons,
-    fire: (frame) => es._onmessage({ data: JSON.stringify(frame) }),
+    fire: (frame) => es()._onmessage({ data: JSON.stringify(frame) }),
     // Drives a named addEventListener('<type>', ...) handler (e.g. 'status',
     // 'ping', 'mark') through the same {data: JSON string} shape the real
     // EventSource passes onmessage — no-ops if this page never registered
     // that listener, so a caller can tell "not fired" from "not wired" by
     // checking the return value.
     fireEvent: (type, data) => {
-      const handler = es._listeners[type];
+      const handler = es()._listeners[type];
       if (!handler) return false;
       handler({ data: JSON.stringify(data) });
       return true;
     },
-    getConnectUrl: () => es.url,
+    fireError: () => { const h = es()._onerror; if (!h) return false; h({}); return true; },
+    fireOpen: () => { const h = es()._onopen; if (!h) return false; h({}); return true; },
+    getConnectUrl: () => es().url,
+    getConnectUrls: () => FakeEventSource.instances.map((s) => s.url),
     getElementById: (id) => elementsById.get(id) || null,
+    // Reads the page's fake localStorage (persistence round-trip assertions).
+    getStored: (k) => fakeLocalStorage.getItem(k),
+    // Fires every timer pending right now (not ones they schedule) and
+    // returns how many ran.
+    runTimers: () => {
+      const batch = pendingTimers;
+      pendingTimers = [];
+      for (const t of batch) t.fn();
+      return batch.length;
+    },
+    pendingTimerCount: () => pendingTimers.length,
+    // Fires each setInterval callback registered with period `ms` once (the
+    // page's periodic watchdog/timer ticks); returns how many ran.
+    runIntervals: (ms) => {
+      const due = intervals.filter((i) => i.ms === ms);
+      for (const i of due) i.fn();
+      return due.length;
+    },
+    // Returns the number of handlers that ran, so "not fired" and "not wired"
+    // stay distinguishable (same contract as fireEvent).
+    dispatchWindow: dispatch(windowListeners),
+    dispatchDocument: dispatch(documentListeners),
+    setVisibility: (state) => { fakeDocument.visibilityState = state; },
   };
 }
 

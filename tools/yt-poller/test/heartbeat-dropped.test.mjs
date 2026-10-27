@@ -46,3 +46,29 @@ describe('poller_heartbeat dropped counter', () => {
     for (const s of [401, 403, 404, 408, 429, 500, 502, 503]) expect(isPayloadRejection(s)).toBe(false);
   });
 });
+
+describe('poller_heartbeat evicted counter', () => {
+  it('declares, increments via enqueueRetry onEvict, and resets cycleEvicted', () => {
+    expect(src).toContain('let cycleEvicted = 0;');
+    expect(src).toContain('enqueueRetry(retryQueue, msg, RETRY_QUEUE_MAX, () => { cycleEvicted++; });');
+    expect(src.match(/enqueueRetry\(/g)).toHaveLength(1);
+    // The reset, pinned with its neighbour so the declaration (`let cycleEvicted = 0;`) cannot satisfy it.
+    expect(src).toContain('    cycleDropped = 0;\n    cycleEvicted = 0;\n');
+  });
+
+  it('is in the heartbeat log line but not the POST payload', () => {
+    const fullLog = src.slice(src.indexOf("ev: 'poller_heartbeat'"), src.indexOf('}));', src.indexOf("ev: 'poller_heartbeat'")));
+    expect(fullLog).toContain('evicted: cycleEvicted,');
+    const payload = src.slice(src.indexOf("type: 'heartbeat',"), src.indexOf("ev: 'poller_heartbeat'"));
+    expect(payload).not.toContain('evicted');
+  });
+});
+
+describe('poller_heartbeat unknownRenderers summary', () => {
+  const start = src.indexOf("ev: 'poller_heartbeat'");
+  const fullLog = src.slice(start, src.indexOf('}));', start));
+  it('logs a bounded summary but leaves the wire field as the full map', () => {
+    expect(fullLog).toContain('unknownRenderers: summarizeUnknownRenderers(unknownRendererCounts),');
+    expect(src).toContain('unknownRenderers: { ...unknownRendererCounts },');
+  });
+});

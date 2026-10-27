@@ -41,6 +41,10 @@ Merges Twitch + YouTube live chat into a single dark, mobile SSE feed for viewin
 trust boundaries, gap recovery, client features, deploy runbook, known
 caveats. This file stays a quick-reference; that one is the source of truth.
 
+Docs conventions:
+
+- Cite code by symbol, never line number. Protects: doc cites stay true across edits (2026-10-13).
+
 ## Standing invariants
 
 These hold across sessions — do not relax them without discussion:
@@ -71,10 +75,13 @@ These hold across sessions — do not relax them without discussion:
   retag.** A deployed-but-unpushed `main` leaves the next session's diff-review
   baseline pointed at a commit nobody else can see.
 - **After any worker deploy, verify the ChatHub DO actually adopted the new
-  script version before assuming it has.** Verify scriptVersion via ingest
-  invocations, or curl -N /events and check the first status frame for
-  ringFloor; force a cycle only if stale. Adoption timing is variable, not
-  instant and not reliably slow either — 2026-08-05's deploy didn't land in
+  script version before assuming it has.** Verify in the CF Observability
+  events view: expand a recent DO event (entrypoint ChatHub) and read
+  `$workers.scriptVersion.id` — ringFloor no longer proves it and free-text
+  search is blind for this worker (2026-10-13); force a cycle only if stale.
+  Edge check: unauthenticated `GET /api/version` proves the edge script only,
+  never DO adoption.
+  Adoption timing is variable, not instant and not reliably slow either — 2026-08-05's deploy didn't land in
   the live DO until ~1.5h into the next stream (the mid-stream ring wipe that
   caused), while 2026-08-06's landed in ~2 min (DO reset logged right after
   `wrangler deploy` returned).
@@ -235,7 +242,7 @@ the numeric id behind that login) — resolved once via a public login→id
 lookup, not sensitive, never changes for a given channel. `Get Channel
 Followers` needs it and doesn't accept a login string.
 `MULTICHAT_MY_NAME` is also a plain `wrangler.jsonc` var (not a secret — the
-streamer's own chat login, lowercased on read, `src/worker.js:120,136`) —
+streamer's own chat login, lowercased on read in `handleIndex` / `handleOverlay`) —
 drives self-mention highlighting (`MY_NAME` on both the PWA and overlay
 pages, `buildRow`'s `myName` option). Empty/unset simply disables that
 highlighting; chat itself is unaffected.
@@ -315,6 +322,7 @@ clean cutover.
 5. Close all tabs, confirm the Twitch IRC socket disconnects after ~2 min idle (no reconnect spam in logs).
 5a. Pull-to-refresh (installed PWA only — Add to Home Screen first, `display-mode: standalone`): pull down from the top of the feed past ~70px and release — indicator shows "release to refresh", then reconnects live (same behavior as toggling airplane mode briefly). Bump `RELEASE_VERSION` in `src/worker.js`, redeploy, pull again with the old tab still open — confirm a full page reload instead of a silent reconnect. Interrupt a drag mid-gesture (e.g. switch app) — confirm the indicator doesn't stick.
 5b. Topbar refresh button removed (2026-09-22) — pull-to-refresh (5a) is the only manual trigger now. Watchdog: leave the app backgrounded past the ~60s stale threshold and foreground it — reconnects silently, no buzz on any platform.
+5c. Reload keeps the feed (2026-10-18): with chat flowing, force a full reload (swipe-kill the installed app and reopen, or the 5a version-mismatch reload) — the feed comes back showing the rows from before the reload (up to the hub's 200-entry ring), no buzz, no TTS, no gray row. Then leave it closed 30+ min with no new chat and reopen — it starts empty with no gray row. A gray "reconnected, some messages may be missing" row on reload is correct only if 200+ messages landed while it was closed or the hub restarted.
 6. EventSub (needs [`twitch-cli`](https://github.com/twitchdev/twitch-cli),
    `brew install twitch-cli`): with `wrangler dev` running and a **throwaway
    dev-only** `EVENTSUB_SECRET` in `.dev.vars` (never the prod value):

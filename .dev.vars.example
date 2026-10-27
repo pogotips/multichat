@@ -56,4 +56,12 @@ MULTICHAT_TTS_EXTRA_CURSES=""
 
 # Optional. Twitch channel-point reward id whose chat message the phone reads
 # aloud once (teal row). Blank = off, the message is normal chat.
+# In production this is a wrangler secret, never a wrangler.jsonc var.
 MULTICHAT_TTS_REWARD_ID=""
+
+# Optional. Spoken word map: a JSON object of word -> spoken form, e.g.
+# {"Word":"how it is said"}. Case-insensitive whole-word match on sender
+# names, @mentions and message text, speech only (display never changes).
+# In production this is a wrangler secret, never a wrangler.jsonc var.
+# Blank or invalid JSON = no-op.
+MULTICHAT_TTS_SAY_AS=""

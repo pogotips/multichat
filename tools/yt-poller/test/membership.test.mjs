@@ -82,7 +82,7 @@ describe('patched parser: giftMessageViewModel (paid Jewels/animated-gift)', () 
     const item = parseOne(giftMessage);
     // ViewModel author field is "@name " with a leading @ and trailing space
     // (unlike classic renderers' authorName.simpleText) — strip both.
-    expect(item.author.name).toBe('Jaydengames017');
+    expect(item.author.name).toBe('viewer_example');
     expect(item.id).toBe('ChwKGkNMMjF4ZkRtM0pVREZVZXd3Z0VkOEZRYUhn');
     const text = item.message.map((p) => p.text ?? '').join('');
     expect(text).toBe('sent Gold coin');
@@ -91,7 +91,7 @@ describe('patched parser: giftMessageViewModel (paid Jewels/animated-gift)', () 
     // the same way without a new fixture.
     expect(item.giftMessage).toEqual({
       giftName: 'Gold coin',
-      giftImageA11yLabel: '@Jaydengames017 sent a gift, Gold coin',
+      giftImageA11yLabel: '@viewer_example sent a gift, Gold coin',
     });
   });
 
@@ -215,9 +215,9 @@ describe('patched parser: mod actions (deletion/author-removal)', () => {
   // treatment as markChatItemsByAuthorAsDeletedAction, despite identical
   // {externalChannelId} shape.
   it('removeChatItemByAuthorAction surfaces as an authorDeletion control item with the same shape', () => {
-    const data = actionData({ removeChatItemByAuthorAction: { externalChannelId: 'UCE8M1SgN-4tFO4TbpYqRJMA' } });
+    const data = actionData({ removeChatItemByAuthorAction: { externalChannelId: 'UCauthorremoved000000000' } });
     const [chatItems] = parseChatData(data);
-    expect(chatItems).toEqual([{ rendererType: 'authorDeletion', authorChannelId: 'UCE8M1SgN-4tFO4TbpYqRJMA' }]);
+    expect(chatItems).toEqual([{ rendererType: 'authorDeletion', authorChannelId: 'UCauthorremoved000000000' }]);
   });
 
   it('a deletion action missing targetItemId degrades to unknownAction capture instead of a broken control item', () => {
@@ -376,7 +376,7 @@ describe('normalizeChatItem: yt_gift (paid Jewels/animated-gift, distinct from m
   it('yt_gift: gifter as user, gift name rides the amount badge', () => {
     const msg = normalizeChatItem(parseOne(giftMessage));
     expect(msg).toEqual({
-      user: 'Jaydengames017',
+      user: 'viewer_example',
       text: 'sent Gold coin',
       kind: 'yt_gift',
       amount: 'Gold coin',
@@ -414,7 +414,7 @@ describe('normalizeChatItem: yt_gift (paid Jewels/animated-gift, distinct from m
     expect(logEvents(logSpy, 'yt_gift_raw')).toEqual([{
       ev: 'yt_gift_raw',
       giftName: 'Gold coin',
-      giftImageA11yLabel: '@Jaydengames017 sent a gift, Gold coin',
+      giftImageA11yLabel: '@viewer_example sent a gift, Gold coin',
     }]);
     logSpy.mockRestore();
   });

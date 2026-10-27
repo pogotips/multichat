@@ -111,6 +111,9 @@ node tools/yt-poller/authed-chat-difftest.mjs
 # anon + authed, 3-minute poll, diff report at the end
 ```
 
+`axios` is a declared devDependency for this diagnostic only (the image
+uses `npm ci --omit=dev`, so it is not shipped).
+
 Never commit a cookie file, and never point `YT_COOKIE_FILE` at a
 repo-relative path. Cookie values are read into memory only to build the
 `Cookie` and `SAPISIDHASH` `Authorization` headers — never logged, never

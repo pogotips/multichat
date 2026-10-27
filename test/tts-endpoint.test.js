@@ -8,7 +8,7 @@
 // directly, never worker.js's own use of them.
 import { describe, it, expect, vi } from 'vitest';
 import worker from '../src/worker.js';
-import { makeHub } from './helpers/makeHub.js';
+import { makeHub, makeStorage } from './helpers/makeHub.js';
 
 const OVERLAY_SECRET = 'ov-secret-test';
 const ADMIN_SECRET = 'admin-secret-test';
@@ -104,6 +104,22 @@ describe('POST /tts — text hardening reaches env.AI.run', () => {
       method: 'POST', headers: { 'content-type': 'application/json' }, body: 'not json',
     }), env, {});
     expect(res.status).toBe(204);
+  });
+
+  it('literal null body is a 204, not a 500', async () => {
+    const env = makeTtsEnv({ AI: { run: vi.fn() } });
+    const res = await worker.fetch(new Request(`https://x/tts?t=${OVERLAY_SECRET}`, {
+      method: 'POST', headers: { 'content-type': 'application/json' }, body: 'null',
+    }), env, {});
+    expect(res.status).toBe(204);
+  });
+
+  it('/overlay/admin with a literal null body is a 400', async () => {
+    const env = makeTtsEnv();
+    const res = await worker.fetch(new Request(`https://x/overlay/admin?t=${OVERLAY_SECRET}`, {
+      method: 'POST', headers: { 'content-type': 'application/json' }, body: 'null',
+    }), env, {});
+    expect(res.status).toBe(400);
   });
 });
 
@@ -307,5 +323,27 @@ describe('POST /overlay/admin — auth restored, shares MULTICHAT_OVERLAY_SECRET
     const env = makeTtsEnv();
     const ttsRes = await postTts(env, 'hello', ADMIN_SECRET);
     expect(ttsRes.status).toBe(401);
+  });
+});
+
+describe('POST /tts — DO meter storage errors', () => {
+  it('a rejecting ttsDaily get answers 204 and the hub keeps serving (not reset)', async () => {
+    const storage = makeStorage();
+    const realGet = storage.get;
+    let thrown = false;
+    storage.get = async (k) => { if (k === 'ttsDaily' && !thrown) { thrown = true; throw new Error('storage down'); } return realGet(k); };
+    const { hub } = makeHub({ storage });
+    const run = vi.fn(async () => new Response('audio'));
+    const env = makeTtsEnv({ AI: { run }, HUB: { getByName: () => ({ fetch: (url, init) => hub.fetch(new Request(url, init)) }) } });
+    const lines = [];
+    vi.spyOn(console, 'log').mockImplementation((l) => lines.push(String(l)));
+    const first = await postTts(env, 'hello');
+    expect(first.status).toBe(204);
+    expect(run).not.toHaveBeenCalled();
+    expect(lines.some((l) => l.includes('tts_meter_error'))).toBe(true);
+    const second = await postTts(env, 'hello');
+    expect(second.status).toBe(200);
+    expect(run).toHaveBeenCalledTimes(1);
+    vi.restoreAllMocks();
   });
 });

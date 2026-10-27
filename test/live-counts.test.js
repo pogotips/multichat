@@ -268,6 +268,31 @@ describe('Twitch Helix viewer polling', () => {
     expect(hub.twViewers).toBe(5);
   });
 
+  it('a non-401 Helix error (500) logs one counts_update error line, keeps the value, stays quiet on repeat, and logs ok on recovery', async () => {
+    const { hub } = makeHub({ envOverrides: { TWITCH_CLIENT_ID: 'cid', TWITCH_CLIENT_SECRET: 'csecret' } });
+    hub.twViewers = 77;
+    const errSpy = vi.spyOn(console, 'error').mockImplementation(() => {});
+    const logSpy = vi.spyOn(console, 'log').mockImplementation(() => {});
+    const counts = (spy) => spy.mock.calls.map((c) => String(c[0])).filter((l) => l.includes('counts_update'));
+    vi.stubGlobal('fetch', vi.fn()
+      .mockResolvedValueOnce({ ok: true, json: async () => ({ access_token: 'tok1', expires_in: 3600 }) })
+      .mockResolvedValueOnce({ ok: false, status: 500 })
+      .mockResolvedValueOnce({ ok: false, status: 500 })
+      .mockResolvedValueOnce({ ok: true, json: async () => ({ data: [{ viewer_count: 77 }] }) }));
+    await hub.pollTwitchViewers();
+    expect(counts(errSpy)).toHaveLength(1);
+    expect(counts(errSpy)[0]).toContain('"outcome":"error"');
+    expect(counts(errSpy)[0]).toContain('http_500');
+    expect(hub.twViewers).toBe(77);
+    await hub.pollTwitchViewers();
+    expect(counts(errSpy)).toHaveLength(1);
+    await hub.pollTwitchViewers();
+    expect(counts(logSpy)).toHaveLength(1);
+    expect(counts(logSpy)[0]).toContain('"outcome":"ok"');
+    errSpy.mockRestore();
+    logSpy.mockRestore();
+  });
+
   it('a network failure leaves the last known value in place and never throws — chat flow is never touched', async () => {
     const { hub } = makeHub({ envOverrides: { TWITCH_CLIENT_ID: 'cid', TWITCH_CLIENT_SECRET: 'csecret' } });
     hub.twViewers = 77;
@@ -415,6 +440,34 @@ describe('Twitch follower polling (moderator:read:followers, user-token refresh 
     await hub.pollTwitchFollowers();
     expect(fetchSpy).toHaveBeenCalledTimes(3); // 1 refresh + 2 followers calls, not 2+2
     expect(hub.twFollowers).toBe(11);
+  });
+
+  it('a non-401 Helix error (500) on the followers call logs one counts_update error line, keeps the value, stays quiet on repeat, and logs ok on recovery', async () => {
+    const { hub } = makeHub({
+      envOverrides: { TWITCH_CLIENT_ID: 'cid', TWITCH_CLIENT_SECRET: 'csecret' },
+      storage: makeStorage({ twUserRefreshToken: 'current-rt' }),
+    });
+    hub.twFollowers = 42;
+    const errSpy = vi.spyOn(console, 'error').mockImplementation(() => {});
+    const logSpy = vi.spyOn(console, 'log').mockImplementation(() => {});
+    const counts = (spy) => spy.mock.calls.map((c) => String(c[0])).filter((l) => l.includes('counts_update'));
+    vi.stubGlobal('fetch', vi.fn()
+      .mockResolvedValueOnce({ ok: true, json: async () => ({ access_token: 'uat1', refresh_token: 'rt2', expires_in: 14400 }) })
+      .mockResolvedValueOnce({ ok: false, status: 500 })
+      .mockResolvedValueOnce({ ok: false, status: 500 })
+      .mockResolvedValueOnce({ ok: true, json: async () => ({ total: 42 }) }));
+    await hub.pollTwitchFollowers();
+    expect(counts(errSpy)).toHaveLength(1);
+    expect(counts(errSpy)[0]).toContain('"outcome":"error"');
+    expect(counts(errSpy)[0]).toContain('http_500');
+    expect(hub.twFollowers).toBe(42);
+    await hub.pollTwitchFollowers();
+    expect(counts(errSpy)).toHaveLength(1);
+    await hub.pollTwitchFollowers();
+    expect(counts(logSpy)).toHaveLength(1);
+    expect(counts(logSpy)[0]).toContain('"outcome":"ok"');
+    errSpy.mockRestore();
+    logSpy.mockRestore();
   });
 
   it('401 on the followers call drops only the cached access token, never the storage refresh chain', async () => {

@@ -16,6 +16,13 @@ export function bumpCount(counts, type) {
   return counts;
 }
 
+// Bounded top-N view of a counts object for log lines: at most `max` entries,
+// sorted by count desc, ties by name asc. Pure; never mutates `counts`.
+export function summarizeUnknownRenderers(counts, max = 10) {
+  const entries = Object.entries(counts || {}).sort((a, b) => (b[1] - a[1]) || (a[0] < b[0] ? -1 : a[0] > b[0] ? 1 : 0));
+  return Object.fromEntries(entries.slice(0, max));
+}
+
 // Reaction-burst entity -> capture-line transform (raw shape: see the
 // frameworkUpdates patch in patches/youtube-chat+2.2.0.patch). Buckets are
 // per-duration-window fountain summaries; YouTube omits reactionsData
@@ -106,8 +113,9 @@ export function appendCapture(filePath, raw, maxBytes = CAPTURE_MAX_BYTES) {
   if (size + Buffer.byteLength(line) > maxBytes) {
     try {
       fs.renameSync(filePath, filePath + '.1');
-    } catch {
-      // nothing to rotate yet
+    } catch (err) {
+      // reached only when the file exists and is full, so a rename failure is real: the capture file would otherwise grow past maxBytes silently
+      console.error(JSON.stringify({ ev: 'capture_rotate_failed', code: err && err.code ? err.code : null }));
     }
   }
   fs.mkdirSync(path.dirname(filePath), { recursive: true });

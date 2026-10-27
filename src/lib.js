@@ -95,8 +95,8 @@ export function cleanSpokenName(name) {
   const base = deAt.length > 0 ? deAt : raw;
   const idx = base.search(/\p{Nd}/u);
   if (idx === -1) return base;
-  const lead = idx === -1 ? 0 : (base.slice(0, idx).match(/\p{L}/gu) || []).length;
-  const cleaned = idx !== -1 && lead >= 3
+  const lead = (base.slice(0, idx).match(/\p{L}/gu) || []).length;
+  const cleaned = lead >= 3
     ? base.slice(0, idx).replace(/[_\-.\s]+$/u, '')
     : base.replace(/[_-]?\p{Nd}+$/u, '');
   const letters = (cleaned.match(/\p{L}/gu) || []).length;
@@ -107,10 +107,45 @@ export function cleanSpokenName(name) {
 
 // "@RRR0O08B8 lol" is spoken "RRR lol": a word that starts with @ at a word
 // boundary (start of text or after whitespace) is replaced by its spoken
-// name (cleanSpokenName rule above). Emails (a@b.com) and plain words are
-// untouched. Flat: interpolated into the PWA.
+// name (spokenNameFor, the same path a sender name takes). The whole
+// whitespace-delimited token after the @ is the handle, "-" and "." included
+// ("@Some_Name-x9k," -> handle "Some_Name-x9k"); trailing punctuation is
+// peeled first and put back after cleanup. A token with nothing but
+// punctuation after the @ is left as typed. Emails (a@b.com), mid-word @ and
+// plain words are untouched. Flat: interpolated into the PWA and the overlay.
 export function cleanSpokenMentions(text, extra) {
-  return String(text || '').replace(/(^|\s)@([\p{L}\p{N}_]+)/gu, (m, pre, handle) => pre + spokenNameFor(handle, extra));
+  return String(text || '').replace(/(^|\s)@(\S+)/gu, (m, pre, token) => {
+    const tail = token.match(/[^\p{L}\p{N}]+$/u);
+    const trail = tail ? tail[0] : '';
+    const handle = trail ? token.slice(0, token.length - trail.length) : token;
+    if (!handle) return m;
+    return pre + spokenNameFor(handle, extra) + trail;
+  });
+}
+
+// Spoken word map (MULTICHAT_TTS_SAY_AS secret, parsed by parseSayAsMap):
+// case-insensitive WHOLE-WORD replacement, speech only. A word is a run of
+// letters/digits/underscore, so "-" "." "!" and spaces are boundaries and key
+// "A" never matches inside "AB" or "ABC". One regex pass, longest key first,
+// so a mapped form is never re-scanned for further keys. Empty or missing
+// map returns the text untouched. Flat (no named closures): interpolated
+// into the PWA and the overlay.
+export function applySpokenWordMap(text, map) {
+  const src = String(text == null ? '' : text);
+  if (!map || typeof map !== 'object') return src;
+  const spoken = Object.create(null);
+  const keys = [];
+  for (const k of Object.keys(map)) {
+    if (typeof map[k] !== 'string' || !k) continue;
+    const lower = k.toLowerCase();
+    if (!(lower in spoken)) keys.push(lower);
+    spoken[lower] = map[k];
+  }
+  if (keys.length === 0) return src;
+  keys.sort((a, b) => b.length - a.length);
+  const alt = keys.map((k) => k.replace(/[.*+?^${}()|[\]\\\/]/g, '\\$&')).join('|');
+  const re = new RegExp('(^|[^\\p{L}\\p{N}_])(' + alt + ')(?![\\p{L}\\p{N}_])', 'giu');
+  return src.replace(re, (m, pre, hit) => pre + spoken[hit.toLowerCase()]);
 }
 
 // ── Spoken-text curse filter ───────────────────────────────────────────
@@ -177,6 +212,42 @@ export function spokenNameFor(name, extra) {
   return isCurseName(name, extra) ? 'someone' : cleanSpokenName(name);
 }
 
+// The one spoken form of a sender name on every surface (PWA chat/gold/
+// readout lines, overlay lines): curse check + cleanSpokenName, then the
+// spoken word map. @mention tokens in a body reach the same
+// spokenNameFor through cleanSpokenMentions, and the word map runs over the
+// finished body, so "@X" and sender X are spoken identically. Flat.
+export function spokenSenderName(name, extra, sayAs) {
+  return applySpokenWordMap(spokenNameFor(name, extra), sayAs);
+}
+
+// Server-side only (not interpolated): MULTICHAT_TTS_SAY_AS secret -> map.
+// JSON object of word -> spoken form. Unset/empty -> empty map, no problem.
+// Bad JSON / non-object -> empty map plus a `bad` reason code ('not_json' |
+// 'not_object'); the value itself is never returned in a log-able field.
+// Entries are capped (200 entries, 64 chars per key and per spoken form,
+// control chars stripped) and non-string values skipped. Null-prototype
+// result so a "__proto__" key is just a key.
+export function parseSayAsMap(raw) {
+  const map = Object.create(null);
+  if (raw == null || String(raw).trim() === '') return { map, bad: null };
+  let parsed;
+  try { parsed = JSON.parse(String(raw)); } catch { return { map, bad: 'not_json' }; }
+  if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed)) return { map, bad: 'not_object' };
+  let n = 0;
+  for (const k of Object.keys(parsed)) {
+    if (n >= 200) break;
+    const key = k.replace(/[\x00-\x1F\x7F]/g, '').trim();
+    const v = parsed[k];
+    if (!key || key.length > 64 || typeof v !== 'string') continue;
+    const spoken = v.replace(/[\x00-\x1F\x7F]/g, '').trim().slice(0, 64);
+    if (!spoken) continue;
+    map[key] = spoken;
+    n++;
+  }
+  return { map, bad: null };
+}
+
 // Server-side only (not interpolated): MULTICHAT_TTS_EXTRA_CURSES -> keys.
 export function parseExtraCurses(raw) {
   const out = [];
@@ -195,9 +266,8 @@ export function parseExtraCurses(raw) {
 // preceded by a non-whitespace character ('a'), so the pattern doesn't
 // match there at all. Only the '@' itself is consumed (\S matches exactly
 // one character) -- the rest of the mentioned name is untouched literal
-// text, never re-parsed. Not currently wired into any call site -- see
-// gate-2 report / open question on where a "speak the message body" TTS
-// path (if one gets built) should invoke this.
+// text, never re-parsed. Called by sanitizeSpokenBody (below) and by the
+// overlay's own utteranceFor (worker.js overlayHtml).
 export function normalizeSpokenMentions(text) {
   return text.replace(/(^|\s)@(\S)/g, '$1$2');
 }
@@ -251,12 +321,13 @@ export function collapseRepeatedChars(text) {
 // caller (formatOverlayUtterance) treats '' as "no body" and degrades to
 // exactly formatUtterance's own PWA-equivalent line, never a broken or
 // silent utterance.
-export function sanitizeSpokenBody(text, maxLen = 120) {
+export function sanitizeSpokenBody(text, maxLen = 120, extra, sayAs) {
   if (!text) return '';
   let out = stripControlChars(text);
   out = stripUrls(out);
   out = collapseRepeatedChars(out);
-  out = normalizeSpokenMentions(out);
+  out = cleanSpokenMentions(out, extra);
+  out = applySpokenWordMap(out, sayAs);
   out = out.trim();
   return out.length > maxLen ? out.slice(0, maxLen).trim() : out;
 }
@@ -295,6 +366,73 @@ export function markMatchesQueueItem(mark, item) {
 export function detectReplayGap(lastEventId, ringFloor) {
   if (lastEventId == null) return false;
   return ringFloor === null || lastEventId < ringFloor;
+}
+
+// ── PWA reload replay: the persisted feed cursor ───────────────────────────
+// PWA only (interpolated at the PWA embed site alone — the OBS overlay must
+// keep getting zero ring rows on a scene-switch reload). The page persists
+// {hi, ts} — the highest msg.id it has actually rendered and the local clock
+// when that last advanced — under FEED_CURSOR_KEY. A fresh page load whose
+// cursor is younger than FEED_CURSOR_MAX_AGE_MS asks the DO for the WHOLE
+// ring (lastEventId = RING_REPLAY_EVENT_ID: the edge forwards any finite
+// numeric string, and handleEvents replays every ring entry with
+// id > 0) and runs the replay-gap decision against the stored hi, so
+// "hi below ringFloor → gray row, at/above → silent" keeps its meaning. The
+// DO replays only `id > lastId`, so sending the stored hi itself could never
+// bring back the rows that were on screen before the reload. Older or
+// missing cursor → the connect is exactly a fresh install's.
+// Both helpers are flat (no nested named closures — esbuild keepNames would
+// inject __name wrappers the page never defines; see renderGifToken).
+export const FEED_CURSOR_KEY = 'multichat-feed';
+export const FEED_CURSOR_MAX_AGE_MS = 30 * 60_000;
+export const FEED_CURSOR_WRITE_MIN_MS = 5_000;
+export const RING_REPLAY_EVENT_ID = 0;
+
+// raw localStorage string → the stored hi, or null when there is nothing a
+// reload should trust: missing/corrupt, no positive finite hi, no numeric
+// ts, or |now - ts| at/over maxAgeMs (a future-dated ts is as untrusted as a
+// stale one — a clock jump must not resurrect an ancient cursor).
+export function readFeedCursor(raw, now, maxAgeMs) {
+  if (typeof raw !== 'string' || raw === '') return null;
+  let v;
+  try { v = JSON.parse(raw); } catch { return null; }
+  if (!v || typeof v !== 'object') return null;
+  if (typeof v.hi !== 'number' || !Number.isFinite(v.hi) || v.hi <= 0) return null;
+  if (typeof v.ts !== 'number' || !Number.isFinite(v.ts)) return null;
+  if (Math.abs(now - v.ts) >= maxAgeMs) return null;
+  return v.hi;
+}
+
+// Throttled high-water tracker. note(id, now) returns the JSON to write when
+// a write is due (first note always; then at most once per minWriteMs),
+// else null while marking the cursor dirty; flush(now) returns the JSON for
+// a dirty cursor (pagehide / hidden / trailing timer) or null. ts is always
+// the time hi last ADVANCED, never the flush time, so the 30-min expiry
+// measures from the last rendered message. Lower/equal/non-numeric ids are
+// ignored: a replayed or duplicate row can never rewind the cursor.
+export function createFeedCursor(minWriteMs) {
+  let hi = 0;
+  let ts = 0;
+  let lastWrite = -Infinity;
+  let dirty = false;
+  return {
+    note(id, now) {
+      if (typeof id !== 'number' || !(id > hi)) return null;
+      hi = id;
+      ts = now;
+      dirty = true;
+      if (now - lastWrite < minWriteMs) return null;
+      lastWrite = now;
+      dirty = false;
+      return JSON.stringify({ hi, ts });
+    },
+    flush(now) {
+      if (!dirty) return null;
+      lastWrite = now;
+      dirty = false;
+      return JSON.stringify({ hi, ts });
+    },
+  };
 }
 
 // Stable per-account key for the PWA name-tap sheet: platform + Twitch login
@@ -475,8 +613,13 @@ export const TTS_BOT_NAMES = [
 ];
 export const TTS_CHAT_MAX_AGE_MS = 20_000;
 export const TTS_QUEUE_CAP = 5;
+export const CLIENT_ERROR_SEND_MAX = 5; // session-scoped cap on /client-error beacons per page — a looping error must never spam the endpoint/log
 export const TTS_CHAT_TEXT_MAX = 200;
 export const TTS_MODE_ICONS = { gold: '🔊', all: '📣' };
+// Mute toggle (left of the speaker button): silences ALL phone speech without touching
+// the Gold/All mode. Own key -- never TTS_MODE_KEY. Glyphs must differ from TTS_MODE_ICONS.
+export const TTS_MUTE_KEY = 'multichat-tts-muted';
+export const TTS_MUTE_ICONS = { live: '🔔', muted: '🔕' };
 
 export function nextTtsMode(mode) {
   return mode === 'gold' ? 'all' : 'gold';
@@ -514,16 +657,25 @@ export function chatSpeakSkipReason(msg, opts) {
   return null;
 }
 
-export function formatChatUtterance(msg, extra) {
-  const body = bleepSpokenText(cleanSpokenMentions(stripUrls(stripControlChars(stripEmoteRanges(msg.text, msg.emotes, msg.gifs))), extra), extra).slice(0, TTS_CHAT_TEXT_MAX).trim();
-  return spokenNameFor(msg.user || msg.login || '', extra) + ', ' + body;
+export function formatChatUtterance(msg, extra, sayAs) {
+  const body = applySpokenWordMap(bleepSpokenText(cleanSpokenMentions(stripUrls(stripControlChars(stripEmoteRanges(msg.text, msg.emotes, msg.gifs))), extra), extra), sayAs).slice(0, TTS_CHAT_TEXT_MAX).trim();
+  return spokenSenderName(msg.user || msg.login || '', extra, sayAs) + ', ' + body;
 }
 
 // Read-Out-Loud redeem line: same body as formatChatUtterance, but an empty
 // body (emote-only, URL-only) yields '' so nothing is spoken. Flat: PWA.
-export function readoutUtterance(msg, extra) {
-  const body = bleepSpokenText(cleanSpokenMentions(stripUrls(stripControlChars(stripEmoteRanges(msg.text, msg.emotes, msg.gifs))), extra), extra).slice(0, TTS_CHAT_TEXT_MAX).trim();
-  return body ? spokenNameFor(msg.user || msg.login || '', extra) + ', ' + body : '';
+export function readoutUtterance(msg, extra, sayAs) {
+  const body = applySpokenWordMap(bleepSpokenText(cleanSpokenMentions(stripUrls(stripControlChars(stripEmoteRanges(msg.text, msg.emotes, msg.gifs))), extra), extra), sayAs).slice(0, TTS_CHAT_TEXT_MAX).trim();
+  return body ? spokenSenderName(msg.user || msg.login || '', extra, sayAs) + ', ' + body : '';
+}
+
+// Overlay plain-chat line (tts=all): "<name> says <body>". Same name path and
+// same @mention/word-map treatment as the PWA lines above, so overlay speech
+// matches PWA speech; no bleep here (the overlay never had one). '' when
+// there is no body. Flat: interpolated into the overlay.
+export function formatOverlayChatUtterance(msg, extra, sayAs) {
+  const body = applySpokenWordMap(cleanSpokenMentions(msg.text || '', extra), sayAs);
+  return body ? spokenSenderName(msg.user, extra, sayAs) + ' says ' + body : '';
 }
 
 // Gold items jump ahead of pending chat (but stay behind earlier gold); over
@@ -1100,4 +1252,30 @@ export function buildRow(msg, opts) {
     row.append(big);
   }
   return row;
+}
+
+// ── YT-chip forced reconnect ──────────────────────────────────────────────
+// A Durable Object moved or restarted mid-stream leaves the OLD instance
+// serving any already-open SSE stream: Twitch keeps flowing but the poller's
+// YT posts land on the NEW instance, so the old one's YT age grows, the chip
+// goes red, and frames (ping/status) keep arriving — the 60 s silence
+// watchdog never fires. Only a fresh connection reaches the live instance.
+export const YT_CHIP_RED_MS = 90_000; // status.yt age at/above which the YT chip is red (PWA CHIP_STALE_MS, overlay)
+export const YT_FORCE_RED_MS = 60_000; // chip must have been red this long before a forced reconnect
+export const YT_FORCE_FRAME_FRESH_MS = 60_000; // ...with a frame this recent (stream alive; else the silence watchdog owns it)
+export const YT_FORCE_CAP_MS = 300_000; // ...and no forced reconnect more recently than this (a real poller outage: one per 5 min)
+
+// Pure decision for the PWA watchdog poll and the overlay's 15 s timer.
+// state: { ytStaleSince (ms epoch the chip turned red, null when not red),
+// lastFrameAt (ms epoch of the last SSE frame), lastForcedAt (ms epoch of the
+// last forced reconnect, null = never), now }. cfg: { redMs, frameMs, capMs }
+// — passed in (callers interpolate the constants above) because this
+// function is interpolated into the page scripts via toString() and cannot
+// close over module scope.
+export function shouldForceYtReconnect(state, cfg) {
+  if (state.ytStaleSince == null) return false;
+  if (state.now - state.ytStaleSince < cfg.redMs) return false;
+  if (state.now - state.lastFrameAt > cfg.frameMs) return false;
+  if (state.lastForcedAt != null && state.now - state.lastForcedAt < cfg.capMs) return false;
+  return true;
 }

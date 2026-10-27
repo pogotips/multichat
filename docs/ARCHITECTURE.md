@@ -50,7 +50,47 @@ external renewal cron (optional, renewals) ────────────�
   `lastMsgId`, and (like every non-`raid` `sys` row) never buzzes or speaks.
   The server's own `sse_replay_result` log line carries the identical
   `ringFloor`/`gap` fields so the audit trail and the client agree on which
-  reconnects actually lost messages.
+  reconnects actually lost messages — except the PWA reload replay below,
+  which logs `kind: 'ring'`, `gap: null`.
+  **PWA reload keeps the feed (2026-10-18).** A reload used to come back
+  empty: the page restored its last-seen id from `multichat-spoken` and the
+  DO only ever replays `id > lastId`, so the rows that were on screen before
+  the reload could never come back — only whatever landed while the page was
+  dead. Now the PWA persists a *feed cursor* `{hi, ts}` under
+  `multichat-feed` (`FEED_CURSOR_KEY`, `src/lib.js`): the highest `msg.id` it
+  has actually rendered (noted after `addRow`, inside the `seenIds` branch —
+  sys rows and gated duplicates never move it) and the local clock when that
+  last advanced. `createFeedCursor` throttles writes to one per
+  `FEED_CURSOR_WRITE_MIN_MS` (5 s; first row immediately, then a single
+  trailing timer) and `pagehide`/hidden flush it. On a fresh page load
+  (in-memory `lastMsgId` still 0) `connect()` reads it through
+  `readFeedCursor`: if the cursor is under `FEED_CURSOR_MAX_AGE_MS` (30 min,
+  measured from the last *rendered* message) the page connects with
+  `lastEventId=0` (`RING_REPLAY_EVENT_ID`) — the edge forwards any finite
+  numeric string and `handleEvents` replays **every** ring entry — and runs
+  `detectReplayGap(storedHi, ringFloor)` against the stored `hi`, which is
+  what the cursor is actually evidence of: `hi` at/above the floor replays
+  silently, `hi` below it (or an empty ring — DO restarted inside the window)
+  gets the one gray row. The request is one-shot: consumed on the first
+  `status` frame; every later reconnect sends the in-memory `lastMsgId`
+  exactly as before. A cursor at/over 30 min old, missing, or malformed is
+  ignored and the connect is a fresh install's (no `Last-Event-ID`, no gray
+  row). `multichat-spoken` no longer carries `lastMsgId`. **Replayed rows
+  cannot buzz or speak** by the existing `isEmittable` predicate alone —
+  buzz and TTS share it (persisted floor + spoken set + `EMIT_TTL_MS`), so a
+  row that fired before the reload is at/under the floor, a silent row stays
+  silent, and anything over 30 min old is aged out; the only rows that fire
+  after a reload are financial/raid rows that landed while the page was dead
+  and are under 30 min old, which fire **once** (§5 speak-once — the design
+  intent, not a gap). Audit-trail: for this one shape the server's
+  `sse_replay_result` carries `kind: 'ring'` and `gap: null` (the client, not
+  the server, decides the gray row against its stored `hi`); no other replay
+  line has a `kind` field, so a gap query that filters `gap = true` can never
+  count a reload replay. The full ring (`RING_SIZE` 200) fits the client's
+  `SEEN_ID_MAX` (400) gate with room to spare. PWA only: the helpers are
+  interpolated at the PWA embed site alone and
+  `test/bundle-gif-render.test.js` asserts neither overlay page carries
+  them — a scene-switch reload of the OBS overlay still gets zero ring rows.
 - **Outbound Twitch socket**: the DO itself opens `wss://irc-ws.chat.twitch.tv`
   anonymously (`justinfan<rand>` nick, no OAuth) and parses raw IRC lines.
   Connects lazily on first SSE client (`ensureTwitchConnected` from
@@ -109,10 +149,13 @@ external renewal cron (optional, renewals) ────────────�
     That real gap (quota death or a revoked `YOUTUBE_API_KEY` silently
     freezing counts) is covered poller-side instead — see the poller
     heartbeat log below.
-  - **`ctx.storage` exception for the Twitch user refresh token**: everything
-    above is otherwise instance memory (see the no-`ctx.storage`-for-chat-state
-    note above), but `getTwitchUserToken`'s refresh token is the one value
-    persisted to `ctx.storage` (key `twUserRefreshToken`). Twitch rotates the
+  - **`ctx.storage` exceptions (five persisted keys)**: everything above is
+    otherwise instance memory (see the no-`ctx.storage`-for-chat-state note
+    above); chat state is never persisted. The only keys the DO writes are
+    `twUserRefreshToken` (the follower-count refresh chain, below), `ttsDaily`
+    and `ttsKill` (TTS budget and kill switch, §3b), `translateDaily`
+    (translate budget, §3b-ii) and `esModerateHealthy` (EventSub row
+    ownership, §3a). The refresh token is the interesting one: Twitch rotates the
     refresh token on every use and invalidates the old one — losing it to a
     DO eviction would permanently break the followers feature instead of
     costing one cheap re-derive, so it can't live in memory like everything
@@ -151,7 +194,7 @@ per message and render on different visual tiers.
 
 Every kind gets the `.msg.paid` gold-tinted row + gold username (unless the
 sender is a mod, which takes visual precedence — see `addRow`'s class
-precedence comment, `src/worker.js:1825`).
+precedence comment, `roleClass` in `src/worker.js`).
 
 | `kind` | Source | TTS label (`TTS_LABELS`) | Notes |
 |---|---|---|---|
@@ -226,7 +269,7 @@ Role color precedence (`roleClass()`, shared by both platforms): `isMod` > finan
 | `EVENTSUB_SECRET` | `Twitch-Eventsub-Message-Signature` header (HMAC-SHA256) on `POST /eventsub/callback` | Shared secret set on each subscription's `transport.secret` | The only auth on this route — **the first public unauthenticated route in this Worker**. See §3a for the full verification spec. Not compared with `safeEqual` directly against a header value (there's no plaintext secret to compare) — it keys an HMAC whose *digest* is then `safeEqual`-compared against the signature header. |
 
 The three plaintext inbound-auth secrets above go through `safeEqual`
-(`src/worker.js:123`) — length-checked, type-guarded, XOR-accumulating
+(`safeEqual` in `src/worker.js`) — length-checked, type-guarded, XOR-accumulating
 constant-time compare, applied *before* the DO stub is touched (edge auth
 gate, `handleEvents`/`handleIngestYt`) so an unauthenticated request never
 bills DO duration. `EVENTSUB_SECRET` follows the same "verify before the DO
@@ -269,8 +312,8 @@ depth. The docs' URL-rendering contract ("must be rendered exactly as given,
 never modified") is honored throughout — accept/reject only ever decides
 whether `url` is kept, nothing ever rewrites it.
 
-**Intentional outbound target: `recent-messages.robotty.de`** (`src/worker.js:1681`,
-`recoverGap`) — a third-party community replay service the DO fetches on
+**Intentional outbound target: `recent-messages.robotty.de`** (`recoverGap` in
+`src/worker.js`) — a third-party community replay service the DO fetches on
 Twitch-IRC reconnect for gap recovery (§4). Not a leak or an accidental
 dependency; flagged here so a future outbound-target audit doesn't mistake
 it for one.
@@ -590,7 +633,7 @@ upgrading a rendered row to gold-sized needs new content (the 3.0-scale
 image) that today's `'mark'` SSE listener has no handler for. This mutation
 is ring-authoritative — any replay that re-sends the row delivers it
 upgraded — but `Last-Event-ID` resume skips already-delivered ids
-(`handleSse` sends only `msg.id > lastId`), so an already-open client sees
+(`handleEvents` sends only `msg.id > lastId`), so an already-open client sees
 the upgrade only after a full page load, not a silent reconnect. Adding a
 live client-side patch handler is a real, bounded follow-up, deliberately
 not done in this pass.
@@ -715,8 +758,9 @@ full-clear button) is never gated — `channel.moderate` has no equivalent
 action, so IRC keeps permanent, unconditional ownership there.
 
 *`esModerateHealthy` — persisted, not just in-memory.* Tracked and persisted
-(`ctx.storage` key `esModerateHealthy`) at the end of every
-`ensureEventSubSubscriptions` reconcile pass, mirrored into the in-memory
+(`ctx.storage` key `esModerateHealthy`) at the end of an
+`ensureEventSubSubscriptions` reconcile pass — written only when it differs
+from the last value known to be stored (or nothing is stored yet) — mirrored into the in-memory
 field read by `applyClearchat`/`applyClearmsg`. Hydrated in the constructor
 via `ctx.blockConcurrencyWhile` (blocks `fetch()` until the read resolves) —
 without this, a DO cold start (eviction between streams, a redeploy) would
@@ -833,7 +877,8 @@ Three independent ceilings, deliberately different persistence:
   date-string comparison), not a rolling 24h. Stop-loss framing: a full
   stream's real financial-TTS volume is ~1,200 chars, so this is ~20x
   headroom, capping a runaway at ~$0.75/day.
-- **Kill switch** (`TTS_KILL_STORAGE_KEY = 'ttsKill'`, also `ctx.storage`),
+- **Kill switch** (`TTS_KILL_STORAGE_KEY = 'ttsKill'`, also `ctx.storage`; read
+  once and memoized in `ttsKilled` — `handleTtsAdmin` on the same instance is the only writer),
   flipped via `POST /overlay/admin {op:'tts_kill', on}` — gated by
   `requireOverlayToken` / `MULTICHAT_OVERLAY_SECRET`, the same secret
   `/tts` and `/overlay/config` check. Briefly unauthenticated on 2026-08-27
@@ -856,7 +901,7 @@ via `ttsBody` (default **off** — a moderation surface a viewer can pay to
 have spoken aloud gets probed, so the scene operator opts in deliberately,
 per scene). Body text runs through `sanitizeSpokenBody` (`src/lib.js`): strip
 control chars → strip URLs → collapse runs of a repeated char beyond 3 →
-`normalizeSpokenMentions` → hard-cap at 120 chars — that 120-char cap is the
+`cleanSpokenMentions` (§3b "Spoken @mentions") → `applySpokenWordMap` → hard-cap at 120 chars — that 120-char cap is the
 body's *own* budget, separate from and smaller than `/tts`'s own 200-char
 whole-utterance cap, specifically so a long donation message can never
 truncate the name/amount prefix out of the utterance. A body that sanitizes
@@ -900,19 +945,54 @@ the PWA's financial/raid/silent split, while the overlay's category decision
 is `config.tts`-driven).
 
 **localStorage: separate key, not a shared one.** The overlay writes exactly
-one key, `multichat-ov-spoken` — namespaced apart from the PWA's four
-(`multichat-fontsize-px`/`multichat-spoken`/`multichat-tts-mode`/
-`multichat-token`) despite sharing an origin. Same origin + unnamespaced keys
+one key, `multichat-ov-spoken` — namespaced apart from the PWA's own
+(`multichat-fontsize-px`/`multichat-spoken`/`multichat-feed`/`multichat-tts-mode`/
+`multichat-tts-muted`/`multichat-gifs`/`multichat-token`) despite sharing an origin. Same origin + unnamespaced keys
 would let the two surfaces cross-suppress each other's spoken message ids.
 
 **The `@` fix applies to both surfaces.** `cleanSpokenName` (`src/lib.js`)
 gains a leading-`@` strip that runs *before* the existing trailing-digit
 strip and the `<2`-char guard, falling back de-`@` → original, never empty
 (`"@Jon_123"` → `"Jon"`, `"@x"` → `"x"`, `"@"` alone stays non-empty).
-`normalizeSpokenMentions` turns an in-body `@name` into just `name` for
-speech (`/(^|\s)@(\S)/` → `$1$2`) — an email address like `a@b.com` is
-untouched, since its `@` isn't preceded by whitespace/start-of-string.
-Display text is never touched by either — spoken output only.
+`normalizeSpokenMentions` (the original `@`-strip-only form, `/(^|\s)@(\S)/` →
+`$1$2`, still exported and unit-tested) is no longer embedded in any page: both
+surfaces now use `cleanSpokenMentions` below. Display text is never touched by
+either — spoken output only.
+
+**Spoken @mentions and the spoken word map (PWA + overlay).** One name path
+serves senders and mentions on both surfaces: `spokenNameFor` (curse-name check,
+then `cleanSpokenName`, rules unchanged: no dash-segment strip, `darc-ttv` stays
+`darc-ttv`) followed by `applySpokenWordMap`, bundled as `spokenSenderName`.
+`cleanSpokenMentions` matches `@` only at the start of a word (start of text or
+after whitespace), takes the whole whitespace-delimited token as the handle
+(`-` and `.` included), peels trailing non-letter/digit punctuation first and
+restores it after cleanup, and leaves emails, mid-word `@` and a punctuation-only
+token alone. Result: `@<handle>` in a body and `<handle>` as a sender speak
+identically (pinned in `test/tts-say-as.test.js`, which asserts against
+`cleanSpokenName` output). The overlay (`formatOverlayChatUtterance` for plain
+chat under `tts=all`, `formatUtterance`/`sanitizeSpokenBody` for financial rows)
+now uses this path too, including the curse-name check, and receives the
+`MULTICHAT_TTS_EXTRA_CURSES` list the PWA already had.
+
+The word map is the optional wrangler **secret** `MULTICHAT_TTS_SAY_AS` (never a
+`vars` entry, which would shadow it): a JSON object of word to spoken form, read
+by `loadSayAs` (`src/worker.js`) through `parseSayAsMap` (`src/lib.js`; at most
+200 entries, keys and spoken forms capped at 64 characters, control characters
+stripped, non-string values dropped). `applySpokenWordMap` replaces whole words
+only, case-insensitively, in one pass with the longest key first: a word is a run
+of letters, digits and `_`, so `-`, `.` and punctuation are boundaries, key `A`
+never matches inside `AB`, and a mapped form is not rescanned. It runs on the
+sender name, over the finished body after mention cleanup and the PWA curse bleep
+(so a mapped form is never bleeped), and before the length cap. The Worker
+embeds the parsed map in both pages as `const TTS_SAY_AS` via `jsonForScript`
+(JSON-encoded, `<` escaped so a value cannot close the script tag); the overlay
+builds its text client-side, so `POST /tts` receives the mapped text and needs no
+change. Unset or invalid JSON gives an empty map (a no-op); an invalid value logs
+one `tts_say_as_bad_config {reason}` ev per isolate (`not_json` or `not_object`),
+never the value. The PWA page memo key includes the raw value, so rotating the
+secret takes effect on the next request. Speech only, display text is never
+rewritten. Words whose key contains digits cannot match a sender name, since
+`cleanSpokenName` strips the digits first.
 
 ### 3b-ii. Tap-to-translate (PWA)
 
@@ -1097,6 +1177,9 @@ sweep and the transitive-interpolation-reference check both cover them.
     idle-disconnect share one alarm slot; this is what disambiguates them).
   - `reap {sseId, reason}` — `reason` is `backpressure` or `max-age` (see the
     zombie-reaping bullet below).
+  - `do_superseded_suspect {ageSec, clients}` / `do_superseded_close {ageSec,
+    clients, ircOpen, err}` / `do_superseded_false_alarm {ageSec, clients}` /
+    `do_superseded_error {step, err}` — the moved-DO self-close (see "Moved / superseded DO instance" below).
   - `do_fetch_timing {op, durationMs, outcome, span_id}` — wraps every
     awaited outbound fetch in `ChatHub`, nine `op` values in total:
     `helix_viewer_poll`, `token_refresh`, `backfill`, `app_token`,
@@ -1228,6 +1311,72 @@ sweep and the transitive-interpolation-reference check both cover them.
   exactly `this.clients.delete()` without the matching lifecycle bookkeeping.
   Covered by `test/do-hardening.test.js` (mock controllers with a scriptable
   `desiredSize`).
+- **Moved / superseded DO instance** (2026.10.18.2). When Cloudflare moves or
+  restarts the `ChatHub` DO while a client's SSE stream is open, the OLD
+  instance stays alive serving that stream (and keeps its IRC socket, so
+  Twitch rows keep flowing), but the storage alarm chain and every new request
+  — including the YT poller's `/ingest/yt` posts — now belong to the NEW
+  instance. The old instance's `lastSeen.yt` ages, the client's YT chip goes
+  red (`status.yt` >= 90s), yet frames (ping/status) keep arriving, so the 60s
+  silence watchdog never fires. Only a fresh connection reaches the live
+  instance. Two independent mechanisms, either alone is enough:
+  1. **Client forced reconnect** (PWA + overlay, not overlay-config). The
+     pure `shouldForceYtReconnect` (`src/lib.js`, interpolated at the PWA and
+     overlay embed sites) says reconnect when the chip has been red >= 60s
+     AND a frame arrived within 60s AND no forced reconnect in the last 300s
+     (`YT_FORCE_RED_MS` / `YT_FORCE_FRAME_FRESH_MS` / `YT_FORCE_CAP_MS`). The
+     PWA tracks `ytStaleSince` in `renderStatus` (set on the red edge, cleared
+     on green; a reconnect does not reset it) and evaluates the helper in the
+     existing 15s watchdog poll, routing through `scheduleReconnectAttempt`
+     with trigger `yt_stale` (visible as `reconnect_attempt {trigger:
+     'yt_stale'}`), checked BEFORE the 60s silence rule so a silent stream is
+     still owned by `watchdog`. The overlay (no watchdog) gets a minimal 15s
+     timer calling its normal `connect()`, beaconing the same `reconnect_attempt`
+     shape under its own 10-per-session budget (separate from
+     `CLIENT_ERROR_SEND_MAX`). The overlay keeps no frame stamps (it has no
+     silence watchdog to overlap with), so it feeds the helper `now` and red
+     alone, bounded by the 300s cap, decides. The PWA feeds the helper
+     `lastFrameTs` (real SSE frames only), never `lastActivityTs`, which the
+     silence watchdog re-arms. The 300s cap is
+     what bounds a real poller outage to one reconnect per 5 minutes per
+     client; the gray "reconnected, some messages may be missing" row after a
+     forced reconnect is the normal gap logic and stays.
+  2. **DO self-close** (`checkSuperseded`, run from the heartbeat tick while
+     clients are attached; `lastAlarmAt` set in `alarm()`, `watchdogArmedAt`
+     in `scheduleWatchdog()`). No alarm and no arm for more than 3 x
+     `WATCHDOG_MS` (180s) on two consecutive 25s ticks logs
+     `do_superseded_suspect {ageSec, clients}`; on the second strike a storage
+     read (`ctx.storage.getAlarm()`, never `setAlarm`) confirms: a throw means
+     superseded and logs `do_superseded_close {ageSec, clients, ircOpen, err}`,
+     success means a merely-late alarm (`do_superseded_false_alarm`, strikes
+     reset, nothing closed). On close it closes every SSE stream (`sse_close` reason
+     `superseded`) and the IRC socket without reconnecting
+     (`supersededClosed` blocks `ensureTwitchConnected` until a new client
+     attaches), and stops the heartbeat loop. A healthy instance cannot trip
+     it: the alarm chain is armed on every client connect and re-armed at the
+     end of every `alarm()` while clients remain, so it fires every <=60s; the
+     reference time is the later of last alarm and last arm, so a new stream
+     after hours of idle (ancient `lastAlarmAt`, fresh arm) is safe, and
+     "never armed / never alarmed" or zero clients is never a signal. The
+     teardown deliberately does NOT call `scheduleIdleDisconnect` (the alarm
+     slot is shared storage the new instance owns). Kill switch: var
+     `MULTICHAT_SUPERSEDED_DETECT="off"` (default on). Covered by
+     `test/superseded-do.test.js` and `test/yt-stale-reconnect.test.js`.
+     The detector is safe only while `IDLE_DISCONNECT_MS` (120s) <
+     3 x `WATCHDOG_MS` (180s); `test/superseded-do.test.js` pins it.
+  - **Timing.** Client side: YouTube rows return in about 2.5-3 minutes
+    (chip red at 90s of YT age, held 60s, observed at 25s status-frame and 15s
+    poll granularity, plus ~1s backoff). DO side: the old instance closes its
+    own streams and IRC about 3.5 minutes after its last delivered alarm (180s
+    threshold, two consecutive 25s ticks). Either alone is enough.
+  - **Next-stream prod proof (DO half).** After the next mid-stream DO move,
+    expect in the logs, in order: `do_superseded_suspect`, then
+    `do_superseded_close` on the OLD script version id, then `sse_open
+    hadLastEventId=true` on the NEW version id, plus `reconnect_attempt`
+    beacons with trigger `yt_stale` from the clients. Their absence while
+    `yt_stale` beacons are present and a late old-version `sse_close` shows
+    means the detector is dead on the platform and the definition of done rests
+    on the client half alone.
 
 ### YouTube (client-side, in the poller)
 
@@ -1287,7 +1436,11 @@ sweep and the transitive-interpolation-reference check both cover them.
   rotation, Worker not yet deployed), 408, 429, 5xx and network errors always
   keep retrying. `sendOnce` records the status via `noteSendStatus`. A drop is
   returned as `dropped` (not `sent`) and `drainLoop` backs off only when
-  `sent + dropped < attempted`, so a poisoned item never delays the chat behind it. That FIFO guarantee covers
+  `sent + dropped < attempted`, so a poisoned item never delays the chat behind it. `drainBatch`'s re-queue respects
+  `RETRY_QUEUE_MAX` too: it evicts oldest-first from the queue front (the same
+  `evictOverflow` as `enqueueRetry`), counted in the heartbeat's `evicted`,
+  never in `dropped` (`dropped` is 400/413 only, and feeds `drainLoop`
+  backoff). That FIFO guarantee covers
   requeue-on-failure only — up to 4 items in a batch are sent concurrently via
   `Promise.all`, so there's no guarantee they *arrive* at the Worker in
   enqueue order; chat message ordering has never depended on that, but the
@@ -1298,7 +1451,8 @@ sweep and the transitive-interpolation-reference check both cover them.
   (`poller.mjs`'s top-level `setInterval`, NOT live-gated — it runs
   identically whether a stream is live or not) logs one bounded line:
   `{ev: 'poller_heartbeat', fetched, posted, failed, dropped, status, counts,
-  rtt_buckets, rtt_max_ms, rtt_count, globalEmojiRenders}`.
+  liveness, watchdogThresholdMin, rtt_buckets, rtt_max_ms, rtt_count,
+  globalEmojiRenders, reactionsSeen, evicted, unknownRenderers}`.
   `globalEmojiRenders` (added 2026-08-20) is the non-sampled counterpart to
   `yt_global_emoji_render` above — a single cycle-scoped integer, no
   per-emoji fields, drained via `takeGlobalEmojiRenderCount()`.
@@ -1326,6 +1480,36 @@ sweep and the transitive-interpolation-reference check both cover them.
   carries the same `X-Req-Id` the DO's `ingest_timing` line logs, so a slow
   request can be joined across both log streams by that id to tell a
   poller-side retry-floor delay apart from a genuine DO-side stall.
+  `evicted` = retry-queue evictions this cycle, from the shared
+  `evictOverflow` (`retry-queue.mjs`) on both paths: the enqueue path and
+  `drainBatch`'s re-queue trim. Log-only: it is not on the heartbeat wire.
+  `unknownRenderers` = top-10 summary of the cumulative unknown-renderer map
+  (`summarizeUnknownRenderers`); also log-only, the full map still rides the
+  heartbeat POST. Two more events come from the tick wrapper
+  (`makeGuardedTick` over `guardTick`, `watchdog.mjs`):
+  `poller_heartbeat_tick_error` is one line per throwing tick
+  (`{ev, reason}`, reason capped at 200 chars, with the ingest secret, the API
+  key and any `key=` query value masked as `[redacted]`), and
+  `poller_heartbeat_tick_skipped` (`{ev, reason: 'in_flight'}`) is the
+  in-flight guard: a tick that starts while the previous one is still running
+  skips. A throwing tick still runs the zombie watchdog and resets the cycle
+  counters (they sit in a `finally` in `heartbeatTick`), then the error is
+  logged and the next tick fires normally.
+  **Tick ceiling**: the in-flight guard is released after `TICK_CEILING_MS`
+  (`watchdog.mjs`, 4 x `HEARTBEAT_INTERVAL_MS` = 60s; above the 10s ingest and
+  5s videos.list timeouts, below `REDISCOVERY_MIN` = 2 min; the release fires on
+  the first interval at or after it, so worst case 75s). Release logs one
+  `poller_tick_ceiling_release` (`{ev, heldMs, reason: 'held_past_ceiling',
+  ceilingMs}`), runs the watchdog (`watchdogOnCeiling` -> `runWatchdogAndReset`)
+  and starts a new tick. Each tick owns a token: a stale tick's `finally` never
+  clears the newer tick's guard, and a stale tick that later resolves drops its
+  state write, heartbeat POST and watchdog run, logging `poller_tick_stale_dropped`
+  (`{ev, what}`) once per tick.
+  **Log masking**: every poller log path that can carry error text goes through
+  `describeErr` / `maskSecrets` (`watchdog.mjs`) with `LOG_SECRETS` (ingest
+  secret + `YOUTUBE_API_KEY`, raw and percent-encoded) plus a `key=` query-value
+  mask; `test/err-mask.test.mjs` sweeps `tools/yt-poller/*.mjs` for a raw
+  `err.message` in a `console.*` line.
 - **Stuck-session self-heal**: `youtube-chat`'s poll loop doesn't recover from
   a broken chat session on its own (stale continuation token) — the poller
   forces a reconnect after `MAX_CONSECUTIVE_ERRORS` = 8 consecutive `error`
@@ -1405,8 +1589,8 @@ sweep and the transitive-interpolation-reference check both cover them.
 
 ## 5. Client Features
 
-All client behavior lives in the inline `<script>` inside `PAGE_HTML`
-(`src/worker.js`, from `~934` on).
+All client behavior lives in the inline `<script>` inside `pageHtml()`
+(`src/worker.js`).
 
 - **Newest-at-top feed**: `addRow` does `feed.insertBefore(row, feed.firstChild)`;
   `MAX_ROWS` (300) trims from the bottom. Auto-scrolls to top unless the
@@ -1420,8 +1604,8 @@ All client behavior lives in the inline `<script>` inside `PAGE_HTML`
   already-rendered rows via `[data-twid]`/`[data-login]` selectors.
 - **Self-mention highlighting**: `MULTICHAT_MY_NAME` (`wrangler.jsonc` plain
   `vars`, not a secret — the streamer's own chat login) flows into both
-  served pages as `MY_NAME` (`src/worker.js:3752` PWA, `:4710` overlay,
-  lowercased at read via `src/worker.js:120,136`) and is passed as `buildRow`'s
+  served pages as `MY_NAME` (`pageHtml` for the PWA, `overlayHtml` for the
+  overlay; lowercased at read in `handleIndex` / `handleOverlay`) and is passed as `buildRow`'s
   `myName` option (`mention: true`) to highlight rows that mention the
   streamer by name. Empty/unset (the default) simply disables the
   highlighting — chat itself is unaffected. The `/overlay/config` preview
@@ -1439,6 +1623,15 @@ All client behavior lives in the inline `<script>` inside `PAGE_HTML`
   own `gifAlt` config param (`OVERLAY_PARAM_SPEC`, default **on** — §2c/§3b)
   that forces alt-text-only rendering unless a scene operator explicitly
   sets `gifAlt=off` per scene; unrelated to and independent of this toggle.
+- **TTS mute**: the `#muteToggle` (🔔/🔕, `TTS_MUTE_ICONS`), immediately left of
+  `#speakToggle`, silences all phone speech without touching the Gold/All mode.
+  Stored under its own key `TTS_MUTE_KEY` (`multichat-tts-muted`, `1`/`0`), never
+  `TTS_MODE_KEY`. Muting cancels the line being read and drops the queue; while
+  muted `fireEmission` still advances `emitFloor` and `spokenIds` (the All-mode chat
+  path advances `emitFloor` too), so unmuting never dumps a backlog. Buzz is
+  unaffected, the speaker button still cycles and its mode announcement is
+  skipped. Hidden with the speaker button when `speechSynthesis` is missing. The
+  overlay has no mute.
 - **TTS read-aloud**: gold alerts (financial rows) are spoken in every
   state. The `#speakToggle` (🔊/📣) switches only whether plain live chat is
   read too: Gold (default, alerts only) or All (alerts plus chat); the choice
@@ -1461,9 +1654,10 @@ All client behavior lives in the inline `<script>` inside `PAGE_HTML`
   `recovered` after reconnect). Now each financial id fires at most once, live
   or replayed: `floor` is the high-water mark of fired ids, `spokenIds` is a
   `Map<id, ts>` of recently-fired ids (pruned past `EMIT_TTL_MS`), and both
-  persist to `localStorage` (`multichat-spoken`, alongside `lastMsgId`). A page
-  reload / iOS background revival therefore behaves like a reconnect: the
-  restored `lastMsgId` requests the gap replay, and donations that arrived
+  persist to `localStorage` (`multichat-spoken`; the replay request itself is
+  the feed cursor's job — `multichat-feed`, §1 "PWA reload keeps the feed").
+  A page reload / iOS background revival therefore behaves like a reconnect:
+  the feed cursor requests the ring replay, and donations that arrived
   while away fire once instead of being re-floored into silence — while a
   **stale** persisted floor cannot flood, because the `EMIT_TTL_MS` age term
   gates every row older than 30 min (verified by
@@ -1483,10 +1677,10 @@ All client behavior lives in the inline `<script>` inside `PAGE_HTML`
   `pushMessage` logs `{ev:'custom_reward_seen', rewardId, login}` for every
   such message (id and login only, never the text, so the reward id can be
   found in Workers Observability) and sets `readAloud: true` on the ring entry
-  only when the id equals the `MULTICHAT_TTS_REWARD_ID` var; `rewardId` itself
-  never reaches the ring or the SSE feed. With the var unset the feature is
+  only when the id equals the `MULTICHAT_TTS_REWARD_ID` secret (`env.MULTICHAT_TTS_REWARD_ID`, read in `ChatHub.pushMessage`; set with `wrangler secret put`, never a `vars` entry, which would shadow it); `rewardId` itself
+  never reaches the ring or the SSE feed. With the secret unset the feature is
   not live and the message is plain chat. `emitCategory` returns `readout` for
-  a `readAloud` row: no buzz, spoken once through the same `fireEmission`
+  a `readAloud` row: buzzes (the `addRow` pattern) and is spoken once through the same `fireEmission`
   per-id gate as gold, using `formatChatUtterance` (so the mention, curse and
   emote rules apply), skipping bot accounts. It renders as a teal `.msg.readout`
   row and is excluded from the All-mode chat path so it is never spoken twice.
@@ -1504,7 +1698,8 @@ All client behavior lives in the inline `<script>` inside `PAGE_HTML`
   |---|---|---|
   | Font size | `multichat-fontsize` | `large` / (absent = normal) |
   | TTS read-aloud mode | `multichat-tts-mode` | `gold` / `all` (absent or any other value, including an old `off`, reads as `gold`) |
-  | Speak-once ledger | `multichat-spoken` | `{floor, lastMsgId, ids: [[id, ts], ...]}` — persisted on `pagehide`/hidden, restored on load (§5 TTS speak-once) |
+  | Speak-once ledger | `multichat-spoken` | `{floor, ids: [[id, ts], ...]}` — persisted on `pagehide`/hidden, restored on load (§5 TTS speak-once) |
+  | Feed cursor | `multichat-feed` | `{hi, ts}` — highest rendered `msg.id` + when it last advanced; throttled writes, flushed on `pagehide`/hidden; read once on page load, trusted only under 30 min old (§1 "PWA reload keeps the feed") |
   | View token | `multichat-token` | raw secret string (fragment-seeded, or manually re-entered via ⚿) |
 - **PWA installability, no service worker**: manifest +
   apple-touch-icon make the page Add-to-Home-Screen-able on iOS and
@@ -1573,6 +1768,17 @@ All client behavior lives in the inline `<script>` inside `PAGE_HTML`
   than a plain button on Android/desktop and a switch on iOS). Ordinary live
   messages never touch this path — only financial/raid rows keep their
   existing `fireEmission` buzz, which is a separate feature.
+
+- **Long sender names (PWA only, CSS only)**: the platform badge and the
+  sender name always share a line. On non-gold rows `span.user` is a nowrap
+  inline-block capped at 60% of the row width with `text-overflow: ellipsis`
+  (the full name stays one tap away in the name sheet; an overlong name also
+  clips its verified tick and colon, there is no DOM wrapper because the golden
+  fixture pins the single-text-node shape). On gold rows (`.paid`,
+  `.points-gigantify`) the badge turns `display: inline` so it is glued to the
+  first characters of the name, and a long name wraps in full. `buildRow` is
+  shared with the overlay, whose layout is untouched (its CSS block has no such
+  rule).
 
 - **Name-tap history sheet (PWA only, 2026-10-11)**: tapping a `span.user`
   in the feed opens a bottom sheet listing every message from the same
@@ -1816,7 +2022,7 @@ All client behavior lives in the inline `<script>` inside `PAGE_HTML`
   Cloudflare R2 behavior (bucket cold-start returning `501` on an early
   `PUT`) that `flushCapture` or the poller's capture writes need to tolerate,
   confirm against current R2 docs/behavior and, if real, add a retry.
-  `flushCapture`'s current error handling (`src/worker.js:543`) only logs and
+  `ChatHub.flushCapture`'s current error handling only logs and
   drops — it does not retry any R2 error class today.
 - **`yt_gift` has no timestamp, gap-recovery classifies it as always-live.**
   `giftMessageViewModel` items carry no `timestampUsec` (unlike the classic

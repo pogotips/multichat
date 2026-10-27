@@ -92,3 +92,109 @@ export function watchdogTick({ liveChatSessionActive, zeroStreak, cycleFetched, 
   }
   return { zeroStreak: nextZeroStreak, fired: false, event: null };
 }
+
+// The single secret mask for every poller log/post path: every exact value in
+// `secrets` (raw and percent-encoded, since an upstream fetch error echoes the
+// request URL where the key is encodeURIComponent'd) plus any `key=...` query
+// value. Pure, never throws.
+export function maskSecrets(text, secrets = []) {
+  let masked = typeof text === 'string' ? text : String(text);
+  for (const secret of secrets) {
+    if (typeof secret !== 'string' || secret === '') continue;
+    masked = masked.split(secret).join('[redacted]');
+    const enc = encodeURIComponent(secret);
+    if (enc !== secret) masked = masked.split(enc).join('[redacted]');
+  }
+  return masked.replace(/([?&]?key=)[^&\s"']+/gi, '$1[redacted]');
+}
+
+// Masked one-line text for any thrown value: "Name: message" (plus the cause
+// chain, depth-capped) or String(err). Never throws, so it is safe inside a
+// catch block that must not itself fail.
+export function describeErr(err, secrets = [], max = Infinity) {
+  let raw;
+  try {
+    raw = err && err.message ? `${err.name || 'Error'}: ${err.message}` : String(err);
+    let cause = err && err.cause;
+    for (let depth = 0; cause && depth < 3; depth++) {
+      raw += ` (cause: ${cause.message ? cause.message : String(cause)})`;
+      cause = cause.cause;
+    }
+  } catch {
+    raw = '[unstringifiable error]';
+  }
+  const masked = maskSecrets(raw, secrets);
+  return masked.length > max ? masked.slice(0, max) : masked;
+}
+
+// Runs one interval tick without ever rejecting: a throw (sync or from any
+// awaited call) becomes one structured poller_heartbeat_tick_error log line
+// carrying the reason, and the caller's interval keeps firing. Log-only by
+// design: no POST, no state change. The reason is truncated and masked via
+// describeErr, since an upstream fetch error can echo its request URL. The log
+// call is itself guarded so a failing logger cannot resurrect the rejection.
+export async function guardTick(fn, log = console.log, secrets = []) {
+  try {
+    await fn();
+  } catch (err) {
+    try {
+      log(JSON.stringify({ ev: 'poller_heartbeat_tick_error', reason: describeErr(err, secrets, 200) }));
+    } catch {}
+  }
+}
+
+// Hard ceiling on how long the in-flight guard may stay held. Every await in a
+// tick is bounded (sendOnce 10s + YT_COUNTS_TIMEOUT_MS 5s, serial = ~15s), so
+// a tick held past this is hung (an unbounded body read, a lost promise).
+// 4 intervals sits above those timeouts and below the shortest watchdog
+// threshold (REDISCOVERY_MIN, 2 min), so releasing never outruns the watchdog.
+// The release fires on the first interval at or after the ceiling, so worst
+// case is ceiling + one interval (75s), still under 2 min.
+export const TICK_CEILING_MS = 4 * HEARTBEAT_INTERVAL_MS;
+
+// In-flight guard around guardTick: a tick that starts while the previous one
+// is still running (a slow videos.list or ingest POST outlasting the 15s
+// interval) skips with one log line instead of stacking a second concurrent
+// run on the same module-level cycle counters. Each tick owns a token; the
+// guard is cleared in a finally only if that tick still owns it, so a throwing
+// tick never wedges the runner and a stale tick can never clear a newer one's
+// guard.
+// Held past ceilingMs: the guard is released with one poller_tick_ceiling_release
+// line (heldMs, reason; no secrets), `onCeiling` (the watchdog) runs guarded,
+// and a new tick starts. The abandoned tick is "stale": its fn receives a ctx
+// whose isStale() (silent) / dropIfStale(what) return true (logging poller_tick_stale_dropped once
+// per tick) so it drops its heartbeat post and state writes.
+export function makeGuardedTick(fn, log = console.log, secrets = [], { onCeiling, ceilingMs = TICK_CEILING_MS, now = Date.now } = {}) {
+  let current = null;
+  return async function guardedTick() {
+    if (current) {
+      const heldMs = now() - current.startedAt;
+      if (heldMs < ceilingMs) {
+        try { log(JSON.stringify({ ev: 'poller_heartbeat_tick_skipped', reason: 'in_flight' })); } catch {}
+        return;
+      }
+      current.stale = true;
+      current = null;
+      try { log(JSON.stringify({ ev: 'poller_tick_ceiling_release', heldMs, reason: 'held_past_ceiling', ceilingMs })); } catch {}
+      if (onCeiling) await guardTick(onCeiling, log, secrets);
+    }
+    const token = { startedAt: now(), stale: false, dropLogged: false };
+    current = token;
+    const ctx = {
+      isStale: () => token.stale,
+      dropIfStale(what) {
+        if (!token.stale) return false;
+        if (!token.dropLogged) {
+          token.dropLogged = true;
+          try { log(JSON.stringify({ ev: 'poller_tick_stale_dropped', what })); } catch {}
+        }
+        return true;
+      },
+    };
+    try {
+      await guardTick(() => fn(ctx), log, secrets);
+    } finally {
+      if (current === token) current = null;
+    }
+  };
+}

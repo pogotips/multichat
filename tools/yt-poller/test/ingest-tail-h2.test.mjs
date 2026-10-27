@@ -30,8 +30,8 @@ import { enqueueRetry, drainBatch, SEND_CONCURRENCY } from '../retry-queue.mjs';
 // Real production values are 5_000/60_000 (poller.mjs:88-89) — this test
 // uses a scaled-down backoff (see `initialBackoffMs` param) purely for test
 // speed; the mechanism under test (does something queued behind a retry
-// get delayed by ~the backoff window, using real timers, not mocked ones)
-// is identical regardless of the constant's magnitude.
+// get delayed by the backoff window, on a fake clock the test advances by
+// hand) is identical regardless of the constant's magnitude.
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 
 async function drainLoopMirror(queue, sendFn, initialBackoffMs, maxBackoffMs) {
@@ -58,6 +58,18 @@ describe('Phase 4b: H2 head-of-line-blocking fingerprint', () => {
   const INITIAL_BACKOFF_MS = 50; // scaled down from poller.mjs's real 5,000ms — see file header
   const MAX_BACKOFF_MS = 500;
 
+  // Fake timers (Date.now included) so the backoff window is exact and the
+  // assertions cannot flake under CI load — a real-clock elapsed-time lower
+  // bound raced setTimeout jitter. Time only moves when the test advances it.
+  describe('with fake timers', () => {
+    beforeEach(() => {
+      vi.useFakeTimers();
+      vi.setSystemTime(new Date('2026-01-01T00:00:00.000Z'));
+    });
+    afterEach(() => {
+      vi.useRealTimers();
+    });
+
   it('a message queued behind a failing/retrying one is delayed by the full backoff — H2 predicted shape', async () => {
     const queue = [];
     // SEND_CONCURRENCY is 4 — msgA alone fills a batch by itself so its
@@ -78,9 +90,11 @@ describe('Phase 4b: H2 head-of-line-blocking fingerprint', () => {
     const loopPromise = drainLoopMirror(queue, sendFn, INITIAL_BACKOFF_MS, MAX_BACKOFF_MS);
     // msgB arrives (post()) partway into msgA's backoff sleep — same as a
     // live chat message arriving while the poller is already backing off.
-    await sleep(INITIAL_BACKOFF_MS / 4);
+    await vi.advanceTimersByTimeAsync(INITIAL_BACKOFF_MS / 4);
     enqueueRetry(queue, 'msgB');
 
+    // Past the first failed batch's (doubled) backoff sleep, well short of the cap.
+    await vi.advanceTimersByTimeAsync(MAX_BACKOFF_MS);
     const timeline = await loopPromise;
 
     const aFirst = timeline.find((t) => t.item === 'msgA');
@@ -91,18 +105,18 @@ describe('Phase 4b: H2 head-of-line-blocking fingerprint', () => {
     // The fingerprint: msgB's actual send is delayed by ~msgA's full backoff
     // window, not by its own (instant) network time — it was ready
     // immediately but sat behind msgA's retry.
-    expect(b.startedAtMs - aFirst.startedAtMs).toBeGreaterThanOrEqual(INITIAL_BACKOFF_MS * 0.9);
+    expect(b.startedAtMs - aFirst.startedAtMs).toBeGreaterThanOrEqual(INITIAL_BACKOFF_MS);
     // And it resolves in the SAME batch as msgA's successful retry — msgB
     // was never itself slow, it was just queued.
     expect(aRetry.startedAtMs).toBe(b.startedAtMs);
   });
+  });
 
   // L8 fix (2026-09-12 review): a real-wall-clock `toBeLessThan` bound here
   // was plausible-flake under CI load (same class of issue the eventsub
-  // clock freeze, 8e3e869, fixed for duration-rounding races). Scoped fake
-  // timers, only for this control test — the head-of-line-blocking test
-  // above genuinely needs real timers, since it races a real setTimeout
-  // sleep against msgB's arrival.
+  // clock freeze, 8e3e869, fixed for duration-rounding races). The
+  // head-of-line-blocking test above now runs on fake timers too, so neither
+  // test depends on the wall clock.
   describe('control: clean batch (fake timers scoped to this test)', () => {
     beforeEach(() => {
       vi.useFakeTimers();

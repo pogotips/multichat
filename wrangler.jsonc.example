@@ -29,9 +29,16 @@
 		// (whole-word in chat text, substring in usernames — keep them unambiguous).
 		// Empty = built-in list only.
 		"MULTICHAT_TTS_EXTRA_CURSES": "",
-		// Optional. Twitch channel-point reward id whose chat message the phone
-		// reads aloud once (teal row). Empty = off, the message is normal chat.
-		"MULTICHAT_TTS_REWARD_ID": ""
+		// Optional kill switch for the superseded-DO detector (a Durable Object
+		// instance that stops receiving alarms while SSE clients are attached
+		// closes its own SSE streams + IRC socket so clients reconnect to the
+		// live instance). Default on; set to "off" to disable the detector.
+		"MULTICHAT_SUPERSEDED_DETECT": "on"
+		// MULTICHAT_TTS_REWARD_ID is a wrangler SECRET, not a var: never add it
+		// here (a vars entry of the same name would shadow the secret).
+		// MULTICHAT_TTS_SAY_AS is also a wrangler SECRET, never a var: a JSON
+		// object of word -> spoken form (e.g. {"Word":"how it is said"}), applied
+		// to speech only. Set it with `wrangler secret put MULTICHAT_TTS_SAY_AS`.
 	},
 	"durable_objects": {
 		"bindings": [

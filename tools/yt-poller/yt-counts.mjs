@@ -4,6 +4,8 @@
 // normalize.mjs/recovery.mjs, so both the video-id lifecycle and the network
 // call are testable in isolation without booting the whole poller process.
 
+import { describeErr } from './watchdog.mjs';
+
 export const YT_COUNTS_TIMEOUT_MS = 5_000;
 
 // Tracks the CURRENTLY-LIVE video id only — never the last-known one. A
@@ -61,7 +63,7 @@ async function requestVideosList(videoId, apiKey, { fetchImpl, timeoutMs }) {
     return { ok: true, status: res.status, item };
   } catch (err) {
     // quota/network/timeout/malformed — skip silently, never blocks the heartbeat
-    console.error(`yt counts fetch failed: ${err.message}`);
+    console.error(`yt counts fetch failed: ${describeErr(err, [apiKey])}`);
     return { ok: null, status: null, item: null };
   }
 }

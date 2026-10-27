@@ -16,9 +16,23 @@ export function isRetryable(msg) {
   return Boolean(msg) && msg.type !== 'heartbeat' && msg.type !== 'yt_reactions';
 }
 
-export function enqueueRetry(queue, item, maxSize = RETRY_QUEUE_MAX) {
+// onEvict (optional): called once per item shifted off the front to honor
+// maxSize, with that item — lets the caller count/log an overflow that would
+// otherwise drop chat silently. Return value is unchanged (the queue).
+export function enqueueRetry(queue, item, maxSize = RETRY_QUEUE_MAX, onEvict) {
   queue.push(item);
-  while (queue.length > maxSize) queue.shift();
+  return evictOverflow(queue, maxSize, onEvict);
+}
+
+// The one overflow policy for every path that adds to the queue: the OLDEST
+// items (front) go first, each reported to onEvict. enqueueRetry (push at the
+// back) and drainBatch's re-queue (unshift at the front) both end here, so
+// neither can leave the queue past maxSize.
+function evictOverflow(queue, maxSize, onEvict) {
+  while (queue.length > maxSize) {
+    const evicted = queue.shift();
+    if (typeof onEvict === 'function') onEvict(evicted);
+  }
   return queue;
 }
 
@@ -57,7 +71,10 @@ export function isPayloadRejection(status) {
 // block the chat queued behind it. A dropped item is not a transient failure:
 // it is reported in `dropped` (separate from `sent`) so the caller's backoff
 // only reacts to failures a retry could fix.
-export async function drainBatch(queue, sendFn, concurrency = SEND_CONCURRENCY) {
+// The re-queue below can push the queue past maxSize (items enqueued while the
+// batch was in flight sit behind the failed ones), so it trims with the same
+// policy as enqueueRetry; onEvict is the same optional per-item callback.
+export async function drainBatch(queue, sendFn, concurrency = SEND_CONCURRENCY, maxSize = RETRY_QUEUE_MAX, onEvict) {
   const batch = queue.splice(0, concurrency);
   if (batch.length === 0) return { attempted: 0, sent: 0, dropped: 0 };
   const results = await Promise.all(batch.map(async (item) => ({ item, ok: await sendFn(item) })));
@@ -75,6 +92,7 @@ export async function drainBatch(queue, sendFn, concurrency = SEND_CONCURRENCY) 
     failed.push(item);
   }
   queue.unshift(...failed);
+  evictOverflow(queue, maxSize, onEvict);
   return { attempted: results.length, sent: results.filter((r) => r.ok).length, dropped };
 }
 

@@ -54,7 +54,22 @@ rsync -a --exclude-from="${SRC}.oss-exclude" "$SRC" "$STAGE/"
 # published (see .oss-exclude); an inline list would ship the very
 # literals it exists to block.
 
-grep_args=(-rIn --exclude-dir=.git --exclude-dir=node_modules --exclude-dir=.wrangler --exclude=publish-oss.sh --exclude=oss-filename-leak-check.mjs --exclude=oss-filename-leak-check.test.mjs --exclude=publish-oss-forbidden-gate.test.mjs --exclude=publish-oss-post-sync-check.test.mjs --exclude=publish-oss-e2e.test.mjs -i)
+# One exclude set for both the substring and whole-word sweeps (was two
+# near-identical inline lists that drifted by one test file).
+FORBIDDEN_EXCLUDES=(
+  --exclude-dir=.git
+  --exclude-dir=node_modules
+  --exclude-dir=.wrangler
+  --exclude=publish-oss.sh
+  --exclude=oss-filename-leak-check.mjs
+  --exclude=oss-filename-leak-check.test.mjs
+  --exclude=publish-oss-forbidden-gate.test.mjs
+  --exclude=publish-oss-post-sync-check.test.mjs
+  --exclude=publish-oss-word-forbidden-gate.test.mjs
+  --exclude=publish-oss-e2e.test.mjs
+)
+
+grep_args=(-rIn "${FORBIDDEN_EXCLUDES[@]}" -i)
 for term in "${FORBIDDEN[@]}"; do
   grep_args+=(-F -e "$term")
 done
@@ -69,7 +84,7 @@ fi
 # Whole-word forbidden literals (short strings that would false-positive as
 # plain substrings, e.g. a short word inside "video"/"provide") — same exclude
 # list, `-w` added so only a standalone-word match trips it.
-word_grep_args=(-rIn -w --exclude-dir=.git --exclude-dir=node_modules --exclude-dir=.wrangler --exclude=publish-oss.sh --exclude=oss-filename-leak-check.mjs --exclude=oss-filename-leak-check.test.mjs --exclude=publish-oss-forbidden-gate.test.mjs --exclude=publish-oss-post-sync-check.test.mjs --exclude=publish-oss-word-forbidden-gate.test.mjs --exclude=publish-oss-e2e.test.mjs -i)
+word_grep_args=(-rIn -w "${FORBIDDEN_EXCLUDES[@]}" -i)
 for term in "${FORBIDDEN_WORDS[@]}"; do
   word_grep_args+=(-F -e "$term")
 done

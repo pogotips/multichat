@@ -24,9 +24,9 @@ afterEach(() => {
 });
 
 // Fires pollTwitchViewers (the highest-exposure unbounded fetch per Phase 2,
-// worker.js:1062) inside the DO instance without awaiting it — mirrors
+// ChatHub.pollTwitchViewers) inside the DO instance without awaiting it — mirrors
 // production's own fire-and-forget shape (startTwitchViewerPoll calls
-// `this.pollTwitchViewers();` with no `await`, worker.js:996) — then, while
+// `this.pollTwitchViewers();` with no `await`) — then, while
 // that fetch is still pending, issues a real `/ingest/yt` POST through the
 // DO's actual fetch handler (stub.fetch, not a direct method call) and
 // measures wall-clock time to response.

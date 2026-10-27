@@ -30,13 +30,13 @@ import {
   formatIngestFailureLog, formatIngestErrorLog, isPayloadRejection,
 } from './retry-queue.mjs';
 import {
-  bumpCount, appendCapture, CAPTURE_DIR, CAPTURE_FILE, CAPTURE_MAX_BYTES, REACTIONS_CAPTURE_FILE,
+  bumpCount, summarizeUnknownRenderers, appendCapture, CAPTURE_DIR, CAPTURE_FILE, CAPTURE_MAX_BYTES, REACTIONS_CAPTURE_FILE,
   reactionCaptureLine, aggregateReactionBuckets, shouldPostReaction, reactionPostPayload,
 } from './capture.mjs';
 import { createVideoIdTracker, fetchYtVideoState } from './yt-counts.mjs';
 import { probeCurrentLive, createRediscoveryGate, resolveRediscoveryOutcome, formatRediscoveryLog } from './rediscovery.mjs';
 import {
-  HEARTBEAT_INTERVAL_MS, REDISCOVERY_GATE_MS, resolveLiveness, selectWatchdogThreshold, watchdogTick,
+  HEARTBEAT_INTERVAL_MS, REDISCOVERY_GATE_MS, resolveLiveness, selectWatchdogThreshold, watchdogTick, makeGuardedTick, describeErr, maskSecrets,
 } from './watchdog.mjs';
 
 const { YT_CHANNEL_ID, MULTICHAT_URL, MULTICHAT_INGEST_SECRET, YOUTUBE_API_KEY, WATCHDOG_LIVENESS_GATE: WATCHDOG_LIVENESS_GATE_RAW } =
@@ -56,6 +56,13 @@ if (!YT_CHANNEL_ID || !MULTICHAT_URL || !MULTICHAT_INGEST_SECRET) {
 }
 // YOUTUBE_API_KEY is optional: absent means counts simply never populate
 // (chat/heartbeat delivery is unaffected either way).
+
+// The one secret set for every log/post path below (the heartbeat guardTick
+// masks with the same set): any error text that can reach a log line goes
+// through maskErr / maskSecrets so a fetch error echoing a key-bearing URL
+// never prints a secret value.
+const LOG_SECRETS = [MULTICHAT_INGEST_SECRET, YOUTUBE_API_KEY].filter(Boolean);
+const maskErr = (err) => describeErr(err, LOG_SECRETS);
 
 const INGEST_URL = MULTICHAT_URL.replace(/\/$/, '') + '/ingest/yt';
 
@@ -153,6 +160,9 @@ let cycleFetched = 0;
 let cyclePosted = 0;
 let cycleFailed = 0;
 let cycleDropped = 0;
+// Retry-queue overflow evictions this cycle (enqueueRetry's onEvict) — chat
+// shifted off the front of the bounded queue during an outage.
+let cycleEvicted = 0;
 // Drained from normalize.mjs's non-sampled counter each cycle — see
 // takeGlobalEmojiRenderCount there for why this exists alongside the
 // existing 2%-sampled yt_global_emoji_render log.
@@ -241,7 +251,12 @@ function randReqId() {
 
 // Single POST attempt, no queue side effects — used as the sendFn drainBatch
 // calls back into, and directly for heartbeats (which never touch the queue).
-async function sendOnce(msg) {
+async function sendOnce(msg, ctx) {
+  // Heartbeat sends carry their tick's ctx: once that tick is stale (guard
+  // released at the ceiling) its late result must not touch the newer cycle's
+  // rtt / failure counters or the send-status map. Chat sends (drain loop)
+  // pass no ctx and are never stale.
+  const stale = () => Boolean(ctx && ctx.isStale());
   const reqId = randReqId();
   const attempt = nextAttempt(msg);
   const rttStart = performance.now();
@@ -256,27 +271,25 @@ async function sendOnce(msg) {
       body: JSON.stringify(msg),
       signal: AbortSignal.timeout(10_000),
     });
-    recordRtt(performance.now() - rttStart);
-    noteSendStatus(msg, res.ok ? undefined : res.status);
+    if (!stale()) { recordRtt(performance.now() - rttStart); noteSendStatus(msg, res.ok ? undefined : res.status); }
     if (!res.ok) {
       // A 400/413 is a payload rejection: the item is dropped, not retried
       // (drainBatch), so it counts as `dropped`, never `failed`. Counted
       // BEFORE reading the body: if res.text() threw, the catch below would
       // otherwise book a drop as a failure.
-      if (msg.type !== 'heartbeat') {
+      if (msg.type !== 'heartbeat' && !stale()) {
         if (isPayloadRejection(res.status)) cycleDropped++; else cycleFailed++;
       }
       // Non-throwing body read: the catch below is for transport errors only,
       // so a failed body read can never book this response a second time.
-      const body = await res.text().catch((err) => `[body read failed: ${err && err.message}]`);
-      console.error(formatIngestFailureLog(res.status, body, attempt));
+      const body = await res.text().catch((err) => `[body read failed: ${maskErr(err)}]`);
+      console.error(maskSecrets(formatIngestFailureLog(res.status, body, attempt), LOG_SECRETS));
     }
     return res.ok;
   } catch (err) {
-    recordRtt(performance.now() - rttStart);
-    noteSendStatus(msg, undefined);
-    console.error(formatIngestErrorLog(err.message, attempt));
-    if (msg.type !== 'heartbeat') cycleFailed++;
+    if (!stale()) { recordRtt(performance.now() - rttStart); noteSendStatus(msg, undefined); }
+    console.error(formatIngestErrorLog(maskErr(err), attempt));
+    if (msg.type !== 'heartbeat' && !stale()) cycleFailed++;
     return false;
   }
 }
@@ -292,7 +305,7 @@ async function drainLoop() {
   draining = true;
   try {
     while (retryQueue.length > 0) {
-      const { attempted, sent, dropped } = await drainBatch(retryQueue, sendOnce, SEND_CONCURRENCY);
+      const { attempted, sent, dropped } = await drainBatch(retryQueue, sendOnce, SEND_CONCURRENCY, RETRY_QUEUE_MAX, () => { cycleEvicted++; });
       if (attempted === 0) break;
       // A dropped payload rejection is not a transient failure: no backoff for it,
       // so the chat queued behind it goes out on the next batch immediately.
@@ -312,15 +325,15 @@ async function drainLoop() {
   }
 }
 
-async function post(msg) {
+async function post(msg, ctx) {
   if (msg.type !== 'heartbeat') cyclePosted++;
   if (!isRetryable(msg)) {
     // Heartbeat: direct send, no queue, no retry — see isRetryable's comment.
     // Return value used only by the heartbeat caller below; every other
     // caller of post() still fires-and-forgets it, same as before.
-    return sendOnce(msg);
+    return sendOnce(msg, ctx);
   }
-  enqueueRetry(retryQueue, msg, RETRY_QUEUE_MAX);
+  enqueueRetry(retryQueue, msg, RETRY_QUEUE_MAX, () => { cycleEvicted++; });
   drainLoop(); // fire-and-forget: draining guard makes repeated calls free
 }
 
@@ -429,7 +442,7 @@ async function run() {
       } catch (err) {
         // Disk full / unwritable dir: telemetry is best-effort, must never
         // take the whole poller down over it.
-        console.error(`capture write failed: ${err.message}`);
+        console.error(`capture write failed: ${maskErr(err)}`);
       }
       return;
     }
@@ -448,7 +461,7 @@ async function run() {
         try {
           appendCapture(REACTIONS_CAPTURE_PATH, line, CAPTURE_MAX_BYTES);
         } catch (err) {
-          console.error(`reactions capture write failed: ${err.message}`);
+          console.error(`reactions capture write failed: ${maskErr(err)}`);
         }
       }
       const agg = aggregateReactionBuckets(item.raw);
@@ -497,8 +510,8 @@ async function run() {
 
   liveChat.on('error', (err) => {
     lastErrorMsg = err?.message ?? String(err);
-    console.error(`live chat error: ${lastErrorMsg}`);
-    errorHistory.push(safeErrorText(lastErrorMsg));
+    console.error(`live chat error: ${maskSecrets(lastErrorMsg, LOG_SECRETS)}`);
+    errorHistory.push(safeErrorText(maskSecrets(lastErrorMsg, LOG_SECRETS)));
     if (errorHistory.length > ERROR_HISTORY_MAX) errorHistory.shift();
     consecutiveErrors++;
     if (consecutiveErrors >= MAX_CONSECUTIVE_ERRORS) {
@@ -549,7 +562,7 @@ async function run() {
 
   const started = await liveChat.start().catch((err) => {
     lastErrorMsg = err?.message ?? String(err);
-    console.error(`failed to start: ${lastErrorMsg}`);
+    console.error(`failed to start: ${maskSecrets(lastErrorMsg, LOG_SECRETS)}`);
     return false;
   });
 
@@ -601,21 +614,78 @@ async function runRediscoveryProbe(liveness) {
       probedVideoId,
     });
     if (outcome.action === 'discarded') {
-      console.log(formatRediscoveryLog(liveness, { changed: false, discarded: true, probedVideoId: probedVideoId || null, ...why }));
+      console.log(maskSecrets(formatRediscoveryLog(liveness, { changed: false, discarded: true, probedVideoId: probedVideoId || null, ...why }), LOG_SECRETS));
       return;
     }
     if (outcome.action === 'no_session') {
-      console.log(formatRediscoveryLog(liveness, { changed: false, outcome: 'skipped_no_session', probedVideoId: probedVideoId || null, ...why }));
+      console.log(maskSecrets(formatRediscoveryLog(liveness, { changed: false, outcome: 'skipped_no_session', probedVideoId: probedVideoId || null, ...why }), LOG_SECRETS));
       return;
     }
     const changed = outcome.action === 'changed';
-    console.log(formatRediscoveryLog(liveness, { changed, probedVideoId: probedVideoId || null, ...why }));
+    console.log(maskSecrets(formatRediscoveryLog(liveness, { changed, probedVideoId: probedVideoId || null, ...why }), LOG_SECRETS));
     if (changed) {
       currentLiveChat?.stop('liveness rediscovery: videoId changed, sustained fetched=0');
     }
   } finally {
     gate.release();
   }
+}
+
+// Watchdog + per-cycle counter reset, run from heartbeatTick's finally and
+// from the tick-ceiling release (watchdogOnCeiling) when a hung tick never
+// reached its own finally.
+function runWatchdogAndReset(liveness, watchdogThresholdMin) {
+  try {
+    // watchdogTick (watchdog.mjs): forensics rec 4 + round-3 audit empty-200
+    // zombie watchdog, threshold liveness-selected internally. Gated on
+    // liveChatSessionActive — this heartbeat interval is deliberately NOT
+    // live-gated (see comment above), so cycleFetched===0 is the normal,
+    // permanent state whenever there's no stream at all; ungated, this would
+    // force a "reconnect" on a fixed cadence all night, every night, with no
+    // stream up. avoid re-checking every tick on fire — see rediscoveryGate
+    // below for the independent, authoritative spacing guarantee.
+    const tick = watchdogTick({ liveChatSessionActive, zeroStreak, cycleFetched, liveness, gateEnabled: WATCHDOG_LIVENESS_GATE });
+    zeroStreak = tick.zeroStreak;
+    if (tick.fired) {
+      // REFINEMENT 1: not_live rediscovery is expected, near-zero-cost in the
+      // common case, not a health problem — it gets its own event so it never
+      // pollutes zombie_watchdog_reconnect, which stays reserved for
+      // "something might actually be wrong".
+      if (tick.event === 'yt_rediscovery') {
+        // fire-and-forget: logs its own outcome, tears down currentLiveChat
+        // itself only if the videoId genuinely changed. runRediscoveryProbe
+        // is not expected to ever reject (probeCurrentLive never does),
+        // but this must never surface as an unhandled rejection regardless.
+        runRediscoveryProbe(liveness).catch((err) => console.error(`rediscovery probe failed: ${maskErr(err)}`));
+      } else {
+        console.log(JSON.stringify({ ev: 'zombie_watchdog_reconnect', zeroStreakMin: watchdogThresholdMin, liveness }));
+        currentLiveChat?.stop('zombie watchdog: sustained fetched=0');
+      }
+    }
+  } finally {
+    cycleFetched = 0;
+    cyclePosted = 0;
+    cycleFailed = 0;
+    cycleDropped = 0;
+    cycleEvicted = 0;
+    cycleRttBuckets = freshRttBuckets();
+    cycleRttMaxMs = 0;
+    cycleRttCount = 0;
+    cycleGlobalEmojiRenders = 0;
+  }
+}
+
+// Ceiling release: the hung tick's finally has not run, so run the watchdog
+// here from the last liveness sample (resolveLiveness fails open to 'unknown').
+function watchdogOnCeiling() {
+  const liveness = resolveLiveness({
+    gateEnabled: WATCHDOG_LIVENESS_GATE,
+    sampleState: lastLiveness.state,
+    sampleAt: lastLiveness.at,
+    now: Date.now(),
+  });
+  const { min } = selectWatchdogThreshold({ gateEnabled: WATCHDOG_LIVENESS_GATE, liveness });
+  runWatchdogAndReset(liveness, min);
 }
 
 // Proves the poller container itself is alive, independent of whether a
@@ -627,109 +697,115 @@ async function runRediscoveryProbe(liveness) {
 // NOT live-gated — it runs on this same 15s cadence whether a stream is live
 // or not, so silence in the poller_heartbeat log below always means the
 // poller process itself died, never just "stream is offline".
-setInterval(async () => {
+async function heartbeatTick(ctx) {
   const videoId = videoIdTracker.get();
-  // Change 1: single videos.list call feeds both the topbar counts (below,
-  // unchanged output — see ADD 5 in the plan doc) and the watchdog's
-  // liveness gate. Never call fetchYtCounts here too — that would spend a
-  // second quota unit for data this call already carries.
-  const videoState = await fetchYtVideoState(videoId, YOUTUBE_API_KEY);
-  const counts = videoState.counts;
-  lastLiveness = videoState.liveness;
-  // Classified here, not inside fetchYtVideoState, so its heartbeat payload
-  // contract (counts: null = zero fields, never a special case) stays
-  // untouched — zero ingest surface change vs. before this feature existed.
-  // skip = feature not configured/not live; err = key+videoId present but
-  // the call still came back with no usable counts (quota death, revoked
-  // key, malformed response) — previously indistinguishable from "not live"
-  // and silent.
-  const countsOutcome = (!YOUTUBE_API_KEY || !videoId) ? 'skip' : (counts ? 'ok' : 'err');
-  const lastMessageAgeSec = lastChatAt ? Math.round((Date.now() - lastChatAt) / 1000) : null;
-
-  // resolveLiveness (watchdog.mjs, FIX 2/Change 2): a stale sample is never
-  // trusted as a positive not_live read — it can only make the watchdog MORE
-  // patient (route to 'unknown'), never hold it off. FIX 3: the kill switch
-  // reports its own 'gate_off' value distinct from 'unknown', so heartbeat
-  // consumers can tell "off on purpose" from "couldn't classify this cycle".
-  const liveness = resolveLiveness({
+  // Fallback computed BEFORE the try: if anything below throws, the finally
+  // still runs the watchdog and resets the per-cycle counters (a throw
+  // propagates to guardTick afterwards; finally does not swallow it). The
+  // try recomputes both from the fresh videos.list sample.
+  let liveness = resolveLiveness({
     gateEnabled: WATCHDOG_LIVENESS_GATE,
     sampleState: lastLiveness.state,
     sampleAt: lastLiveness.at,
     now: Date.now(),
   });
+  let { min: watchdogThresholdMin } = selectWatchdogThreshold({ gateEnabled: WATCHDOG_LIVENESS_GATE, liveness });
+  try {
+    // Change 1: single videos.list call feeds both the topbar counts (below,
+    // unchanged output — see ADD 5 in the plan doc) and the watchdog's
+    // liveness gate. Never call fetchYtCounts here too — that would spend a
+    // second quota unit for data this call already carries.
+    const videoState = await fetchYtVideoState(videoId, YOUTUBE_API_KEY);
+    // Stale tick (guard released at the ceiling while this fetch hung): drop
+    // before any state write or post — the newer tick owns the state now.
+    if (ctx.dropIfStale('state')) return;
+    const counts = videoState.counts;
+    lastLiveness = videoState.liveness;
+    // Classified here, not inside fetchYtVideoState, so its heartbeat payload
+    // contract (counts: null = zero fields, never a special case) stays
+    // untouched — zero ingest surface change vs. before this feature existed.
+    // skip = feature not configured/not live; err = key+videoId present but
+    // the call still came back with no usable counts (quota death, revoked
+    // key, malformed response) — previously indistinguishable from "not live"
+    // and silent.
+    const countsOutcome = (!YOUTUBE_API_KEY || !videoId) ? 'skip' : (counts ? 'ok' : 'err');
+    const lastMessageAgeSec = lastChatAt ? Math.round((Date.now() - lastChatAt) / 1000) : null;
 
-  // selectWatchdogThreshold (watchdog.mjs, BLOCKING round-3 audit): liveness
-  // SELECTS a threshold, it never suppresses. not_live gets the cheap
-  // rediscovery cadence; live/unknown/gate_off all get the patient backstop
-  // (gate_off uses the pre-audit legacy constant so the kill switch is a
-  // true rollback).
-  const { min: watchdogThresholdMin } = selectWatchdogThreshold({ gateEnabled: WATCHDOG_LIVENESS_GATE, liveness });
+    // resolveLiveness (watchdog.mjs, FIX 2/Change 2): a stale sample is never
+    // trusted as a positive not_live read — it can only make the watchdog MORE
+    // patient (route to 'unknown'), never hold it off. FIX 3: the kill switch
+    // reports its own 'gate_off' value distinct from 'unknown', so heartbeat
+    // consumers can tell "off on purpose" from "couldn't classify this cycle".
+    liveness = resolveLiveness({
+      gateEnabled: WATCHDOG_LIVENESS_GATE,
+      sampleState: lastLiveness.state,
+      sampleAt: lastLiveness.at,
+      now: Date.now(),
+    });
 
-  const status = await post({
-    type: 'heartbeat',
-    unknownRenderers: { ...unknownRendererCounts },
-    fetched: cycleFetched,
-    lastMessageAgeSec,
-    // ADD 4: additive only, no renames — makes the next audit answerable
-    // from the heartbeat alone instead of a second YouTube API cross-check.
-    liveness,
-    watchdogThresholdMin,
-    ...(counts || {}),
-  });
-  console.log(JSON.stringify({
-    ev: 'poller_heartbeat',
-    fetched: cycleFetched,
-    posted: cyclePosted,
-    failed: cycleFailed,
-    dropped: cycleDropped,
-    status,
-    counts: countsOutcome,
-    liveness,
-    watchdogThresholdMin,
-    rtt_buckets: cycleRttBuckets,
-    rtt_max_ms: Math.round(cycleRttMaxMs),
-    rtt_count: cycleRttCount,
-    globalEmojiRenders: cycleGlobalEmojiRenders,
-    // Cumulative for the process lifetime (never reset per-cycle), same
-    // convention as unknownRendererCounts — a burst is a rare, bursty event;
-    // a running total is more useful here than a per-15s-cycle count.
-    reactionsSeen,
-  }));
-  // watchdogTick (watchdog.mjs): forensics rec 4 + round-3 audit empty-200
-  // zombie watchdog, threshold liveness-selected internally. Gated on
-  // liveChatSessionActive — this heartbeat interval is deliberately NOT
-  // live-gated (see comment above), so cycleFetched===0 is the normal,
-  // permanent state whenever there's no stream at all; ungated, this would
-  // force a "reconnect" on a fixed cadence all night, every night, with no
-  // stream up. avoid re-checking every tick on fire — see rediscoveryGate
-  // below for the independent, authoritative spacing guarantee.
-  const tick = watchdogTick({ liveChatSessionActive, zeroStreak, cycleFetched, liveness, gateEnabled: WATCHDOG_LIVENESS_GATE });
-  zeroStreak = tick.zeroStreak;
-  if (tick.fired) {
-    // REFINEMENT 1: not_live rediscovery is expected, near-zero-cost in the
-    // common case, not a health problem — it gets its own event so it never
-    // pollutes zombie_watchdog_reconnect, which stays reserved for
-    // "something might actually be wrong".
-    if (tick.event === 'yt_rediscovery') {
-      // fire-and-forget: logs its own outcome, tears down currentLiveChat
-      // itself only if the videoId genuinely changed. runRediscoveryProbe
-      // is not expected to ever reject (probeCurrentLive never does),
-      // but this must never surface as an unhandled rejection regardless.
-      runRediscoveryProbe(liveness).catch((err) => console.error(`rediscovery probe failed: ${err.message}`));
-    } else {
-      console.log(JSON.stringify({ ev: 'zombie_watchdog_reconnect', zeroStreakMin: watchdogThresholdMin, liveness }));
-      currentLiveChat?.stop('zombie watchdog: sustained fetched=0');
-    }
+    // selectWatchdogThreshold (watchdog.mjs, BLOCKING round-3 audit): liveness
+    // SELECTS a threshold, it never suppresses. not_live gets the cheap
+    // rediscovery cadence; live/unknown/gate_off all get the patient backstop
+    // (gate_off uses the pre-audit legacy constant so the kill switch is a
+    // true rollback).
+    ({ min: watchdogThresholdMin } = selectWatchdogThreshold({ gateEnabled: WATCHDOG_LIVENESS_GATE, liveness }));
+
+    if (ctx.dropIfStale('post')) return;
+    const status = await post({
+      type: 'heartbeat',
+      unknownRenderers: { ...unknownRendererCounts },
+      fetched: cycleFetched,
+      lastMessageAgeSec,
+      // ADD 4: additive only, no renames — makes the next audit answerable
+      // from the heartbeat alone instead of a second YouTube API cross-check.
+      liveness,
+      watchdogThresholdMin,
+      ...(counts || {}),
+    }, ctx);
+    // post() can also hang past the ceiling: a stale tick drops its log line too.
+    if (ctx.dropIfStale('log')) return;
+    console.log(JSON.stringify({
+      ev: 'poller_heartbeat',
+      fetched: cycleFetched,
+      posted: cyclePosted,
+      failed: cycleFailed,
+      dropped: cycleDropped,
+      status,
+      counts: countsOutcome,
+      liveness,
+      watchdogThresholdMin,
+      rtt_buckets: cycleRttBuckets,
+      rtt_max_ms: Math.round(cycleRttMaxMs),
+      rtt_count: cycleRttCount,
+      globalEmojiRenders: cycleGlobalEmojiRenders,
+      // Cumulative for the process lifetime (never reset per-cycle), same
+      // convention as unknownRendererCounts — a burst is a rare, bursty event;
+      // a running total is more useful here than a per-15s-cycle count.
+      reactionsSeen,
+      // LOG-ONLY: `evicted` is deliberately not in the heartbeat POST body above.
+      // The wire shape is frozen (the Worker ignores unknown fields, but a
+      // version-skew window is not worth one counter).
+      evicted: cycleEvicted,
+      // Top-10 summary of the cumulative unknownRendererCounts (the full map is
+      // unbounded in code and stays on the heartbeat wire untouched). Log-only: a
+      // Worker-side consumer for the wire field is a separate decision (J10).
+      unknownRenderers: summarizeUnknownRenderers(unknownRendererCounts),
+    }));
+  } finally {
+    // A stale tick (guard released at the ceiling) must not touch the newer
+    // tick's counters or run a second watchdog on them.
+    if (!ctx.dropIfStale('watchdog')) runWatchdogAndReset(liveness, watchdogThresholdMin);
   }
-  cycleFetched = 0;
-  cyclePosted = 0;
-  cycleFailed = 0;
-  cycleDropped = 0;
-  cycleRttBuckets = freshRttBuckets();
-  cycleRttMaxMs = 0;
-  cycleRttCount = 0;
-  cycleGlobalEmojiRenders = 0;
-}, HEARTBEAT_INTERVAL_MS);
+}
+
+// guardTick (via makeGuardedTick) never rejects: a throw anywhere inside heartbeatTick (or anything
+// it awaits) logs poller_heartbeat_tick_error with the reason and the next
+// tick still fires. Unguarded, the rejection is an unhandled one and Node 20
+// exits the process.
+// makeGuardedTick (watchdog.mjs) also skips a tick that starts while the
+// previous one is still running, with one poller_heartbeat_tick_skipped line.
+const heartbeatRunner = makeGuardedTick(heartbeatTick, console.log, LOG_SECRETS, { onCeiling: watchdogOnCeiling });
+setInterval(heartbeatRunner, HEARTBEAT_INTERVAL_MS);
 
 process.on('SIGTERM', () => process.exit(0));
 process.on('SIGINT', () => process.exit(0));

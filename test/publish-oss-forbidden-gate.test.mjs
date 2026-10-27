@@ -14,7 +14,7 @@
 // and (b) a FORBIDDEN literal anywhere else still trips the gate.
 import { describe, it, expect, afterEach, vi } from 'vitest';
 import { spawnSync, execFileSync } from 'node:child_process';
-import { mkdtempSync, mkdirSync, writeFileSync, rmSync, readFileSync } from 'node:fs';
+import { mkdtempSync, mkdirSync, writeFileSync, rmSync, readFileSync, existsSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
@@ -25,6 +25,8 @@ vi.setConfig({ testTimeout: OSS_TEST_TIMEOUT_MS });
 const DIR = path.dirname(fileURLToPath(import.meta.url));
 const SCRIPT = path.join(DIR, '..', 'tools', 'publish-oss.sh');
 const PATTERNS_FILE = path.join(DIR, '..', 'tools', 'oss-forbidden-patterns.sh');
+// Skipped when the private forbidden-patterns list (tools/oss-forbidden-patterns.sh, never published) is absent — e.g. in a clone of the public repo.
+const HAS_PATTERNS = existsSync(PATTERNS_FILE);
 
 // Built at runtime so this file (gate-exempt, but still published) carries no
 // FORBIDDEN literal itself.
@@ -51,6 +53,7 @@ afterEach(() => {
 function runForbiddenGate(scanRoot) {
   const extracted = [
     ...execFileSync('sed', ['-n', '/^FORBIDDEN=(/,/^)/p', PATTERNS_FILE], { encoding: 'utf8' }).split('\n'),
+    ...execFileSync('sed', ['-n', '/^FORBIDDEN_EXCLUDES=(/,/^)/p', SCRIPT], { encoding: 'utf8' }).split('\n'),
     ...execFileSync('sed', ['-n', '/^grep_args=(/,/^done$/p', SCRIPT], { encoding: 'utf8' }).split('\n'),
   ].join('\n');
   const gateFile = path.join(makeTmpDir('publish-oss-gate-script-'), 'gate.sh');
@@ -62,7 +65,7 @@ function runForbiddenGate(scanRoot) {
   return spawnSync('bash', [gateFile], { encoding: 'utf8' });
 }
 
-describe('publish-oss.sh FORBIDDEN gate', () => {
+describe.skipIf(!HAS_PATTERNS)('publish-oss.sh FORBIDDEN gate', () => {
   it('still trips on a FORBIDDEN literal in an ordinary published file (original leak case preserved)', () => {
     const scanRoot = makeTmpDir('publish-oss-gate-');
     writeFileSync(path.join(scanRoot, 'CHANGELOG.md'), `see ${LIT} item 3\n`, 'utf8');
@@ -107,9 +110,10 @@ describe('publish-oss.sh FORBIDDEN gate', () => {
     expect(result.status).toBe(0);
   });
 
-  it('grep_args declaration carries exactly the four --exclude entries alongside the pre-existing publish-oss.sh exclude', () => {
+  it('grep_args uses the shared FORBIDDEN_EXCLUDES array, which carries every --exclude entry alongside the pre-existing publish-oss.sh exclude', () => {
     const src = readFileSync(SCRIPT, 'utf8');
-    const declLine = src.split('\n').find((l) => l.startsWith('grep_args=('));
+    expect(src.split('\n').find((l) => l.startsWith('grep_args=('))).toContain('"${FORBIDDEN_EXCLUDES[@]}"');
+    const declLine = execFileSync('sed', ['-n', '/^FORBIDDEN_EXCLUDES=(/,/^)/p', SCRIPT], { encoding: 'utf8' });
     expect(declLine).toContain('--exclude=publish-oss.sh');
     expect(declLine).toContain('--exclude=oss-filename-leak-check.mjs');
     expect(declLine).toContain('--exclude=oss-filename-leak-check.test.mjs');

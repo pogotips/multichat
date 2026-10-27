@@ -2163,6 +2163,33 @@ describe('ChatHub.esModerateHealthy — persistence + hydration', () => {
     expect(storage._map.get('esModerateHealthy')).toBe(false);
   });
 
+  it('a failed put logs esmoderate_persist_failed, rethrows, leaves the stored marker alone, and the next pass retries then stops writing', async () => {
+    const existingSubs = buildDesiredSubs('42').map((want, i) => ({
+      id: `sub-${i}`, type: want.type, version: want.version, status: 'enabled',
+      created_at: new Date(Date.now() - 60_000).toISOString(),
+      condition: want.condition, transport: { callback },
+    }));
+    vi.stubGlobal('fetch', vi.fn(fetchMock(existingSubs, [])));
+    const storage = makeStorage();
+    const realPut = storage.put;
+    let puts = 0;
+    let failNext = true;
+    storage.put = async (k, v) => { if (k === 'esModerateHealthy') { puts++; if (failNext) { failNext = false; throw new Error('storage down'); } } return realPut(k, v); };
+    const errSpy = vi.spyOn(console, 'error').mockImplementation(() => {});
+    const hub = makeEventSubHub({ EVENTSUB_SECRET: 's3cret', TWITCH_BROADCASTER_ID: '42' }, storage);
+    await hub.ctx.pendingBlockConcurrencyWhile;
+
+    await expect(hub.ensureEventSubSubscriptions(origin)).rejects.toThrow('storage down');
+    expect(errSpy.mock.calls.some((c) => String(c[0]).includes('esmoderate_persist_failed'))).toBe(true);
+    expect(storage._map.has('esModerateHealthy')).toBe(false);
+
+    await hub.ensureEventSubSubscriptions(origin); // retry succeeds
+    expect(storage._map.get('esModerateHealthy')).toBe(true);
+    await hub.ensureEventSubSubscriptions(origin); // unchanged: no further write
+    expect(puts).toBe(2);
+    errSpy.mockRestore();
+  });
+
   it('hydrates esModerateHealthy:true from storage on construction (cold-start survival) — never the bare false default while a value is persisted', async () => {
     const storage = makeStorage({ esModerateHealthy: true });
     const hub = makeEventSubHub({}, storage);

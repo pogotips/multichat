@@ -189,10 +189,53 @@ describe('real wrangler-bundle overlay TTS queue (production-parity)', () => {
 const ESBUILD_RUNTIME_HELPERS = ['__name', '__publicField', '__decorateClass', '__esm', '__commonJS', '__export', '__toESM', '__require', '__privateGet', '__privateSet', '__privateAdd'];
 
 const PAGE_HELPERS = {
-  'https://x/#t=x': ['roleClass', 'emitCategory', 'isEmittable', 'resolveToken', 'cleanSpokenName', 'spokenCurseKey', 'isSpokenCurse', 'bleepSpokenText', 'isCurseName', 'spokenNameFor', 'cleanSpokenMentions', 'formatUtterance', 'translateRequestText', 'translateLabel', 'markMatchesQueueItem', 'nextTtsMode', 'chatSpeakSkipReason', 'formatChatUtterance', 'readoutUtterance', 'enqueueSpeechItem', 'parseTtsCommand', 'applyTtsCommand', 'formatCount', 'pullPhase', 'versionMismatch', 'createPullGate', 'isClientStale', 'supersedeSocket', 'shouldSendClientError', 'isAllowedEmojiUrl', 'isAllowedGifUrl', 'renderGifToken', 'mergeAnnotations', 'appendWithMention', 'renderText', 'buildRow', 'reconnectBackoffMs', 'createSeenIdGate', 'detectReplayGap', 'userKeyOf', 'createMessageStore', 'parseAmountNumber', 'splitAmountCurrency', 'summarizeGold', 'sheetStats', 'copyHandle', 'writeClipboard', 'stripEmoteRanges', 'stripControlChars', 'stripUrls'],
-  'https://x/overlay?t=y': ['roleClass', 'isAllowedEmojiUrl', 'isAllowedGifUrl', 'renderGifToken', 'mergeAnnotations', 'appendWithMention', 'renderText', 'buildRow', 'reactionSpawnUnits', 'spawnReactionParticle', 'cleanSpokenName', 'spokenCurseKey', 'isCurseName', 'spokenNameFor', 'normalizeSpokenMentions', 'stripControlChars', 'stripUrls', 'collapseRepeatedChars', 'sanitizeSpokenBody', 'formatUtterance', 'formatOverlayUtterance', 'enqueueCapped', 'supersedeSocket', 'markMatchesQueueItem', 'shouldSendClientError'],
+  'https://x/#t=x': ['roleClass', 'emitCategory', 'isEmittable', 'resolveToken', 'cleanSpokenName', 'spokenCurseKey', 'isSpokenCurse', 'bleepSpokenText', 'isCurseName', 'spokenNameFor', 'applySpokenWordMap', 'spokenSenderName', 'cleanSpokenMentions', 'formatUtterance', 'translateRequestText', 'translateLabel', 'markMatchesQueueItem', 'nextTtsMode', 'chatSpeakSkipReason', 'formatChatUtterance', 'readoutUtterance', 'enqueueSpeechItem', 'parseTtsCommand', 'applyTtsCommand', 'formatCount', 'pullPhase', 'versionMismatch', 'createPullGate', 'isClientStale', 'supersedeSocket', 'shouldSendClientError', 'isAllowedEmojiUrl', 'isAllowedGifUrl', 'renderGifToken', 'mergeAnnotations', 'appendWithMention', 'renderText', 'buildRow', 'reconnectBackoffMs', 'shouldForceYtReconnect', 'createSeenIdGate', 'detectReplayGap', 'userKeyOf', 'createMessageStore', 'parseAmountNumber', 'splitAmountCurrency', 'summarizeGold', 'sheetStats', 'copyHandle', 'writeClipboard', 'stripEmoteRanges', 'stripControlChars', 'stripUrls', 'isTtsBotName', 'translateRetryable', 'readFeedCursor', 'createFeedCursor'],
+  'https://x/overlay?t=y': ['roleClass', 'isAllowedEmojiUrl', 'isAllowedGifUrl', 'renderGifToken', 'mergeAnnotations', 'appendWithMention', 'renderText', 'buildRow', 'reactionSpawnUnits', 'spawnReactionParticle', 'cleanSpokenName', 'spokenCurseKey', 'isCurseName', 'spokenNameFor', 'applySpokenWordMap', 'spokenSenderName', 'cleanSpokenMentions', 'stripControlChars', 'stripUrls', 'collapseRepeatedChars', 'sanitizeSpokenBody', 'formatUtterance', 'formatOverlayUtterance', 'formatOverlayChatUtterance', 'enqueueCapped', 'supersedeSocket', 'markMatchesQueueItem', 'shouldSendClientError', 'reconnectBackoffMs', 'shouldForceYtReconnect'],
   'https://x/overlay/config?t=y': ['roleClass', 'isAllowedEmojiUrl', 'isAllowedGifUrl', 'renderGifToken', 'mergeAnnotations', 'appendWithMention', 'renderText', 'buildRow'],
 };
+
+// PWA-only helpers: the reload feed cursor (readFeedCursor/createFeedCursor,
+// 'multichat-feed', the ring-replay sentinel) is interpolated at the PWA
+// embed site only. OBS owns the overlay's lifecycle — a scene-switch reload
+// must keep getting zero ring rows (ARCHITECTURE "Replay tagging"), so the
+// overlay and overlay-config scripts must not even carry the helper text.
+const PWA_ONLY_HELPERS = ['readFeedCursor', 'createFeedCursor'];
+const PWA_ONLY_TOKENS = ['multichat-feed', 'RING_REPLAY_EVENT_ID', 'FEED_CURSOR_KEY'];
+describe('reload feed cursor is PWA-only: neither overlay page carries it', () => {
+  it.each(['https://x/overlay?t=y', 'https://x/overlay/config?t=y'])('%s', async (url) => {
+    const mod = await import(bundlePath);
+    const script = await extractScript(mod.default, url);
+    for (const name of PWA_ONLY_HELPERS) {
+      expect(script, `${url} carries ${name}`).not.toMatch(new RegExp(`function\\s+${name}\\s*\\(`));
+    }
+    for (const token of PWA_ONLY_TOKENS) {
+      expect(script, `${url} carries ${token}`).not.toContain(token);
+    }
+  });
+  it('the PWA page carries every one of them (so the assertion above is testing presence vs absence, not a typo)', async () => {
+    const mod = await import(bundlePath);
+    const script = await extractScript(mod.default, 'https://x/#t=x');
+    for (const name of PWA_ONLY_HELPERS) expect(script).toMatch(new RegExp(`function\\s+${name}\\s*\\(`));
+    for (const token of PWA_ONLY_TOKENS) expect(script).toContain(token);
+  });
+});
+
+// YT-chip forced reconnect (feature/yt-chip-reconnect): the helper is
+// interpolated at the PWA and overlay embed sites only -- overlay-config is a
+// static preview page with no live SSE stream to reconnect.
+describe('shouldForceYtReconnect is not embedded in overlay-config (minified bundle)', () => {
+  it('overlay-config carries neither the helper nor its tokens; the PWA and overlay do', async () => {
+    const mod = await import(bundlePath);
+    const cfg = await extractScript(mod.default, 'https://x/overlay/config?t=y');
+    expect(cfg).not.toMatch(/function\s+shouldForceYtReconnect\s*\(/);
+    expect(cfg).not.toContain('yt_stale');
+    for (const url of ['https://x/#t=x', 'https://x/overlay?t=y']) {
+      const script = await extractScript(mod.default, url);
+      expect(script, url).toMatch(/function\s+shouldForceYtReconnect\s*\(/);
+      expect(script, url).toContain('yt_stale');
+    }
+  });
+});
 
 // Brace-counts from the "function <name>(" (or "function <name> (") token to
 // its matching close — a bounded regex can't reliably do this once a body
@@ -275,4 +318,116 @@ describe('transitive check: an interpolated helper must not reference a lib.js/w
       }
     },
   );
+});
+
+// Spoken @mentions + word map (MULTICHAT_TTS_SAY_AS) through the REAL
+// minified bundle: overlay and PWA both speak the mapped/cleaned text. The
+// overlay now references cleanSpokenName/the curse-name check/the word map
+// transitively (spokenNameFor, spokenSenderName, cleanSpokenMentions,
+// applySpokenWordMap) -- a missing interpolation would be a ReferenceError
+// swallowed by onmessage, i.e. silent speech, so prove they are present and
+// that the page actually speaks.
+const SAY_AS_ENV = { MULTICHAT_TTS_SAY_AS: JSON.stringify({ Word: 'wurd' }) };
+const SAY_AS_SPEECH_HELPERS = ['cleanSpokenName', 'spokenCurseKey', 'isCurseName', 'spokenNameFor', 'applySpokenWordMap', 'spokenSenderName', 'cleanSpokenMentions', 'formatOverlayChatUtterance'];
+
+describe('spoken-name helpers are interpolated on the pages that speak (minified bundle)', () => {
+  it.each(['https://x/#t=x', 'https://x/overlay?t=y'])('%s carries every speech helper as a function declaration', async (url) => {
+    const mod = await import(bundlePath);
+    const script = await extractScript(mod.default, url, SAY_AS_ENV);
+    const names = url.includes('overlay') ? SAY_AS_SPEECH_HELPERS : SAY_AS_SPEECH_HELPERS.filter((n) => n !== 'formatOverlayChatUtterance');
+    for (const name of names) {
+      expect(script, `${url} :: ${name}`).toMatch(new RegExp('function\\s+' + name + '\\s*\\('));
+    }
+    expect(script).toContain('const TTS_SAY_AS = {"Word":"wurd"}');
+  });
+
+  it('overlay no longer carries the old @-strip-only mention helper', async () => {
+    const mod = await import(bundlePath);
+    const script = await extractScript(mod.default, 'https://x/overlay?t=y', SAY_AS_ENV);
+    expect(script).not.toMatch(/function\s+normalizeSpokenMentions\s*\(/);
+  });
+});
+
+describe('real wrangler-bundle spoken text (production-parity)', () => {
+  const HANDLES = ['Some_Name-x9k', 'Name_42', 'darc-ttv', 'ab12345', 'Word_2'];
+
+  async function overlaySpeech(rows, env = SAY_AS_ENV) {
+    const mod = await import(bundlePath);
+    const script = await extractScript(mod.default, 'https://x/overlay?t=y&tts=all', env);
+    const ttsCalls = [];
+    // First /tts call stays pending so each fired row is dequeued in order.
+    const { fire } = driveClientScriptSession(script, {
+      fetch: (url, opts) => { ttsCalls.push(JSON.parse(opts.body).text); return Promise.reject(new Error('stub')); },
+    });
+    const out = [];
+    for (const r of rows) {
+      ttsCalls.length = 0;
+      fire({ ts: Date.now(), platform: 'tw', ...r });
+      for (let i = 0; i < 8; i++) await Promise.resolve();
+      out.push(ttsCalls[0]);
+    }
+    return out;
+  }
+
+  it('overlay plain chat: sender, @mention and word map are spoken the PWA way', async () => {
+    const { cleanSpokenName, applySpokenWordMap } = await import('../src/lib.js');
+    const map = { Word: 'wurd' };
+    const rows = HANDLES.flatMap((h, i) => [
+      { id: 100 + i * 2, user: 'Viewer', login: 'viewer', text: 'hey @' + h + ', ok' },
+      { id: 101 + i * 2, user: h, login: h.toLowerCase(), text: 'hi' },
+    ]);
+    rows.push({ id: 200, user: 'Word', login: 'word', text: 'love Word! and @Word_2' });
+    const spoken = await overlaySpeech(rows);
+    HANDLES.forEach((h, i) => {
+      const n = applySpokenWordMap(cleanSpokenName(h), map);
+      expect(spoken[i * 2]).toBe('Viewer says hey ' + n + ', ok');
+      expect(spoken[i * 2 + 1]).toBe(n + ' says hi');
+    });
+    expect(spoken[rows.length - 1]).toBe('wurd says love wurd! and wurd');
+  });
+
+  it('overlay financial body gets the same mention + word-map treatment (ttsBody=on)', async () => {
+    const mod = await import(bundlePath);
+    const script = await extractScript(mod.default, 'https://x/overlay?t=y&ttsBody=on', SAY_AS_ENV);
+    const ttsCalls = [];
+    const { fire } = driveClientScriptSession(script, {
+      fetch: (url, opts) => { ttsCalls.push(JSON.parse(opts.body).text); return Promise.reject(new Error('stub')); },
+    });
+    fire({ id: 1, platform: 'tw', kind: 'cheer', amount: '5 bits', user: 'Word', login: 'word', text: 'thanks @Word_2 and Word', ts: Date.now() });
+    for (let i = 0; i < 8; i++) await Promise.resolve();
+    expect(ttsCalls[0]).toBe('wurd, cheer, 5 bits, thanks wurd and wurd');
+  });
+
+  it('overlay: curse-name sender is "someone" and display is untouched', async () => {
+    const mod = await import(bundlePath);
+    const script = await extractScript(mod.default, 'https://x/overlay?t=y&tts=all', SAY_AS_ENV);
+    const ttsCalls = [];
+    const { feed, fire } = driveClientScriptSession(script, {
+      fetch: (url, opts) => { ttsCalls.push(JSON.parse(opts.body).text); return Promise.reject(new Error('stub')); },
+    });
+    fire({ id: 1, platform: 'tw', user: 'FuckFace', login: 'fuckface', text: 'hi @Word_2', ts: Date.now() });
+    for (let i = 0; i < 8; i++) await Promise.resolve();
+    expect(ttsCalls[0]).toBe('someone says hi wurd');
+    // display text is the raw typed text, never the spoken form
+    expect(JSON.stringify(feed.children[0])).toContain('hi @Word_2');
+    expect(JSON.stringify(feed.children[0])).toContain('FuckFace');
+  });
+
+  it('PWA All mode: chat line speaks sender, @mention and word map; display untouched', async () => {
+    const mod = await import(bundlePath);
+    const script = await extractScript(mod.default, 'https://x/#t=x', SAY_AS_ENV);
+    const spoken = [];
+    const synth = { speak(u) { spoken.push(u.text); }, cancel() {}, pause() {}, resume() {}, speaking: false };
+    class FakeUtterance { constructor(text) { this.text = text; } }
+    const { feed, fire } = driveClientScriptSession(script, {
+      localStorage: { 'multichat-tts-mode': 'all' },
+      speechSynthesis: synth,
+      SpeechSynthesisUtterance: FakeUtterance,
+    });
+    fire({ id: 1, platform: 'tw', user: 'Word', login: 'word', text: 'hey @Some_Name-x9k, Word! @Name_42!', ts: Date.now() });
+    const said = spoken.filter((t) => t !== '');
+    const { cleanSpokenName } = await import('../src/lib.js');
+    expect(said).toEqual(['wurd, hey ' + cleanSpokenName('Some_Name-x9k') + ', wurd! ' + cleanSpokenName('Name_42') + '!']);
+    expect(JSON.stringify(feed.children[0])).toContain('hey @Some_Name-x9k, Word! @Name_42!');
+  });
 });
